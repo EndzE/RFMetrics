@@ -7,6 +7,8 @@ struct QueueRow {
     display: String,
     include: bool,
     selected: bool,
+    media: String,
+    media_tip: String,
 }
 
 /// Python `normcase(abspath)` equivalent for the same-file guard rail.
@@ -60,6 +62,44 @@ fn display_names(paths: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Retrieves the cursor position in egui's logical point coordinates.
+/// During Windows OLE file drags, winit omits pointer move events, so egui's
+/// internal pointer state is None/stale. We query the OS cursor directly.
+#[cfg(windows)]
+fn get_cursor_pos(ctx: &egui::Context) -> Option<egui::Pos2> {
+    #[repr(C)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetCursorPos(lpPoint: *mut Point) -> i32;
+    }
+
+    let mut pt = Point { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut pt) } != 0 {
+        let ppp = ctx.pixels_per_point();
+        let screen_pos = egui::pos2(pt.x as f32 / ppp, pt.y as f32 / ppp);
+        if let Some(inner_rect) = ctx.input(|i| i.viewport().inner_rect) {
+            return Some(egui::pos2(
+                screen_pos.x - inner_rect.min.x,
+                screen_pos.y - inner_rect.min.y,
+            ));
+        }
+    }
+    ctx.input(|i| i.pointer.hover_pos().or(i.pointer.latest_pos()))
+}
+
+#[cfg(not(windows))]
+fn get_cursor_pos(ctx: &egui::Context) -> Option<egui::Pos2> {
+    ctx.input(|i| i.pointer.hover_pos().or(i.pointer.latest_pos()))
+}
+
+/// Hover highlight delay (seconds) so passing over rows while aiming
+/// at text to copy doesn't flash each row.
+const ROW_HOVER_DELAY: f64 = 0.1;
+
 #[derive(Debug)]
 pub struct RFMetricsApp {
     ref_path: String,
@@ -84,6 +124,10 @@ pub struct RFMetricsApp {
     ref_info: String,
     last_probed_ref: String,
     ref_rect: Option<egui::Rect>,
+    table_rect: Option<egui::Rect>,
+    hover_row: Option<usize>,
+    hover_since: Option<f64>,
+    hovered_now: Option<usize>,
 }
 
 impl Default for RFMetricsApp {
@@ -114,13 +158,16 @@ impl Default for RFMetricsApp {
             ref_info: crate::probe::reference_media_text("", None),
             last_probed_ref: String::new(),
             ref_rect: None,
+            table_rect: None,
+            hover_row: None,
+            hover_since: None,
+            hovered_now: None,
         }
     }
 }
 
 impl RFMetricsApp {
-    /// Re-probe only when the path actually changed. Cheap for typed text
-    /// (nonexistent paths never spawn ffprobe); one spawn per Browse pick.
+    /// Re-probe only when the path actually changed.
     fn refresh_ref_info(&mut self) {
         if self.ref_path == self.last_probed_ref {
             return;
@@ -137,30 +184,35 @@ impl RFMetricsApp {
         for (row, name) in self.rows.iter_mut().zip(display_names(&paths)) {
             row.display = name;
         }
+        // Row indices may have shifted; drop stale hover state.
+        self.hover_row = None;
+        self.hover_since = None;
     }
 
     /// Queue picked files, silently skipping ones already present.
     fn add_queue_files(&mut self, paths: Vec<std::path::PathBuf>) {
         let mut seen: HashSet<String> = self.rows.iter().map(|r| norm_key(&r.path)).collect();
+        let exe = self.ffprobe.clone();
         for p in paths {
             let s = p.to_string_lossy().into_owned();
             if !seen.insert(norm_key(&s)) {
                 continue; // guard rail: same file already queued
             }
+            let (media, media_tip) = crate::probe::probe_table_text(&s, exe.as_deref());
             self.rows.push(QueueRow {
                 path: s,
                 display: String::new(),
                 include: true,
                 selected: false,
+                media,
+                media_tip,
             });
         }
         self.refresh_queue_names();
     }
 }
 
-/// 1px vertical divider in an exact 3px grid column. (The Separator widget
-/// sizes to spacing units and broke the table width math; Python draws plain
-/// 1px tk frames here.)
+/// 1px vertical divider in an exact 3px grid column.
 fn vline(ui: &mut egui::Ui, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 18.0), egui::Sense::hover());
     let x = rect.center().x;
@@ -170,11 +222,21 @@ fn vline(ui: &mut egui::Ui, color: egui::Color32) {
     );
 }
 
+/// Panel frame with Python's drag-enter green (#2FA572) while hovered.
+fn panel_frame(ui: &egui::Ui, hovering: bool) -> egui::Frame {
+    let mut frame = egui::Frame::group(ui.style());
+    if hovering {
+        frame = frame.stroke(egui::Stroke::new(
+            1.5,
+            egui::Color32::from_rgb(0x2F, 0xA5, 0x72),
+        ));
+    }
+    frame
+}
+
 impl eframe::App for RFMetricsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // OS file-drag state. `hovering` is window-wide (Python paints the
-        // boxes on drag-enter anywhere); the drop itself is routed by rect.
-        let (hovering, dropped, pointer) = ui.ctx().input(|i| {
+        let (hovering, dropped) = ui.ctx().input(|i| {
             (
                 !i.raw.hovered_files.is_empty(),
                 i.raw
@@ -182,34 +244,41 @@ impl eframe::App for RFMetricsApp {
                     .iter()
                     .map(|f| f.path().to_path_buf())
                     .collect::<Vec<_>>(),
-                i.pointer.latest_pos(),
             )
         });
-        // Route by rect when the cursor pos is known; if it isn't (drop
-        // frame without a preceding move event), accept anyway — reference
-        // is currently the only drop target.
-        let over_ref = match (pointer, self.ref_rect) {
-            (Some(pos), Some(rect)) => rect.contains(pos),
-            _ => true,
-        };
-        if let Some(first) = dropped.into_iter().next()
-            && over_ref
-        {
-            self.ref_path = first.to_string_lossy().into_owned();
+
+        // Continuously repaint while dragging so hover outlines update smoothly
+        if hovering {
+            ui.ctx().request_repaint();
+        }
+
+        let cursor_pos = get_cursor_pos(ui.ctx());
+
+        // Direct OS-cursor hit test; winit gives no position during OLE drags.
+        let is_over_ref =
+            matches!((cursor_pos, self.ref_rect), (Some(pos), Some(rect)) if rect.contains(pos));
+        let is_over_table =
+            matches!((cursor_pos, self.table_rect), (Some(pos), Some(rect)) if rect.contains(pos));
+
+        // Handle dropped files
+        if !dropped.is_empty() {
+            if is_over_ref {
+                if let Some(first) = dropped.into_iter().next() {
+                    self.ref_path = first.to_string_lossy().into_owned();
+                }
+            } else {
+                self.add_queue_files(dropped);
+            }
         }
         self.refresh_ref_info();
+
+        let ref_hover = hovering && is_over_ref;
+        let table_hover = hovering && is_over_table;
+
         // ---- Reference (top, fixed) ----
         let ref_resp = egui::Panel::top("reference").show(ui, |ui| {
             ui.label("Reference");
-            let mut ref_frame = egui::Frame::group(ui.style());
-            if hovering {
-                // ponytail: Python's drag-enter green (#2FA572)
-                ref_frame = ref_frame.stroke(egui::Stroke::new(
-                    1.5,
-                    egui::Color32::from_rgb(0x2F, 0xA5, 0x72),
-                ));
-            }
-            ref_frame.show(ui, |ui| {
+            panel_frame(ui, ref_hover).show(ui, |ui| {
                 ui.horizontal_top(|ui| {
                     let preview_w = 136.0;
                     let total = ui.available_width();
@@ -260,7 +329,7 @@ impl eframe::App for RFMetricsApp {
                             );
                         });
                     });
-                    // Thumbnail placeholder 136x76, black like Python preview_box
+                    // Thumbnail placeholder 136x76
                     egui::Frame::NONE
                         .fill(egui::Color32::BLACK)
                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(60)))
@@ -370,23 +439,20 @@ impl eframe::App for RFMetricsApp {
                 }
             });
             ui.add_space(4.0);
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            let now = ui.ctx().input(|i| i.time);
+            self.hovered_now = None;
+            let table_resp = panel_frame(ui, table_hover).show(ui, |ui| {
                 if self.rows.is_empty() {
-                    // ponytail: claim full width/height so the empty box
-                    // matches the table dimensions instead of shrinking
                     ui.set_min_size(egui::vec2(ui.available_width(), 160.0));
                     ui.weak("No files yet — drag & drop video files here");
                     return;
                 }
-                // ponytail: TableBuilder owns column geometry; the remainder
-                // Path column replaces all hand-rolled width math.
-                // Tight gaps like Python's padx (default 8px gaps would eat
-                // ~160px across 21 columns).
                 ui.scope(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
                     let mut table = egui_extras::TableBuilder::new(ui)
                         .striped(false)
                         .resizable(false)
+                        .sense(egui::Sense::click())
                         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                         .column(egui_extras::Column::exact(22.0))
                         .column(egui_extras::Column::exact(3.0))
@@ -432,58 +498,128 @@ impl eframe::App for RFMetricsApp {
                             body.rows(20.0, self.rows.len(), |mut row| {
                                 let i = row.index();
                                 row.set_selected(self.rows[i].selected);
+                                // Delayed hover: only outline after the pointer
+                                // rests on the row, so passing over rows while
+                                // aiming at text doesn't flash each one.
+                                let hover_delayed = self.hover_row == Some(i)
+                                    && self.hover_since.is_some_and(|t| now - t >= ROW_HOVER_DELAY);
+                                row.set_hovered(hover_delayed);
+                                // Free-space click toggles selection; widget clicks
+                                // (checkbox, play, text drag-select) must not.
+                                let mut label_clicked = false;
+                                let mut bg_clicked = false;
                                 row.col(|ui| {
                                     ui.checkbox(&mut self.rows[i].include, "");
                                 });
-                                row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
+                                let (_, r) =
+                                    row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
+                                if r.clicked() {
+                                    bg_clicked = true;
+                                }
                                 row.col(|ui| {
                                     if ui.button("▶").clicked() {
-                                        // ponytail: Python ignores play errors too
                                         let path = self.rows[i].path.clone();
                                         let _ = open::that(&path);
                                     }
                                 });
-                                row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
-                                // Left-aligned selectable label
-                                // (Python: anchor="w"); the clipped
-                                // remainder column truncates long names.
-                                row.col(|ui| {
-                                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-                                    let (selected, display) = {
-                                        let r = &self.rows[i];
-                                        (r.selected, r.display.clone())
-                                    };
-                                    if ui.selectable_label(selected, &display).clicked() {
-                                        self.rows[i].selected = !selected;
-                                    }
-                                });
-                                row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
-                                row.col(|ui| {
-                                    ui.label("N/A");
-                                });
-                                for _ in 0..7 {
+                                let (_, r) =
                                     row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
-                                    // ponytail: Python centers metric cells too
-                                    row.col(|ui| {
+                                if r.clicked() {
+                                    bg_clicked = true;
+                                }
+                                let (_, r) = row.col(|ui| {
+                                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                                    let (display, path) = {
+                                        let r = &self.rows[i];
+                                        (r.display.clone(), r.path.clone())
+                                    };
+                                    // Plain selectable text: no button hover
+                                    // outline; drag-select/copy still works and
+                                    // the full path shows as tooltip (Python parity).
+                                    ui.add(egui::Label::new(&display).selectable(true))
+                                        .on_hover_text(&path);
+                                });
+                                if r.clicked() {
+                                    label_clicked = true;
+                                }
+                                let (_, r) =
+                                    row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
+                                if r.clicked() {
+                                    bg_clicked = true;
+                                }
+                                let (_, r) = row.col(|ui| {
+                                    let (media, tip) = {
+                                        let r = &self.rows[i];
+                                        (r.media.clone(), r.media_tip.clone())
+                                    };
+                                    ui.label(&media).on_hover_text(&tip);
+                                });
+                                if r.clicked() {
+                                    bg_clicked = true;
+                                }
+                                for _ in 0..7 {
+                                    let (_, r) =
+                                        row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
+                                    if r.clicked() {
+                                        bg_clicked = true;
+                                    }
+                                    let (_, r) = row.col(|ui| {
                                         ui.centered_and_justified(|ui| {
                                             ui.label("N/A");
                                         });
                                     });
+                                    if r.clicked() {
+                                        bg_clicked = true;
+                                    }
+                                }
+                                if label_clicked || bg_clicked {
+                                    self.rows[i].selected = !self.rows[i].selected;
+                                }
+                                if row.response().hovered() {
+                                    self.hovered_now = Some(i);
                                 }
                             });
                         });
                 });
             });
+            self.table_rect = Some(table_resp.response.rect);
+            // Roll the delayed-hover timer forward; repaint while the
+            // delay is pending so the outline appears without moving.
+            if self.hovered_now != self.hover_row {
+                self.hover_row = self.hovered_now;
+                self.hover_since = self.hover_row.map(|_| now);
+            }
+            let hover_pending = matches!(
+                (self.hover_row, self.hovered_now, self.hover_since),
+                (Some(a), Some(b), Some(t)) if a == b && now - t < ROW_HOVER_DELAY
+            );
+            if hover_pending {
+                ui.ctx().request_repaint();
+            }
         });
 
+        // Drop hint overlay pinned over the active drop target
         if hovering {
-            egui::Area::new(egui::Id::new("drop_hint"))
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ui.ctx(), |ui| {
-                    egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.label("Drop file to set as reference");
+            let active_hint = if ref_hover {
+                self.ref_rect
+                    .map(|r| ("drop_hint_ref", r, "Drop video to set as reference"))
+            } else if table_hover {
+                self.table_rect
+                    .map(|r| ("drop_hint_table", r, "Drop files to queue"))
+            } else {
+                None
+            };
+
+            if let Some((id, r, text)) = active_hint {
+                egui::Area::new(egui::Id::new(id))
+                    .fixed_pos(r.center_top())
+                    .pivot(egui::Align2::CENTER_TOP)
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.label(text);
+                        });
                     });
-                });
+            }
         }
     }
 }

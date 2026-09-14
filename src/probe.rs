@@ -17,6 +17,7 @@ pub struct Stream {
     color_range: Option<String>,
     bit_rate: Option<String>,
     duration: Option<String>,
+    nb_frames: Option<String>,
     field_order: Option<String>,
     tags: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -45,6 +46,7 @@ pub struct MediaInfo {
     pub bitrate_kbps: Option<i64>,
     pub is_container_rate: bool,
     pub duration: Option<f64>,
+    pub total_frames: Option<i64>,
     pub encoder: Option<String>,
     pub interlaced: bool,
 }
@@ -152,6 +154,23 @@ pub fn parse_media(v: &Stream, fmt: &Format) -> MediaInfo {
         }
     }
 
+    // Prefer ffprobe's own frame count; fall back to duration × fps.
+    // (`nb_frames` is often missing/"N/A", and `parse` rejects those.)
+    // The estimate is a last resort only: `probe_media` overrides it with
+    // a packet count whenever `nb_frames` is unusable.
+    let mut total_frames = v
+        .nb_frames
+        .as_deref()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|&n| n > 0);
+    if total_frames.is_none()
+        && let (Some(d), Some(f)) = (duration, fps)
+        && d > 0.0
+        && f > 0.0
+    {
+        total_frames = Some((d * f).round() as i64);
+    }
+
     let mut encoder = None;
     if let Some(c) = v.codec_name.as_deref().filter(|s| !s.is_empty()) {
         encoder = Some(c.to_owned());
@@ -172,12 +191,192 @@ pub fn parse_media(v: &Stream, fmt: &Format) -> MediaInfo {
         bitrate_kbps,
         is_container_rate: v.bit_rate.is_none() && fmt.bit_rate.is_some(),
         duration,
+        total_frames,
         encoder,
         interlaced: matches!(
             v.field_order.as_deref(),
             Some("interlaced" | "tt" | "bb" | "tb" | "bt")
         ),
     }
+}
+
+/// Accurate frame count via packet scan, for streams without `nb_frames`.
+/// Reads packet headers only (no decoding), so it is fast but not free —
+/// called only when the cheap JSON probe has no usable count.
+fn count_packets(exe: &Path, path: &str) -> Option<i64> {
+    let out = Command::new(exe)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-count_packets",
+            "-show_entries",
+            "stream=nb_read_packets",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            path,
+        ])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .filter(|&n| n > 0)
+}
+
+/// Shared ffprobe spawn + parse; `None` = no usable video stream.
+fn probe_media(path: &str, ffprobe: Option<&Path>) -> Option<MediaInfo> {
+    if path.trim().is_empty() || !Path::new(path).is_file() {
+        return None;
+    }
+    let exe = ffprobe?;
+    let out = Command::new(exe)
+        .args([
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            path,
+        ])
+        .output()
+        .ok()?;
+    let data: ProbeOutput = serde_json::from_slice(&out.stdout).ok()?;
+    let v = data
+        .streams
+        .iter()
+        .find(|s| s.codec_type.as_deref() == Some("video"))
+        .or_else(|| data.streams.first())?;
+    let mut info = parse_media(v, &data.format);
+    // `duration × fps` is only an estimate (wrong on VFR/long-GOP files),
+    // so when `nb_frames` gave nothing usable, count packets instead.
+    let has_nb = v
+        .nb_frames
+        .as_deref()
+        .and_then(|s| s.parse::<i64>().ok())
+        .is_some_and(|n| n > 0);
+    if !has_nb && let Some(n) = count_packets(exe, path) {
+        info.total_frames = Some(n);
+    }
+    Some(info)
+}
+
+/// Python `table_media_text`: `{enc}, {height+suffix}, {PIX}, {bitrate}`.
+pub fn table_media_text(info: Option<&MediaInfo>) -> String {
+    let u = "-unknown-";
+    let Some(info) = info else {
+        return format!("{u}, {u}, {u}, {u}");
+    };
+    let suffix = if info.interlaced { "i" } else { "p" };
+    let height_s = match info.height {
+        Some(h) => format!("{h}{suffix}"),
+        None => u.to_owned(),
+    };
+    let pix_s = match info.pix_fmt.as_deref() {
+        Some(p) => {
+            let up = p.to_uppercase();
+            up.strip_suffix('P').unwrap_or(&up).to_owned()
+        }
+        None => u.to_owned(),
+    };
+    let bit_s = match info.bitrate_kbps {
+        Some(kbps) => format!("{kbps} kb/s"),
+        None => u.to_owned(),
+    };
+    let enc_s = info
+        .encoder
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(u);
+    format!("{enc_s}, {height_s}, {pix_s}, {bit_s}")
+}
+
+/// Python `_cell_media_text`: comma-aware truncation to `limit` chars.
+pub fn cell_media_text(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_owned();
+    }
+    let truncated: String = text.chars().take(limit).collect();
+    match truncated.rsplit_once(", ") {
+        Some((head, _)) => format!("{head}…"),
+        None => {
+            let h: String = truncated.chars().take(limit.saturating_sub(1)).collect();
+            format!("{}…", h.trim_end())
+        }
+    }
+}
+
+/// Python `table_media_tooltip`: 8-line hover detail (note `Colour` spelling).
+pub fn table_media_tooltip(info: Option<&MediaInfo>) -> String {
+    let u = "-unknown-";
+    let (size_s, rate_s, field_s, pix_s, range_s, bit_s, dur_s, frames_s) = match info {
+        None => (
+            u.to_owned(),
+            u.to_owned(),
+            "Progressive".to_owned(),
+            u.to_owned(),
+            u.to_owned(),
+            u.to_owned(),
+            u.to_owned(),
+            u.to_owned(),
+        ),
+        Some(info) => {
+            let size_s = match (info.width, info.height) {
+                (Some(w), Some(h)) => format!("{w}x{h}"),
+                _ => u.to_owned(),
+            };
+            let rate_s = match info.fps {
+                Some(fps) => format!("{} fps", format_fps(fps)),
+                None => u.to_owned(),
+            };
+            let field_s = if info.interlaced {
+                "Interlaced"
+            } else {
+                "Progressive"
+            }
+            .to_owned();
+            let pix_s = info.pix_fmt.as_deref().unwrap_or(u).to_owned();
+            let range_s = info
+                .range_tag
+                .as_deref()
+                .map(|r| r.to_uppercase())
+                .unwrap_or_else(|| u.to_owned());
+            let bit_s = match info.bitrate_kbps {
+                Some(kbps) => {
+                    let star = if info.is_container_rate { "*" } else { "" };
+                    format!("{kbps} kb/s{star}")
+                }
+                None => u.to_owned(),
+            };
+            let dur_s = match info.duration {
+                Some(d) if d > 0.0 => format_duration(d),
+                _ => u.to_owned(),
+            };
+            let frames_s = match info.total_frames {
+                Some(n) => n.to_string(),
+                None => u.to_owned(),
+            };
+            (
+                size_s, rate_s, field_s, pix_s, range_s, bit_s, dur_s, frames_s,
+            )
+        }
+    };
+    format!(
+        "Frame size: {size_s}\nFrame Rate: {rate_s}\nField Type: {field_s}\n\
+         Pixel Format: {pix_s}\nColour Range: {range_s}\nBitrate: {bit_s}\nDuration: {dur_s}\nTotal Frames: {frames_s}"
+    )
+}
+
+/// Single spawn returning truncated cell text + full tooltip for a queue row.
+pub fn probe_table_text(path: &str, ffprobe: Option<&Path>) -> (String, String) {
+    let info = probe_media(path, ffprobe);
+    let full = table_media_text(info.as_ref());
+    let cell = cell_media_text(&full, 38);
+    let tip = table_media_tooltip(info.as_ref());
+    (cell, tip)
 }
 
 /// Single-line reference info, mirroring Python `reference_media_text`.
@@ -220,7 +419,17 @@ pub fn reference_media_text(path: &str, ffprobe: Option<&Path>) -> String {
     else {
         return "No video stream".to_owned();
     };
-    let info = parse_media(v, &data.format);
+    let mut info = parse_media(v, &data.format);
+    // Same accurate-count fallback as queue rows (estimate is wrong on
+    // VFR/long-GOP files when `nb_frames` is missing).
+    let has_nb = v
+        .nb_frames
+        .as_deref()
+        .and_then(|s| s.parse::<i64>().ok())
+        .is_some_and(|n| n > 0);
+    if !has_nb && let Some(n) = count_packets(exe, path) {
+        info.total_frames = Some(n);
+    }
 
     let mut parts: Vec<String> = Vec::new();
     if let Some(e) = info.encoder.as_deref().filter(|s| !s.is_empty()) {
@@ -250,6 +459,9 @@ pub fn reference_media_text(path: &str, ffprobe: Option<&Path>) -> String {
         && d > 0.0
     {
         parts.push(format!("Duration: {}", format_duration(d)));
+    }
+    if let Some(n) = info.total_frames {
+        parts.push(format!("Total Frames: {n}"));
     }
     if parts.is_empty() {
         "—".to_owned()
@@ -345,5 +557,88 @@ mod tests {
         let s = reference_media_text(&p.to_string_lossy(), None);
         std::fs::remove_file(&p).ok();
         assert_eq!(s, "ffprobe not found");
+    }
+
+    #[test]
+    fn table_text_from_fixture() {
+        let (v, f) = fixture();
+        let m = parse_media(&v, &f);
+        assert_eq!(table_media_text(Some(&m)), "h264, 1080p, YUV420, 5000 kb/s");
+    }
+
+    #[test]
+    fn table_text_unknown() {
+        assert_eq!(
+            table_media_text(None),
+            "-unknown-, -unknown-, -unknown-, -unknown-"
+        );
+    }
+
+    #[test]
+    fn table_pix_strip() {
+        let (v, f) = fixture();
+        let mut m = parse_media(&v, &f);
+        m.pix_fmt = Some("rgb24".to_owned());
+        assert!(table_media_text(Some(&m)).contains("RGB24"));
+        m.pix_fmt = None;
+        assert!(table_media_text(Some(&m)).contains("-unknown-"));
+    }
+
+    #[test]
+    fn table_star_in_tooltip_not_cell() {
+        let (mut v, f) = fixture();
+        v.bit_rate = None; // force container rate
+        let m = parse_media(&v, &f);
+        assert!(m.is_container_rate);
+        assert!(!table_media_text(Some(&m)).contains('*'));
+        assert!(table_media_tooltip(Some(&m)).contains("5200 kb/s*"));
+    }
+
+    #[test]
+    fn cell_truncation() {
+        let short = "h264, 1080p, YUV420, 5000 kb/s";
+        assert_eq!(cell_media_text(short, 38), short);
+        let long = "av1, 2160p, YUV420P10LE, 12345 kb/s, extra";
+        let cell = cell_media_text(long, 38);
+        assert!(cell.chars().count() <= 39);
+        assert!(cell.ends_with('…'));
+        // comma-aware: cuts at a ", " boundary, not mid-token
+        assert!(!cell.contains("extra"));
+        let no_comma = "x".repeat(50);
+        assert_eq!(
+            cell_media_text(&no_comma, 38),
+            format!("{}…", "x".repeat(37))
+        );
+    }
+
+    #[test]
+    fn table_tooltip_exact() {
+        let (v, f) = fixture();
+        let m = parse_media(&v, &f);
+        // 63.04s × 29.97fps ≈ 1889 frames (computed fallback, no nb_frames)
+        assert_eq!(
+            table_media_tooltip(Some(&m)),
+            "Frame size: 1920x1080\nFrame Rate: 29.97 fps\nField Type: Progressive\n\
+             Pixel Format: yuv420p\nColour Range: TV\nBitrate: 5000 kb/s\nDuration: 00:01:03.04\nTotal Frames: 1889"
+        );
+        assert!(table_media_tooltip(None).contains("Field Type: Progressive"));
+        assert!(table_media_tooltip(None).contains("Total Frames: -unknown-"));
+    }
+
+    #[test]
+    fn total_frames_prefers_nb_frames() {
+        let (mut v, f) = fixture();
+        v.nb_frames = Some("1500".to_owned());
+        let m = parse_media(&v, &f);
+        assert_eq!(m.total_frames, Some(1500));
+        assert!(table_media_tooltip(Some(&m)).contains("Total Frames: 1500"));
+    }
+
+    #[test]
+    fn total_frames_rejects_garbage() {
+        let (mut v, f) = fixture();
+        v.nb_frames = Some("N/A".to_owned());
+        let m = parse_media(&v, &f);
+        assert_eq!(m.total_frames, Some(1889)); // falls back to duration × fps
     }
 }

@@ -162,6 +162,11 @@ pub fn ffmpeg_info() -> BinaryInfo {
         .ok()
         .and_then(|re| re.captures(full).map(|c| format!("FFmpeg: {}", &c[1])))
         .unwrap_or_else(|| full.to_owned());
+    // `ffmpeg -version` puts "Copyright (c) ..." on the same first line;
+    // strip it so the hover tooltip stays to version + path.
+    let full = Regex::new(r"(?i)\s*copyright.*$")
+        .map(|re| re.replace(full, "").trim_end().to_owned())
+        .unwrap_or_else(|_| full.to_owned());
     BinaryInfo {
         path: Some(exe.clone()),
         origin,
