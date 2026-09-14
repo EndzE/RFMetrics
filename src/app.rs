@@ -283,7 +283,7 @@ impl eframe::App for RFMetricsApp {
                     let preview_w = 136.0;
                     let total = ui.available_width();
                     ui.vertical(|ui| {
-                        ui.set_width(total - preview_w - 12.0);
+                        ui.set_width((total - preview_w - 12.0).max(0.0));
                         // Path row
                         ui.horizontal(|ui| {
                             ui.add(egui::Label::new("Path to file:").selectable(false));
