@@ -1,5 +1,6 @@
 mod app;
 mod binaries;
+mod probe;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {

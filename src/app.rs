@@ -18,8 +18,9 @@ pub struct RFMetricsApp {
     files: Vec<String>,
     ffmpeg: crate::binaries::BinaryInfo,
     ffvship: crate::binaries::BinaryInfo,
-    #[allow(dead_code)] // consumed by the upcoming probe step
     ffprobe: Option<std::path::PathBuf>,
+    ref_info: String,
+    last_probed_ref: String,
 }
 
 impl Default for RFMetricsApp {
@@ -47,7 +48,23 @@ impl Default for RFMetricsApp {
             ffmpeg,
             ffvship,
             ffprobe,
+            ref_info: crate::probe::reference_media_text("", None),
+            last_probed_ref: String::new(),
         }
+    }
+}
+
+impl RFMetricsApp {
+    /// Re-probe only when the path actually changed. Cheap for typed text
+    /// (nonexistent paths never spawn ffprobe); one spawn per Browse pick.
+    fn refresh_ref_info(&mut self) {
+        if self.ref_path == self.last_probed_ref {
+            return;
+        }
+        self.last_probed_ref = self.ref_path.clone();
+        let path = self.ref_path.clone();
+        let exe = self.ffprobe.clone();
+        self.ref_info = crate::probe::reference_media_text(&path, exe.as_deref());
     }
 }
 
@@ -57,6 +74,7 @@ fn vsep(ui: &mut egui::Ui) {
 
 impl eframe::App for RFMetricsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.refresh_ref_info();
         // ---- Reference (top, fixed) ----
         egui::Panel::top("reference").show(ui, |ui| {
             ui.label("Reference");
@@ -73,24 +91,20 @@ impl eframe::App for RFMetricsApp {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     if ui
-                                        .add_sized(
-                                            [90.0, 24.0],
-                                            egui::Button::new("Browse"),
-                                        )
+                                        .add_sized([90.0, 24.0], egui::Button::new("Browse"))
                                         .clicked()
                                         && let Some(path) = rfd::FileDialog::new()
                                             .set_title("Select reference video")
                                             .add_filter(
                                                 "Video files",
                                                 &[
-                                                    "mp4", "mkv", "mov", "avi",
-                                                    "webm", "m2ts", "ts", "m4v",
+                                                    "mp4", "mkv", "mov", "avi", "webm", "m2ts",
+                                                    "ts", "m4v",
                                                 ],
                                             )
                                             .pick_file()
                                     {
-                                        self.ref_path =
-                                            path.to_string_lossy().into_owned();
+                                        self.ref_path = path.to_string_lossy().into_owned();
                                     }
                                     let _ = ui.add(
                                         egui::TextEdit::singleline(&mut self.ref_path)
@@ -99,9 +113,7 @@ impl eframe::App for RFMetricsApp {
                                 },
                             );
                         });
-                        ui.label(
-                            "Encoder: -unknown-, Frame: -unknown-, Bitrate: -unknown-, Duration: -unknown-",
-                        );
+                        ui.label(&self.ref_info);
                         ui.horizontal(|ui| {
                             ui.label("Duration:");
                             let _ = ui.add(
@@ -120,10 +132,7 @@ impl eframe::App for RFMetricsApp {
                     // Thumbnail placeholder 136x76, black like Python preview_box
                     egui::Frame::NONE
                         .fill(egui::Color32::BLACK)
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            egui::Color32::from_gray(60),
-                        ))
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(60)))
                         .show(ui, |ui| {
                             ui.allocate_space(egui::vec2(preview_w, 76.0));
                         });
