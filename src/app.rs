@@ -100,6 +100,39 @@ fn get_cursor_pos(ctx: &egui::Context) -> Option<egui::Pos2> {
 /// at text to copy doesn't flash each row.
 const ROW_HOVER_DELAY: f64 = 0.1;
 
+/// How long the drop toast (e.g. ignored extra reference files) stays up.
+const TOAST_SECS: f64 = 3.0;
+
+/// Toast severity; drives the outline color. `Info` keeps the default
+/// popup outline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    dead_code,
+    reason = "Info/Error have no producer yet; kept for probe/run errors"
+)]
+enum ToastKind {
+    Info,
+    Warning,
+    Error,
+}
+
+impl ToastKind {
+    fn outline(self) -> Option<egui::Color32> {
+        match self {
+            ToastKind::Info => None,
+            ToastKind::Warning => Some(egui::Color32::from_rgb(0xD9, 0xA4, 0x06)),
+            ToastKind::Error => Some(egui::Color32::from_rgb(0xE0, 0x4B, 0x4B)),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Toast {
+    text: String,
+    until: f64,
+    kind: ToastKind,
+}
+
 #[derive(Debug)]
 pub struct RFMetricsApp {
     ref_path: String,
@@ -128,6 +161,7 @@ pub struct RFMetricsApp {
     hover_row: Option<usize>,
     hover_since: Option<f64>,
     hovered_now: Option<usize>,
+    toast: Option<Toast>,
 }
 
 impl Default for RFMetricsApp {
@@ -162,6 +196,7 @@ impl Default for RFMetricsApp {
             hover_row: None,
             hover_since: None,
             hovered_now: None,
+            toast: None,
         }
     }
 }
@@ -253,6 +288,7 @@ impl eframe::App for RFMetricsApp {
         }
 
         let cursor_pos = get_cursor_pos(ui.ctx());
+        let now = ui.ctx().input(|i| i.time);
 
         // Direct OS-cursor hit test; winit gives no position during OLE drags.
         let is_over_ref =
@@ -260,13 +296,26 @@ impl eframe::App for RFMetricsApp {
         let is_over_table =
             matches!((cursor_pos, self.table_rect), (Some(pos), Some(rect)) if rect.contains(pos));
 
-        // Handle dropped files
+        // Strict target routing (Python parity: a drop outside a target
+        // does nothing). The reference box takes one file; extras are
+        // reported via toast instead of silently vanishing.
         if !dropped.is_empty() {
             if is_over_ref {
-                if let Some(first) = dropped.into_iter().next() {
+                let mut iter = dropped.into_iter();
+                if let Some(first) = iter.next() {
                     self.ref_path = first.to_string_lossy().into_owned();
                 }
-            } else {
+                let extra = iter.len();
+                if extra > 0 {
+                    self.toast = Some(Toast {
+                        text: format!(
+                            "Reference takes one file — kept the first, ignored {extra} more"
+                        ),
+                        until: now + TOAST_SECS,
+                        kind: ToastKind::Warning,
+                    });
+                }
+            } else if is_over_table {
                 self.add_queue_files(dropped);
             }
         }
@@ -442,11 +491,12 @@ impl eframe::App for RFMetricsApp {
                 }
             });
             ui.add_space(4.0);
-            let now = ui.ctx().input(|i| i.time);
             self.hovered_now = None;
             let table_resp = panel_frame(ui, table_hover).show(ui, |ui| {
+                // Keep the drop box a stable size: at least full width × 160
+                // even when the table content is smaller (e.g. one row).
+                ui.set_min_size(egui::vec2(ui.available_width(), 160.0));
                 if self.rows.is_empty() {
-                    ui.set_min_size(egui::vec2(ui.available_width(), 160.0));
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new("No files yet — drag & drop video files here")
@@ -634,6 +684,29 @@ impl eframe::App for RFMetricsApp {
                             ui.label(text);
                         });
                     });
+            }
+        }
+
+        // Transient toast (e.g. extra files dropped on the reference box).
+        if let Some(toast) = self.toast.clone() {
+            if now < toast.until {
+                ui.ctx().request_repaint();
+                let corner = ui.max_rect().right_bottom();
+                let mut frame = egui::Frame::popup(ui.style());
+                if let Some(outline) = toast.kind.outline() {
+                    frame = frame.stroke(egui::Stroke::new(1.5, outline));
+                }
+                egui::Area::new(egui::Id::new("toast"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(corner + egui::vec2(-10.0, -10.0))
+                    .pivot(egui::Align2::RIGHT_BOTTOM)
+                    .show(ui.ctx(), |ui| {
+                        frame.show(ui, |ui| {
+                            ui.label(&toast.text);
+                        });
+                    });
+            } else {
+                self.toast = None;
             }
         }
     }
