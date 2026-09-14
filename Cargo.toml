@@ -1,6 +1,11 @@
 [package]
 name = "rfmetrics"
 version = "0.1.0"
-edition = "2026"
+edition = "2024"
 
 [dependencies]
+eframe = "0.36.2"
+egui = "0.36.2"
+regex = "1.13.1"
+rfd = "0.17.2"
+which = "8.0.6"
