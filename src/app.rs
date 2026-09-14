@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::mpsc::{Receiver, Sender};
 
 #[derive(Debug)]
 struct QueueRow {
@@ -133,6 +134,21 @@ struct Toast {
     kind: ToastKind,
 }
 
+/// Results sent back from background probe threads. The UI thread never
+/// blocks on ffprobe; it drains these each frame via `try_recv`.
+#[derive(Debug)]
+enum ProbeMsg {
+    Reference {
+        generation: u64,
+        text: String,
+    },
+    RowMedia {
+        key: String,
+        media: String,
+        tip: String,
+    },
+}
+
 #[derive(Debug)]
 pub struct RFMetricsApp {
     ref_path: String,
@@ -155,13 +171,19 @@ pub struct RFMetricsApp {
     ffvship: crate::binaries::BinaryInfo,
     ffprobe: Option<std::path::PathBuf>,
     ref_info: String,
-    last_probed_ref: String,
     ref_rect: Option<egui::Rect>,
     table_rect: Option<egui::Rect>,
     hover_row: Option<usize>,
     hover_since: Option<f64>,
     hovered_now: Option<usize>,
     toast: Option<Toast>,
+    probe_tx: Sender<ProbeMsg>,
+    probe_rx: Receiver<ProbeMsg>,
+    /// Path last handed to a probe worker (or resolved cheaply without one).
+    last_spawned_ref: String,
+    /// Bumped on every ref change; worker results with an older generation
+    /// are stale (typed-through) and discarded.
+    ref_generation: u64,
 }
 
 impl Default for RFMetricsApp {
@@ -169,6 +191,7 @@ impl Default for RFMetricsApp {
         let ffmpeg = crate::binaries::ffmpeg_info();
         let ffvship = crate::binaries::ffvship_info();
         let ffprobe = crate::binaries::ffprobe_path(ffmpeg.path.as_deref());
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
         Self {
             ref_path: String::new(),
             duration: String::new(),
@@ -190,27 +213,75 @@ impl Default for RFMetricsApp {
             ffvship,
             ffprobe,
             ref_info: crate::probe::reference_media_text("", None),
-            last_probed_ref: String::new(),
             ref_rect: None,
             table_rect: None,
             hover_row: None,
             hover_since: None,
             hovered_now: None,
             toast: None,
+            probe_tx,
+            probe_rx,
+            last_spawned_ref: String::new(),
+            ref_generation: 0,
         }
     }
 }
 
 impl RFMetricsApp {
-    /// Re-probe only when the path actually changed.
+    /// Apply any probe results that arrived since the last frame. Stale
+    /// reference results (typed-through while a worker was running) are
+    /// dropped via the generation check.
+    fn drain_probe_results(&mut self) {
+        while let Ok(msg) = self.probe_rx.try_recv() {
+            match msg {
+                ProbeMsg::Reference { generation, text } => {
+                    if generation == self.ref_generation {
+                        self.ref_info = text;
+                    }
+                }
+                ProbeMsg::RowMedia { key, media, tip } => {
+                    if let Some(row) = self.rows.iter_mut().find(|r| norm_key(&r.path) == key) {
+                        row.media = media;
+                        row.media_tip = tip;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Re-probe only when the path actually changed, and only off the UI
+    /// thread: cheap cases (empty/missing/no ffprobe) resolve inline, an
+    /// existing file spawns a worker and shows "Probing…" meanwhile.
     fn refresh_ref_info(&mut self) {
-        if self.ref_path == self.last_probed_ref {
+        self.drain_probe_results();
+        if self.ref_path == self.last_spawned_ref {
             return;
         }
-        self.last_probed_ref = self.ref_path.clone();
+        self.last_spawned_ref = self.ref_path.clone();
+        self.ref_generation = self.ref_generation.wrapping_add(1);
+        if self.ref_path.trim().is_empty() {
+            self.ref_info =
+                "Encoder: -unknown-, Frame: -unknown-, Bitrate: -unknown-, Duration: -unknown-"
+                    .to_owned();
+            return;
+        }
+        if !Path::new(&self.ref_path).is_file() {
+            self.ref_info = "File not found".to_owned();
+            return;
+        }
+        if self.ffprobe.is_none() {
+            self.ref_info = "ffprobe not found".to_owned();
+            return;
+        }
+        self.ref_info = "Probing…".to_owned();
+        let tx = self.probe_tx.clone();
+        let generation = self.ref_generation;
         let path = self.ref_path.clone();
         let exe = self.ffprobe.clone();
-        self.ref_info = crate::probe::reference_media_text(&path, exe.as_deref());
+        std::thread::spawn(move || {
+            let text = crate::probe::reference_media_text(&path, exe.as_deref());
+            let _ = tx.send(ProbeMsg::Reference { generation, text });
+        });
     }
 
     /// Short display names for all rows (Python `_refresh_names`).
@@ -225,25 +296,39 @@ impl RFMetricsApp {
     }
 
     /// Queue picked files, silently skipping ones already present.
+    /// Media probing runs on a worker thread; rows show "Probing…"
+    /// until their results arrive, so drops never freeze the window.
     fn add_queue_files(&mut self, paths: Vec<std::path::PathBuf>) {
         let mut seen: HashSet<String> = self.rows.iter().map(|r| norm_key(&r.path)).collect();
-        let exe = self.ffprobe.clone();
+        let mut fresh: Vec<(String, String)> = Vec::new();
         for p in paths {
             let s = p.to_string_lossy().into_owned();
-            if !seen.insert(norm_key(&s)) {
+            let key = norm_key(&s);
+            if !seen.insert(key.clone()) {
                 continue; // guard rail: same file already queued
             }
-            let (media, media_tip) = crate::probe::probe_table_text(&s, exe.as_deref());
             self.rows.push(QueueRow {
-                path: s,
+                path: s.clone(),
                 display: String::new(),
                 include: true,
                 selected: false,
-                media,
-                media_tip,
+                media: "Probing…".to_owned(),
+                media_tip: "Probing…".to_owned(),
             });
+            fresh.push((key, s));
         }
         self.refresh_queue_names();
+        if fresh.is_empty() {
+            return;
+        }
+        let tx = self.probe_tx.clone();
+        let exe = self.ffprobe.clone();
+        std::thread::spawn(move || {
+            for (key, s) in fresh {
+                let (media, tip) = crate::probe::probe_table_text(&s, exe.as_deref());
+                let _ = tx.send(ProbeMsg::RowMedia { key, media, tip });
+            }
+        });
     }
 }
 
@@ -714,7 +799,7 @@ impl eframe::App for RFMetricsApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{display_names, norm_key};
+    use super::{ProbeMsg, QueueRow, RFMetricsApp, display_names, norm_key};
 
     #[test]
     fn same_file_keys_equal() {
@@ -744,5 +829,88 @@ mod tests {
         let names = display_names(&["C:/a/x.mp4".to_owned(), "C:/b/x.mp4".to_owned()]);
         let sep = std::path::MAIN_SEPARATOR;
         assert_eq!(names, vec![format!("a{sep}x.mp4"), format!("b{sep}x.mp4")]);
+    }
+
+    #[test]
+    fn ref_cheap_cases_stay_synchronous() {
+        let mut app = RFMetricsApp::default();
+        app.ref_path = String::new();
+        app.refresh_ref_info();
+        assert!(app.ref_info.contains("-unknown-"));
+        app.ref_path = "C:/no/such/file.mp4".to_owned();
+        app.refresh_ref_info();
+        assert_eq!(app.ref_info, "File not found");
+        // Neither case spawns a worker: the channel stays empty.
+        assert!(app.probe_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn stale_reference_result_discarded() {
+        let mut app = RFMetricsApp::default();
+        app.ref_info = "sentinel".to_owned();
+        app.probe_tx
+            .send(ProbeMsg::Reference {
+                generation: 999,
+                text: "stale".to_owned(),
+            })
+            .unwrap();
+        app.refresh_ref_info();
+        assert_eq!(app.ref_info, "sentinel");
+        app.probe_tx
+            .send(ProbeMsg::Reference {
+                generation: app.ref_generation,
+                text: "fresh".to_owned(),
+            })
+            .unwrap();
+        app.refresh_ref_info();
+        assert_eq!(app.ref_info, "fresh");
+    }
+
+    #[test]
+    fn row_media_applies_by_key() {
+        let mut app = RFMetricsApp::default();
+        app.rows.push(QueueRow {
+            path: "C:/vids/a.mp4".to_owned(),
+            display: "a.mp4".to_owned(),
+            include: true,
+            selected: false,
+            media: "Probing…".to_owned(),
+            media_tip: "Probing…".to_owned(),
+        });
+        let key = norm_key("C:/vids/a.mp4");
+        app.probe_tx
+            .send(ProbeMsg::RowMedia {
+                key,
+                media: "h264, 1080p".to_owned(),
+                tip: "tip".to_owned(),
+            })
+            .unwrap();
+        app.probe_tx
+            .send(ProbeMsg::RowMedia {
+                key: "nope".to_owned(),
+                media: "x".to_owned(),
+                tip: "y".to_owned(),
+            })
+            .unwrap();
+        app.refresh_ref_info();
+        assert_eq!(app.rows[0].media, "h264, 1080p");
+        assert_eq!(app.rows[0].media_tip, "tip");
+    }
+
+    #[test]
+    fn queue_shows_probing_placeholder() {
+        let mut app = RFMetricsApp::default();
+        app.add_queue_files(vec![std::path::PathBuf::from("C:/no/such/file.mp4")]);
+        assert_eq!(app.rows.len(), 1);
+        assert_eq!(app.rows[0].media, "Probing…");
+        // Missing files resolve without spawning ffprobe; poll briefly.
+        for _ in 0..200 {
+            app.drain_probe_results();
+            if app.rows[0].media != "Probing…" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.rows[0].media.contains("-unknown-"));
     }
 }
