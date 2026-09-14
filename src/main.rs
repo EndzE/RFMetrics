@@ -4,7 +4,10 @@ mod probe;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1300.0, 600.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1300.0, 600.0])
+            // Windows file-drop is opt-in; without this no hover/drop events arrive
+            .with_drag_and_drop(true),
         ..Default::default()
     };
     eframe::run_native(
