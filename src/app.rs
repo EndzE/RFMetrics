@@ -277,7 +277,7 @@ impl eframe::App for RFMetricsApp {
 
         // ---- Reference (top, fixed) ----
         let ref_resp = egui::Panel::top("reference").show(ui, |ui| {
-            ui.label("Reference");
+            ui.add(egui::Label::new("Reference").selectable(false));
             panel_frame(ui, ref_hover).show(ui, |ui| {
                 ui.horizontal_top(|ui| {
                     let preview_w = 136.0;
@@ -286,7 +286,7 @@ impl eframe::App for RFMetricsApp {
                         ui.set_width(total - preview_w - 12.0);
                         // Path row
                         ui.horizontal(|ui| {
-                            ui.label("Path to file:");
+                            ui.add(egui::Label::new("Path to file:").selectable(false));
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -315,13 +315,13 @@ impl eframe::App for RFMetricsApp {
                         });
                         ui.label(&self.ref_info);
                         ui.horizontal(|ui| {
-                            ui.label("Duration:");
+                            ui.add(egui::Label::new("Duration:").selectable(false));
                             let _ = ui.add(
                                 egui::TextEdit::singleline(&mut self.duration)
                                     .hint_text("00:00.000")
                                     .desired_width(110.0),
                             );
-                            ui.label("Skip:");
+                            ui.add(egui::Label::new("Skip:").selectable(false));
                             let _ = ui.add(
                                 egui::TextEdit::singleline(&mut self.skip)
                                     .hint_text("00:00.000")
@@ -349,7 +349,7 @@ impl eframe::App for RFMetricsApp {
                 let _ = ui.add_sized([90.0, 24.0], egui::Button::new("Plot"));
                 ui.label(&self.ffmpeg.short)
                     .on_hover_text(&self.ffmpeg.detail);
-                ui.label("|");
+                ui.add(egui::Label::new("|").selectable(false));
                 ui.label(&self.ffvship.short)
                     .on_hover_text(&self.ffvship.detail);
             });
@@ -357,10 +357,10 @@ impl eframe::App for RFMetricsApp {
 
         // ---- VMAF options (just above bottom bar) ----
         egui::Panel::bottom("vmaf").show(ui, |ui| {
-            ui.label("VMAF options");
+            ui.add(egui::Label::new("VMAF options").selectable(false));
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add_sized([70.0, 18.0], egui::Label::new("Model"));
+                    ui.add_sized([70.0, 18.0], egui::Label::new("Model").selectable(false));
                     let _ = egui::ComboBox::from_id_salt("vmaf_model")
                         .width(220.0)
                         .selected_text(&self.vmaf_model)
@@ -381,7 +381,7 @@ impl eframe::App for RFMetricsApp {
                     ));
                 });
                 ui.horizontal(|ui| {
-                    ui.add_sized([70.0, 18.0], egui::Label::new("Pooling"));
+                    ui.add_sized([70.0, 18.0], egui::Label::new("Pooling").selectable(false));
                     let _ = egui::ComboBox::from_id_salt("vmaf_pooling")
                         .width(220.0)
                         .selected_text(&self.vmaf_pooling)
@@ -399,7 +399,10 @@ impl eframe::App for RFMetricsApp {
                         });
                 });
                 ui.horizontal(|ui| {
-                    ui.add_sized([70.0, 18.0], egui::Label::new("Subsample"));
+                    ui.add_sized(
+                        [70.0, 18.0],
+                        egui::Label::new("Subsample").selectable(false),
+                    );
                     let _ = egui::ComboBox::from_id_salt("vmaf_subsample")
                         .width(220.0)
                         .selected_text(&self.vmaf_subsample)
@@ -444,7 +447,13 @@ impl eframe::App for RFMetricsApp {
             let table_resp = panel_frame(ui, table_hover).show(ui, |ui| {
                 if self.rows.is_empty() {
                     ui.set_min_size(egui::vec2(ui.available_width(), 160.0));
-                    ui.weak("No files yet — drag & drop video files here");
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("No files yet — drag & drop video files here")
+                                .weak(),
+                        )
+                        .selectable(false),
+                    );
                     return;
                 }
                 ui.scope(|ui| {
@@ -473,11 +482,17 @@ impl eframe::App for RFMetricsApp {
                             header.col(|_| {});
                             header.col(|ui| vline(ui, egui::Color32::from_gray(0x8A)));
                             header.col(|ui| {
-                                ui.label(egui::RichText::new("Path").strong());
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new("Path").strong())
+                                        .selectable(false),
+                                );
                             });
                             header.col(|ui| vline(ui, egui::Color32::from_gray(0x8A)));
                             header.col(|ui| {
-                                ui.label(egui::RichText::new("Media info").strong());
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new("Media info").strong())
+                                        .selectable(false),
+                                );
                             });
                             for (flag, name) in [
                                 (&mut self.m_psnr, "PSNR"),
