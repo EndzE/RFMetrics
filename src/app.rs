@@ -149,7 +149,13 @@ enum ProbeMsg {
     },
 }
 
-#[derive(Debug)]
+/// Thumbnail result from the dedicated ffmpeg worker (separate channel so
+/// slow frame extracts never block fast ffprobe text results).
+struct ThumbMsg {
+    generation: u64,
+    image: Option<egui::ColorImage>,
+}
+
 pub struct RFMetricsApp {
     ref_path: String,
     duration: String,
@@ -184,6 +190,12 @@ pub struct RFMetricsApp {
     /// Bumped on every ref change; worker results with an older generation
     /// are stale (typed-through) and discarded.
     ref_generation: u64,
+    thumb_tx: Sender<ThumbMsg>,
+    thumb_rx: Receiver<ThumbMsg>,
+    thumb_tex: Option<egui::TextureHandle>,
+    thumb_loading: bool,
+    last_thumb_path: String,
+    thumb_generation: u64,
 }
 
 impl Default for RFMetricsApp {
@@ -192,6 +204,7 @@ impl Default for RFMetricsApp {
         let ffvship = crate::binaries::ffvship_info();
         let ffprobe = crate::binaries::ffprobe_path(ffmpeg.path.as_deref());
         let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+        let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
         Self {
             ref_path: String::new(),
             duration: String::new(),
@@ -223,6 +236,12 @@ impl Default for RFMetricsApp {
             probe_rx,
             last_spawned_ref: String::new(),
             ref_generation: 0,
+            thumb_tx,
+            thumb_rx,
+            thumb_tex: None,
+            thumb_loading: false,
+            last_thumb_path: String::new(),
+            thumb_generation: 0,
         }
     }
 }
@@ -281,6 +300,56 @@ impl RFMetricsApp {
         std::thread::spawn(move || {
             let text = crate::probe::reference_media_text(&path, exe.as_deref());
             let _ = tx.send(ProbeMsg::Reference { generation, text });
+        });
+    }
+
+    /// Apply arrived thumbnails; stale generations (typed-through) are dropped.
+    fn drain_thumbs(&mut self, ctx: &egui::Context) {
+        while let Ok(msg) = self.thumb_rx.try_recv() {
+            if msg.generation != self.thumb_generation {
+                continue;
+            }
+            self.thumb_loading = false;
+            match msg.image {
+                Some(img) => {
+                    self.thumb_tex =
+                        Some(ctx.load_texture("ref_thumb", img, egui::TextureOptions::LINEAR));
+                }
+                None => self.thumb_tex = None,
+            }
+        }
+    }
+
+    /// Spawn a dedicated ffmpeg worker when the ref path changed. Cheap cases
+    /// clear inline; the worker sends duration-aware extracts back on the
+    /// thumb channel and repaints via the cloned ctx.
+    fn refresh_thumbnail(&mut self, ctx: &egui::Context) {
+        self.drain_thumbs(ctx);
+        if self.ref_path == self.last_thumb_path {
+            return;
+        }
+        self.last_thumb_path = self.ref_path.clone();
+        self.thumb_generation = self.thumb_generation.wrapping_add(1);
+        self.thumb_tex = None;
+        if self.ref_path.trim().is_empty() || !Path::new(&self.ref_path).is_file() {
+            self.thumb_loading = false;
+            return;
+        }
+        let Some(ffmpeg_exe) = self.ffmpeg.path.clone() else {
+            self.thumb_loading = false;
+            return;
+        };
+        self.thumb_loading = true;
+        let tx = self.thumb_tx.clone();
+        let generation = self.thumb_generation;
+        let path = self.ref_path.clone();
+        let ffprobe_exe = self.ffprobe.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let duration = crate::probe::media_duration(&path, ffprobe_exe.as_deref());
+            let image = crate::preview::extract_thumbnail(&ffmpeg_exe, &path, duration);
+            let _ = tx.send(ThumbMsg { generation, image });
+            ctx.request_repaint();
         });
     }
 
@@ -405,6 +474,8 @@ impl eframe::App for RFMetricsApp {
             }
         }
         self.refresh_ref_info();
+        let ctx = ui.ctx().clone();
+        self.refresh_thumbnail(&ctx);
 
         let ref_hover = hovering && is_over_ref;
         let table_hover = hovering && is_over_table;
@@ -463,12 +534,40 @@ impl eframe::App for RFMetricsApp {
                             );
                         });
                     });
-                    // Thumbnail placeholder 136x76
+                    // Reference thumbnail 136x76 (black box parity with Python).
                     egui::Frame::NONE
                         .fill(egui::Color32::BLACK)
                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(60)))
                         .show(ui, |ui| {
-                            ui.allocate_space(egui::vec2(preview_w, 76.0));
+                            ui.set_min_size(egui::vec2(preview_w, 76.0));
+                            if let Some(tex) = &self.thumb_tex {
+                                let size = tex.size_vec2();
+                                ui.centered_and_justified(|ui| {
+                                    ui.image((tex.id(), size));
+                                });
+                            } else if self.thumb_loading {
+                                ui.centered_and_justified(|ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new("Loading…")
+                                                .small()
+                                                .color(egui::Color32::from_gray(160)),
+                                        )
+                                        .selectable(false),
+                                    );
+                                });
+                            } else {
+                                ui.centered_and_justified(|ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new("No preview")
+                                                .small()
+                                                .color(egui::Color32::from_gray(120)),
+                                        )
+                                        .selectable(false),
+                                    );
+                                });
+                            }
                         });
                 });
             });

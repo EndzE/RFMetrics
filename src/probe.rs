@@ -264,6 +264,11 @@ fn probe_media(path: &str, ffprobe: Option<&Path>) -> Option<MediaInfo> {
     Some(info)
 }
 
+/// Duration helper for the thumbnail worker (Python `_get_media_duration`).
+pub(crate) fn media_duration(path: &str, ffprobe: Option<&Path>) -> Option<f64> {
+    probe_media(path, ffprobe)?.duration.filter(|&d| d > 0.0)
+}
+
 /// Python `table_media_text`: `{enc}, {height+suffix}, {PIX}, {bitrate}`.
 pub fn table_media_text(info: Option<&MediaInfo>) -> String {
     let u = "-unknown-";

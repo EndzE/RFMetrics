@@ -1,5 +1,6 @@
 mod app;
 mod binaries;
+mod preview;
 mod probe;
 
 fn main() -> eframe::Result<()> {
