@@ -136,18 +136,39 @@ fn leg_model_scale(w: Option<i64>, h: Option<i64>, mw: u32, mh: u32) -> Option<(
     }
 }
 
-/// Native resolution of a model (`*4k*` → 2160p, else 1080p).
+/// Native resolution of a model (`*4k*`/`*2160*` → 2160p, else 1080p).
+/// The `*2160*` arm covers the v1 (`vmaf_v1.0.16_*_2160`, incl. `_hfr_`)
+/// and any future 4K files that don't carry a `4k` marker.
 pub fn model_resolution(model_name: &str) -> (u32, u32) {
-    if model_name.to_lowercase().contains("4k") {
+    let lower = model_name.to_lowercase();
+    if lower.contains("4k") || lower.contains("2160") {
         (3840, 2160)
     } else {
         (1920, 1080)
     }
 }
 
+/// v1-generation model (`vmaf_v1.0.16_*`, incl. `_hfr_` variants): phone
+/// is a separate `5d0h` file there, never the `enable_transform` flag.
+pub fn is_v1_model(model_name: &str) -> bool {
+    model_name.to_lowercase().contains("v1.0")
+}
+
+/// Top of the score range for a model: the v1 4K-consumer model
+/// (`3d0h_2160`, incl. `_hfr_`) operates on [0, 110] (models_v1.md);
+/// everything else on [0, 100].
+pub fn model_score_max(model_name: &str) -> f64 {
+    if model_name.to_lowercase().contains("3d0h_2160") {
+        110.0
+    } else {
+        100.0
+    }
+}
+
 /// libvmaf filtergraph (Python filter construction parity). Returns the
 /// full `-filter_complex` string or a fatal per-file error (Phone on a
-/// neg/4k model, mirroring the exact Python message).
+/// neg/4k/v1 model — the v1 branch has no Python equivalent, v1 postdates
+/// the rev).
 #[allow(clippy::too_many_arguments)]
 pub fn build_filter(
     ref_info: &MediaInfo,
@@ -162,6 +183,15 @@ pub fn build_filter(
     let (mut model_opt, model_name) = resolve_model(&cfg.model, models_dir);
     if cfg.phone {
         // Phone transform exists only on standard v0.6.1 1080p models.
+        // v1 phone is the separate `5d0h` file: the flag parses but is a
+        // silent no-op there (verified live), so v1+phone is rejected
+        // outright — including the `5d0h` file itself, for which the flag
+        // would be meaningless.
+        if is_v1_model(&model_name) {
+            return Err(format!(
+                "Model '{model_name}' has no Phone transform (v1 uses the separate 5d0h phone file)"
+            ));
+        }
         let lower = model_name.to_lowercase();
         if lower.contains("neg") || lower.contains("4k") {
             return Err(format!(
@@ -229,9 +259,10 @@ pub struct VmafLog {
 }
 
 /// Parse a libvmaf JSON log (Python `_parse_vmaf_log` parity):
-/// `frames[].metrics.vmaf` per frame (sanitized + clamped 0–100),
-/// `pooled_metrics.vmaf.{mean,harmonic_mean}` pooled.
-pub fn parse_vmaf_log(text: &str) -> Option<VmafLog> {
+/// `frames[].metrics.vmaf` per frame (sanitized + clamped 0–`max_score`),
+/// `pooled_metrics.vmaf.{mean,harmonic_mean}` pooled (raw, never clamped).
+/// `max_score` is `model_score_max` for the run's model (110 for v1 4K 3H).
+pub fn parse_vmaf_log(text: &str, max_score: f64) -> Option<VmafLog> {
     let data: serde_json::Value = serde_json::from_str(text).ok()?;
     let mut log = VmafLog::default();
     if let Some(frames) = data.get("frames").and_then(|f| f.as_array()) {
@@ -241,7 +272,13 @@ pub fn parse_vmaf_log(text: &str) -> Option<VmafLog> {
                 .and_then(|m| m.get("vmaf"))
                 .and_then(tolerant_f64);
             if let Some(v) = v {
-                let v = crate::metrics::ffmpeg::sanitize_db(v).clamp(0.0, 100.0);
+                // `inf` (identical files) saturates at the top of the
+                // model's range; `nan` sanitizes to 0 downstream.
+                let v = if v.is_infinite() {
+                    max_score
+                } else {
+                    crate::metrics::ffmpeg::sanitize_db(v).clamp(0.0, max_score)
+                };
                 if v.is_finite() {
                     log.values.push(v);
                 }
@@ -412,7 +449,10 @@ pub fn run_vmaf(job: &RunInputs, cfg: &VmafCfg, on_progress: &(dyn Fn(u64) + Syn
             error: Some(msg),
         };
     }
-    let (values, avg) = match parse_vmaf_log(&log_text) {
+    // Re-resolve for the score range (one extra tiny dir read per run;
+    // cheaper than threading the name out of `build_filter`).
+    let max_score = model_score_max(&resolve_model(&cfg.model, &models_dir).1);
+    let (values, avg) = match parse_vmaf_log(&log_text, max_score) {
         Some(log) if !log.values.is_empty() => {
             let pooled = match cfg.pooling {
                 Pooling::HarmonicMean => log.harmonic_mean,
@@ -552,6 +592,43 @@ mod tests {
         assert_eq!(model_resolution("vmaf_v0.6.1.json"), (1920, 1080));
         assert_eq!(model_resolution("vmaf_v0.6.1neg.json"), (1920, 1080));
         assert_eq!(model_resolution(""), (1920, 1080));
+        // v1 names carry no `4k` marker; `*2160*` routes them instead.
+        assert_eq!(model_resolution("vmaf_v1.0.16_3d0h.json"), (1920, 1080));
+        assert_eq!(model_resolution("vmaf_v1.0.16_5d0h.json"), (1920, 1080));
+        assert_eq!(
+            model_resolution("vmaf_v1.0.16_1d5h_2160.json"),
+            (3840, 2160)
+        );
+        assert_eq!(
+            model_resolution("vmaf_v1.0.16_3d0h_2160.json"),
+            (3840, 2160)
+        );
+        assert_eq!(model_resolution("vmaf_v1.0.16_hfr_3d0h.json"), (1920, 1080));
+        assert_eq!(
+            model_resolution("vmaf_v1.0.16_hfr_3d0h_2160.json"),
+            (3840, 2160)
+        );
+    }
+
+    #[test]
+    fn v1_detection_covers_hfr_names() {
+        for m in [
+            "vmaf_v1.0.16_3d0h.json",
+            "vmaf_v1.0.16_5d0h.json",
+            "vmaf_v1.0.16_1d5h_2160.json",
+            "vmaf_v1.0.16_hfr_3d0h.json",
+            "vmaf_v1.0.16_hfr_3d0h_2160.json",
+        ] {
+            assert!(is_v1_model(m), "{m}");
+        }
+        for m in [
+            "vmaf_v0.6.1.json",
+            "vmaf_v0.6.1neg.json",
+            "vmaf_4k_v0.6.1.json",
+            "",
+        ] {
+            assert!(!is_v1_model(m), "{m}");
+        }
     }
 
     #[test]
@@ -686,6 +763,33 @@ mod tests {
     }
 
     #[test]
+    fn phone_guard_rejects_any_v1_model() {
+        // Live finding: `enable_transform` parses on v1 but changes nothing
+        // (identical scores), so phone+5d0h included — v1 phone means
+        // picking the `5d0h` file with the box unticked.
+        let (_g, dir) = models_dir(&[
+            "vmaf_v1.0.16_3d0h.json",
+            "vmaf_v1.0.16_5d0h.json",
+            "vmaf_v1.0.16_hfr_3d0h_2160.json",
+        ]);
+        let mut c = cfg();
+        c.phone = true;
+        for m in [
+            "vmaf_v1.0.16_3d0h.json",
+            "vmaf_v1.0.16_5d0h.json",
+            "vmaf_v1.0.16_hfr_3d0h_2160.json",
+        ] {
+            c.model = m.to_owned();
+            assert_eq!(
+                build_filter(&ref_info(), &ref_info(), None, None, &c, &dir, "v.json", 0),
+                Err(format!(
+                    "Model '{m}' has no Phone transform (v1 uses the separate 5d0h phone file)"
+                )),
+            );
+        }
+    }
+
+    #[test]
     fn filter_trims_and_scales_dist_only() {
         let (_g, dir) = models_dir(&["vmaf_v0.6.1.json"]);
         let mut dist = ref_info();
@@ -719,7 +823,7 @@ mod tests {
             ],
             "pooled_metrics": {"vmaf": {"mean": 91.0, "harmonic_mean": 90.8}}
         }"#;
-        let log = parse_vmaf_log(text).unwrap();
+        let log = parse_vmaf_log(text, 100.0).unwrap();
         assert_eq!(log.values, vec![90.5, 91.25]);
         assert_eq!(log.mean, Some(91.0));
         assert_eq!(log.harmonic_mean, Some(90.8));
@@ -733,13 +837,32 @@ mod tests {
             {"metrics": {"vmaf": 150.0}},
             {"metrics": {"vmaf": -5.0}}
         ]}"#;
-        let log = parse_vmaf_log(text).unwrap();
+        let log = parse_vmaf_log(text, 100.0).unwrap();
         assert_eq!(log.values, vec![100.0, 0.0, 100.0, 0.0]);
     }
 
     #[test]
+    fn log_clamps_to_model_range() {
+        // Live v1 4K-consumer case (`3d0h_2160`, incl. `_hfr_`): real
+        // scores above 100 (mean 104.355, max frame 110) must survive.
+        let text = r#"{"frames": [
+            {"metrics": {"vmaf": 104.355}},
+            {"metrics": {"vmaf": 110.0}},
+            {"metrics": {"vmaf": 150.0}},
+            {"metrics": {"vmaf": -5.0}},
+            {"metrics": {"vmaf": "inf"}}
+        ]}"#;
+        let log = parse_vmaf_log(text, 110.0).unwrap();
+        assert_eq!(log.values, vec![104.355, 110.0, 110.0, 0.0, 110.0]);
+        assert_eq!(model_score_max("vmaf_v1.0.16_3d0h_2160.json"), 110.0);
+        assert_eq!(model_score_max("vmaf_v1.0.16_hfr_3d0h_2160.json"), 110.0);
+        assert_eq!(model_score_max("vmaf_v1.0.16_3d0h.json"), 100.0);
+        assert_eq!(model_score_max("vmaf_v0.6.1.json"), 100.0);
+    }
+
+    #[test]
     fn log_rejects_garbage() {
-        assert!(parse_vmaf_log("not json").is_none());
-        assert!(parse_vmaf_log("{}").unwrap().values.is_empty());
+        assert!(parse_vmaf_log("not json", 100.0).is_none());
+        assert!(parse_vmaf_log("{}", 100.0).unwrap().values.is_empty());
     }
 }

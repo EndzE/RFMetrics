@@ -1466,7 +1466,24 @@ impl eframe::App for RFMetricsApp {
                                     );
                                 }
                             });
-                        let _ = ui.add(egui::Checkbox::new(&mut self.vmaf_phone, "Phone"));
+                        // v1 phone is the separate `5d0h` file, never the flag:
+                        // block the box for v1 models (run-time guard is the
+                        // backstop). Unchecking here is visible and keeps the
+                        // Start snapshot truthful — no silent coercion.
+                        let v1 = crate::metrics::vmaf::is_v1_model(&self.vmaf_model);
+                        if v1 {
+                            self.vmaf_phone = false;
+                        }
+                        let _ = ui
+                            .add_enabled(
+                                !v1,
+                                egui::Checkbox::new(&mut self.vmaf_phone, "Phone"),
+                            )
+                            .on_hover_text(if v1 {
+                                "v1 phone is the separate 5d0h model file — pick it with Phone unticked"
+                            } else {
+                                "Phone viewing-condition transform (v0.6.1 model only)"
+                            });
                     });
                     ui.horizontal(|ui| {
                         ui.add_sized([70.0, 18.0], egui::Label::new(""));
