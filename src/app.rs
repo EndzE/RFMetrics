@@ -17,9 +17,11 @@ struct QueueRow {
     info: Option<crate::probe::MediaInfo>,
     psnr: crate::metrics::MetricCell,
     ssim: crate::metrics::MetricCell,
+    vmaf: crate::metrics::MetricCell,
     xpsnr: crate::metrics::MetricCell,
     psnr_cache: CachedStats,
     ssim_cache: CachedStats,
+    vmaf_cache: CachedStats,
     xpsnr_cache: CachedStats,
 }
 
@@ -37,6 +39,7 @@ impl QueueRow {
         match kind {
             MetricKind::Psnr => &self.psnr,
             MetricKind::Ssim => &self.ssim,
+            MetricKind::Vmaf => &self.vmaf,
             MetricKind::Xpsnr => &self.xpsnr,
         }
     }
@@ -45,6 +48,7 @@ impl QueueRow {
         match kind {
             MetricKind::Psnr => &mut self.psnr,
             MetricKind::Ssim => &mut self.ssim,
+            MetricKind::Vmaf => &mut self.vmaf,
             MetricKind::Xpsnr => &mut self.xpsnr,
         }
     }
@@ -53,6 +57,7 @@ impl QueueRow {
         match kind {
             MetricKind::Psnr => &self.psnr_cache,
             MetricKind::Ssim => &self.ssim_cache,
+            MetricKind::Vmaf => &self.vmaf_cache,
             MetricKind::Xpsnr => &self.xpsnr_cache,
         }
     }
@@ -61,6 +66,7 @@ impl QueueRow {
         match kind {
             MetricKind::Psnr => &mut self.psnr_cache,
             MetricKind::Ssim => &mut self.ssim_cache,
+            MetricKind::Vmaf => &mut self.vmaf_cache,
             MetricKind::Xpsnr => &mut self.xpsnr_cache,
         }
     }
@@ -231,6 +237,9 @@ enum MetricMsg {
         /// rerun under different skip/clip recomputes instead of skipping.
         skip: Option<f64>,
         clip_dur: Option<f64>,
+        /// VMAF settings the run used (`Some` for VMAF jobs only); stamped
+        /// onto the `Done` cell so an options change recomputes VMAF alone.
+        vmaf_cfg: Option<crate::metrics::vmaf::VmafCfg>,
     },
     /// End of the worker loop; `aborted` settles still-Running cells to
     /// Idle while keeping finished (`Done`) results on screen.
@@ -253,6 +262,7 @@ pub struct RFMetricsApp {
     vmaf_scale: bool,
     vmaf_pooling: String,
     vmaf_subsample: String,
+    vmaf_models: Vec<String>,
     rows: Vec<QueueRow>,
     ffmpeg: crate::binaries::BinaryInfo,
     ffvship: crate::binaries::BinaryInfo,
@@ -313,10 +323,13 @@ impl Default for RFMetricsApp {
             m_but: false,
             m_cvvdp: false,
             vmaf_model: "vmaf_v0.6.1.json".to_owned(),
-            vmaf_phone: true,
+            vmaf_phone: false,
             vmaf_scale: false,
             vmaf_pooling: "Mean".to_owned(),
             vmaf_subsample: "1".to_owned(),
+            vmaf_models: crate::metrics::vmaf::list_models(
+                &crate::metrics::vmaf::vmaf_home().join("vmaf-models"),
+            ),
             rows: Vec::new(),
             ffmpeg,
             ffvship,
@@ -511,9 +524,11 @@ impl RFMetricsApp {
                 info: None,
                 psnr: crate::metrics::MetricCell::Idle,
                 ssim: crate::metrics::MetricCell::Idle,
+                vmaf: crate::metrics::MetricCell::Idle,
                 xpsnr: crate::metrics::MetricCell::Idle,
                 psnr_cache: CachedStats::default(),
                 ssim_cache: CachedStats::default(),
+                vmaf_cache: CachedStats::default(),
                 xpsnr_cache: CachedStats::default(),
             });
             fresh.push((key, s));
@@ -570,6 +585,7 @@ impl RFMetricsApp {
                     error,
                     skip,
                     clip_dur,
+                    vmaf_cfg,
                 } => {
                     if generation != self.run_generation {
                         log::debug!(target: "rfmetrics::app", "discarded stale {} result", kind.name());
@@ -589,6 +605,7 @@ impl RFMetricsApp {
                                 exec_s,
                                 skip,
                                 clip_dur,
+                                vmaf_cfg,
                             },
                         };
                         // Cache the stats once (clone+sort lives here, not
@@ -612,7 +629,8 @@ impl RFMetricsApp {
                     // settle them to Idle. Finished (`Done`) cells are kept.
                     if aborted {
                         for row in &mut self.rows {
-                            for cell in [&mut row.psnr, &mut row.ssim] {
+                            for kind in MetricKind::ALL {
+                                let cell = row.cell_mut(kind);
                                 if matches!(cell, crate::metrics::MetricCell::Running { .. }) {
                                     *cell = crate::metrics::MetricCell::Idle;
                                 }
@@ -628,8 +646,9 @@ impl RFMetricsApp {
         // the batch — not per message, and never per frame. The scan itself
         // is trivial (min/max over 10 scalars per scored row, no sorting).
         if scored_changed {
-            self.refresh_ranks(MetricKind::Psnr);
-            self.refresh_ranks(MetricKind::Ssim);
+            for kind in MetricKind::ALL {
+                self.refresh_ranks(kind);
+            }
         }
     }
 
@@ -699,11 +718,12 @@ impl RFMetricsApp {
         if self.measuring {
             return;
         }
-        let kinds: Vec<MetricKind> = [MetricKind::Psnr, MetricKind::Ssim, MetricKind::Xpsnr]
+        let kinds: Vec<MetricKind> = MetricKind::ALL
             .into_iter()
             .filter(|k| match k {
                 MetricKind::Psnr => self.m_psnr,
                 MetricKind::Ssim => self.m_ssim,
+                MetricKind::Vmaf => self.m_vmaf,
                 MetricKind::Xpsnr => self.m_xpsnr,
             })
             .collect();
@@ -763,9 +783,26 @@ impl RFMetricsApp {
             );
             return;
         };
+        // Validated VMAF snapshot (Python `vmaf_cfg`): subsample parses to
+        // u32 with max(1, …), pooling maps the UI strings to the enum.
+        // Snapshotted before the partition so VMAF `Done` stamps compare
+        // against the settings this run will use.
+        let vmaf_cfg = crate::metrics::vmaf::VmafCfg {
+            model: self.vmaf_model.clone(),
+            phone: self.vmaf_phone,
+            scale: self.vmaf_scale,
+            pooling: if self.vmaf_pooling == "Harmonic Mean" {
+                crate::metrics::vmaf::Pooling::HarmonicMean
+            } else {
+                crate::metrics::vmaf::Pooling::Mean
+            },
+            subsample: self.vmaf_subsample.parse::<u32>().unwrap_or(1).max(1),
+        };
         // Per metric: rows already holding a valid value sit the rerun out —
         // but only when the trim settings still match: a value computed
-        // under a different skip/clip is stale and must recompute.
+        // under a different skip/clip is stale and must recompute. VMAF
+        // additionally compares its options stamp, so an options change
+        // recomputes just the VMAF column while other metrics keep skipping.
         // Pre-flight error cells above touch `targets` (settings
         // uncomparable there); everything below touches `fresh` only.
         let mut work: Vec<(MetricKind, Vec<usize>, Vec<String>)> = Vec::new();
@@ -776,10 +813,12 @@ impl RFMetricsApp {
                 if let crate::metrics::MetricCell::Done {
                     skip: s,
                     clip_dur: c,
+                    vmaf_cfg: v,
                     ..
                 } = self.rows[i].cell(kind)
                     && *s == skip
                     && *c == clip_dur
+                    && (kind != MetricKind::Vmaf || v.as_ref() == Some(&vmaf_cfg))
                 {
                     skipped.push(self.rows[i].display.clone());
                 } else {
@@ -790,17 +829,22 @@ impl RFMetricsApp {
         }
         let fresh_total: usize = work.iter().map(|(_, f, _)| f.len()).sum();
         if fresh_total == 0 {
-            for (kind, _, skipped) in &work {
-                self.toast(
-                    now,
+            // One combined toast: the slot holds a single message, so per-kind
+            // toasts would overwrite each other and only the last survive.
+            // Identical skip sets merge (`skip_groups`) so shared filenames
+            // print once instead of repeating per metric.
+            let msg = skip_groups(&work)
+                .iter()
+                .map(|(names, skipped)| {
                     format!(
-                        "Skipped {} with existing {} (Reset to recompute)",
+                        "Skipped {} with existing {}",
                         skipped.len(),
-                        kind.name(),
-                    ),
-                    ToastKind::Info,
-                );
-            }
+                        names.join(", ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.toast(now, format!("{msg} (Reset to recompute)"), ToastKind::Info);
             return;
         }
         let Some(ffmpeg_exe) = self.ffmpeg.path.clone() else {
@@ -884,14 +928,25 @@ impl RFMetricsApp {
                     abort: &abort,
                     child_slot: &child_slot,
                 };
-                let out = crate::metrics::ffmpeg::run_metric(&job, &|f| {
-                    let _ = txp.send(MetricMsg::Progress {
-                        generation,
-                        kind,
-                        key: keyp.clone(),
-                        frame: f,
-                    });
-                });
+                let out = if kind == MetricKind::Vmaf {
+                    crate::metrics::vmaf::run_vmaf(&job, &vmaf_cfg, &|f| {
+                        let _ = txp.send(MetricMsg::Progress {
+                            generation,
+                            kind,
+                            key: keyp.clone(),
+                            frame: f,
+                        });
+                    })
+                } else {
+                    crate::metrics::ffmpeg::run_metric(&job, &|f| {
+                        let _ = txp.send(MetricMsg::Progress {
+                            generation,
+                            kind,
+                            key: keyp.clone(),
+                            frame: f,
+                        });
+                    })
+                };
                 let _ = tx.send(MetricMsg::Done {
                     generation,
                     kind,
@@ -902,6 +957,11 @@ impl RFMetricsApp {
                     error: out.error,
                     skip,
                     clip_dur,
+                    vmaf_cfg: if kind == MetricKind::Vmaf {
+                        Some(vmaf_cfg.clone())
+                    } else {
+                        None
+                    },
                 });
             }
             let _ = tx.send(MetricMsg::Finished {
@@ -909,23 +969,24 @@ impl RFMetricsApp {
                 aborted: abort.load(Ordering::SeqCst),
             });
         });
-        for (kind, _, skipped) in &work {
-            if skipped.is_empty() {
-                continue;
-            }
-            let mut list = skipped.join(", ");
-            if list.chars().count() > 80 {
-                list = format!("{}…", list.chars().take(79).collect::<String>());
-            }
-            self.toast(
-                now,
+        // One combined toast (see above), with identical skip sets merged so
+        // shared filenames print once instead of repeating per metric.
+        let parts: Vec<String> = skip_groups(&work)
+            .into_iter()
+            .map(|(names, skipped)| {
+                let mut list = skipped.join(", ");
+                if list.chars().count() > 80 {
+                    list = format!("{}…", list.chars().take(79).collect::<String>());
+                }
                 format!(
                     "Skipped {} with existing {}: {list}",
                     skipped.len(),
-                    kind.name(),
-                ),
-                ToastKind::Info,
-            );
+                    names.join(", ")
+                )
+            })
+            .collect();
+        if !parts.is_empty() {
+            self.toast(now, parts.join("\n"), ToastKind::Info);
         }
     }
 
@@ -961,15 +1022,34 @@ impl RFMetricsApp {
         self.pending = 0;
         self.measuring = false;
         for row in &mut self.rows {
-            row.psnr = crate::metrics::MetricCell::Idle;
-            row.ssim = crate::metrics::MetricCell::Idle;
-            row.xpsnr = crate::metrics::MetricCell::Idle;
-            row.psnr_cache = CachedStats::default();
-            row.ssim_cache = CachedStats::default();
-            row.xpsnr_cache = CachedStats::default();
+            for kind in MetricKind::ALL {
+                *row.cell_mut(kind) = crate::metrics::MetricCell::Idle;
+                *row.cached_mut(kind) = CachedStats::default();
+            }
         }
         log::info!(target: "rfmetrics::app", "metric results cleared");
     }
+}
+
+/// Kinds sharing an identical skip set merge into one toast line
+/// ("Skipped 2 with existing PSNR, SSIM: a, b") so filenames print once
+/// instead of repeating per metric. First-seen kind order is kept.
+fn skip_groups(work: &[(MetricKind, Vec<usize>, Vec<String>)]) -> Vec<(Vec<&str>, &Vec<String>)> {
+    let mut groups: Vec<(Vec<&str>, &Vec<String>)> = Vec::new();
+    for (kind, _, skipped) in work {
+        if skipped.is_empty() {
+            continue;
+        }
+        if let Some(g) = groups
+            .iter_mut()
+            .find(|(_, s)| s.as_slice() == skipped.as_slice())
+        {
+            g.0.push(kind.name());
+        } else {
+            groups.push((vec![kind.name()], skipped));
+        }
+    }
+    groups
 }
 
 /// 1px vertical divider in an exact 3px grid column.
@@ -1013,12 +1093,12 @@ fn rank_fill(rank: crate::metrics::StatRank) -> Option<egui::Color32> {
 
 /// Table metric-column layout, left to right — MUST match the header
 /// checkbox order. `None` slots are stale placeholders for unimplemented
-/// metrics (VMAF until it lands): they render N/A so live columns like
-/// XPSNR stay under their own headers.
+/// metrics (SSIM2/BUTTER/CVVDP): they render N/A so live columns stay
+/// under their own headers.
 const METRIC_COLUMNS: [(Option<MetricKind>, &str); 7] = [
     (Some(MetricKind::Psnr), "PSNR"),
     (Some(MetricKind::Ssim), "SSIM"),
-    (None, "VMAF"),
+    (Some(MetricKind::Vmaf), "VMAF"),
     (Some(MetricKind::Xpsnr), "XPSNR"),
     (None, "SSIM2"),
     (None, "BUTTER"),
@@ -1359,60 +1439,71 @@ impl eframe::App for RFMetricsApp {
         // ---- VMAF options (just above bottom bar) ----
         egui::Panel::bottom("vmaf").show(ui, |ui| {
             ui.add(egui::Label::new("VMAF options").selectable(false));
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add_sized([70.0, 18.0], egui::Label::new("Model").selectable(false));
-                    let _ = egui::ComboBox::from_id_salt("vmaf_model")
-                        .width(220.0)
-                        .selected_text(&self.vmaf_model)
-                        .show_ui(ui, |ui| {
-                            let _ = ui.selectable_value(
-                                &mut self.vmaf_model,
-                                "vmaf_v0.6.1.json".to_owned(),
-                                "vmaf_v0.6.1.json",
-                            );
-                        });
-                    let _ = ui.add(egui::Checkbox::new(&mut self.vmaf_phone, "Phone"));
-                });
-                ui.horizontal(|ui| {
-                    ui.add_sized([70.0, 18.0], egui::Label::new(""));
-                    let _ = ui.add(egui::Checkbox::new(
-                        &mut self.vmaf_scale,
-                        "Scale to model's resolution",
-                    ));
-                });
-                ui.horizontal(|ui| {
-                    ui.add_sized([70.0, 18.0], egui::Label::new("Pooling").selectable(false));
-                    let _ = egui::ComboBox::from_id_salt("vmaf_pooling")
-                        .width(220.0)
-                        .selected_text(&self.vmaf_pooling)
-                        .show_ui(ui, |ui| {
-                            let _ = ui.selectable_value(
-                                &mut self.vmaf_pooling,
-                                "Mean".to_owned(),
-                                "Mean",
-                            );
-                            let _ = ui.selectable_value(
-                                &mut self.vmaf_pooling,
-                                "Harmonic Mean".to_owned(),
-                                "Harmonic Mean",
-                            );
-                        });
-                });
-                ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [70.0, 18.0],
-                        egui::Label::new("Subsample").selectable(false),
-                    );
-                    let _ = egui::ComboBox::from_id_salt("vmaf_subsample")
-                        .width(220.0)
-                        .selected_text(&self.vmaf_subsample)
-                        .show_ui(ui, |ui| {
-                            for v in ["1", "2", "3", "5", "10", "15"] {
-                                let _ =
-                                    ui.selectable_value(&mut self.vmaf_subsample, v.to_owned(), v);
-                            }
-                        });
+            // Dim when running or when the VMAF header checkbox is off
+            // (todo.txt:1 parity with the run_locked inputs above).
+            let vmaf_enabled = !run_locked && self.m_vmaf;
+            ui.add_enabled_ui(vmaf_enabled, |ui| {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([70.0, 18.0], egui::Label::new("Model").selectable(false));
+                        let models = self.vmaf_models.clone();
+                        let _ = egui::ComboBox::from_id_salt("vmaf_model")
+                            .width(220.0)
+                            .selected_text(&self.vmaf_model)
+                            .show_ui(ui, |ui| {
+                                for m in &models {
+                                    let _ = ui.selectable_value(
+                                        &mut self.vmaf_model,
+                                        m.clone(),
+                                        m.as_str(),
+                                    );
+                                }
+                            });
+                        let _ = ui.add(egui::Checkbox::new(&mut self.vmaf_phone, "Phone"));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_sized([70.0, 18.0], egui::Label::new(""));
+                        let _ = ui.add(egui::Checkbox::new(
+                            &mut self.vmaf_scale,
+                            "Scale to model's resolution",
+                        ));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_sized([70.0, 18.0], egui::Label::new("Pooling").selectable(false));
+                        let _ = egui::ComboBox::from_id_salt("vmaf_pooling")
+                            .width(220.0)
+                            .selected_text(&self.vmaf_pooling)
+                            .show_ui(ui, |ui| {
+                                let _ = ui.selectable_value(
+                                    &mut self.vmaf_pooling,
+                                    "Mean".to_owned(),
+                                    "Mean",
+                                );
+                                let _ = ui.selectable_value(
+                                    &mut self.vmaf_pooling,
+                                    "Harmonic Mean".to_owned(),
+                                    "Harmonic Mean",
+                                );
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [70.0, 18.0],
+                            egui::Label::new("Subsample").selectable(false),
+                        );
+                        let _ = egui::ComboBox::from_id_salt("vmaf_subsample")
+                            .width(220.0)
+                            .selected_text(&self.vmaf_subsample)
+                            .show_ui(ui, |ui| {
+                                for v in ["1", "2", "3", "5", "10", "15"] {
+                                    let _ = ui.selectable_value(
+                                        &mut self.vmaf_subsample,
+                                        v.to_owned(),
+                                        v,
+                                    );
+                                }
+                            });
+                    });
                 });
             });
         });
@@ -1446,9 +1537,10 @@ impl eframe::App for RFMetricsApp {
                 {
                     self.rows.retain(|r| !r.selected);
                     self.refresh_queue_names();
-                    // The scored set may have shrunk: re-rank both columns.
-                    self.refresh_ranks(MetricKind::Psnr);
-                    self.refresh_ranks(MetricKind::Ssim);
+                    // The scored set may have shrunk: re-rank all columns.
+                    for kind in MetricKind::ALL {
+                        self.refresh_ranks(kind);
+                    }
                 }
             });
             ui.add_space(4.0);
@@ -1746,14 +1838,14 @@ mod tests {
         use crate::metrics::ffmpeg::MetricKind;
         // Body order must mirror the header checkboxes (PSNR SSIM VMAF
         // XPSNR SSIM2 BUTTER CVVDP); unimplemented slots stay N/A so e.g.
-        // XPSNR values can never slide under the VMAF header.
+        // SSIM2 placeholders can never slide under a live header.
         let kinds: Vec<_> = METRIC_COLUMNS.iter().map(|(k, _)| *k).collect();
         assert_eq!(
             kinds,
             [
                 Some(MetricKind::Psnr),
                 Some(MetricKind::Ssim),
-                None,
+                Some(MetricKind::Vmaf),
                 Some(MetricKind::Xpsnr),
                 None,
                 None,
@@ -1877,9 +1969,11 @@ mod tests {
             info: None,
             psnr: crate::metrics::MetricCell::Idle,
             ssim: crate::metrics::MetricCell::Idle,
+            vmaf: crate::metrics::MetricCell::Idle,
             xpsnr: crate::metrics::MetricCell::Idle,
             psnr_cache: CachedStats::default(),
             ssim_cache: CachedStats::default(),
+            vmaf_cache: CachedStats::default(),
             xpsnr_cache: CachedStats::default(),
         });
         let key = norm_key("C:/vids/a.mp4");
@@ -1932,9 +2026,11 @@ mod tests {
             info: None,
             psnr: crate::metrics::MetricCell::Idle,
             ssim: crate::metrics::MetricCell::Idle,
+            vmaf: crate::metrics::MetricCell::Idle,
             xpsnr: crate::metrics::MetricCell::Idle,
             psnr_cache: CachedStats::default(),
             ssim_cache: CachedStats::default(),
+            vmaf_cache: CachedStats::default(),
             xpsnr_cache: CachedStats::default(),
         }
     }
@@ -1944,6 +2040,7 @@ mod tests {
         let mut app = RFMetricsApp::default();
         app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
         app.m_psnr = false;
+        app.m_vmaf = false;
         app.start_run(0.0);
         assert!(!app.measuring);
         assert!(matches!(app.rows[0].psnr, crate::metrics::MetricCell::Idle));
@@ -1954,6 +2051,7 @@ mod tests {
     fn start_psnr_needs_included_rows() {
         let mut app = RFMetricsApp {
             m_psnr: true,
+            m_vmaf: false,
             ..RFMetricsApp::default()
         };
         // Unchecked include box: the row must not be processed.
@@ -1970,6 +2068,7 @@ mod tests {
         let mut app = RFMetricsApp {
             m_psnr: true,
             m_ssim: true,
+            m_vmaf: false,
             ref_path: p.to_string_lossy().into_owned(),
             skip: "abc".to_owned(),
             ..RFMetricsApp::default()
@@ -2034,6 +2133,7 @@ mod tests {
                 error: None,
                 skip: None,
                 clip_dur: Some(5.0),
+                vmaf_cfg: None,
             })
             .unwrap();
         app.drain_metric_results();
@@ -2063,6 +2163,7 @@ mod tests {
                 error: None,
                 skip: None,
                 clip_dur: None,
+                vmaf_cfg: None,
             })
             .unwrap();
         app.drain_metric_results();
@@ -2098,6 +2199,7 @@ mod tests {
                     error: None,
                     skip: None,
                     clip_dur: None,
+                    vmaf_cfg: None,
                 })
                 .unwrap();
         }
@@ -2126,6 +2228,7 @@ mod tests {
             exec_s: 1.0,
             skip: None,
             clip_dur: None,
+            vmaf_cfg: None,
         };
         let stats = app.rows[0].psnr.done_stats();
         app.rows[0].psnr_cache.stats = stats;
@@ -2148,6 +2251,7 @@ mod tests {
             exec_s: 1.0,
             skip: None,
             clip_dur: None,
+            vmaf_cfg: None,
         };
         app.rows[1].psnr = MetricCell::Running { frame: 12 };
         app.rows[1].ssim = MetricCell::Running { frame: 3 };
@@ -2203,6 +2307,7 @@ mod tests {
                 error: Some("aborted".to_owned()),
                 skip: None,
                 clip_dur: None,
+                vmaf_cfg: None,
             })
             .unwrap();
         app.drain_metric_results();
@@ -2246,6 +2351,7 @@ mod tests {
         let mut app = RFMetricsApp {
             m_psnr: true,
             m_ssim: true,
+            m_vmaf: false,
             ref_path: p.to_string_lossy().into_owned(),
             skip: "abc".to_owned(), // unparseable: settings uncomparable
             ..RFMetricsApp::default()
@@ -2258,6 +2364,7 @@ mod tests {
             exec_s: 1.0,
             skip: None,
             clip_dur: None,
+            vmaf_cfg: None,
         };
         app.start_run(0.0);
         std::fs::remove_file(&p).ok();
@@ -2281,6 +2388,7 @@ mod tests {
         std::fs::write(&p, b"x").unwrap();
         let mut app = RFMetricsApp {
             m_psnr: true,
+            m_vmaf: false,
             ref_path: p.to_string_lossy().into_owned(),
             ..RFMetricsApp::default()
         };
@@ -2291,6 +2399,7 @@ mod tests {
             exec_s: 1.0,
             skip: None,
             clip_dur: None,
+            vmaf_cfg: None,
         };
         app.start_run(0.0);
         std::fs::remove_file(&p).ok();
@@ -2311,6 +2420,7 @@ mod tests {
         std::fs::write(&p, b"x").unwrap();
         let mut app = RFMetricsApp {
             m_psnr: true,
+            m_vmaf: false,
             ref_path: p.to_string_lossy().into_owned(),
             ..RFMetricsApp::default()
         };
@@ -2327,6 +2437,7 @@ mod tests {
             exec_s: 1.0,
             skip: None,
             clip_dur: None,
+            vmaf_cfg: None,
         };
         app.rows[0].info = Some(MediaInfo::default());
         app.rows[1].info = Some(MediaInfo::default());
@@ -2367,6 +2478,7 @@ mod tests {
         std::fs::write(&p, b"x").unwrap();
         let mut app = RFMetricsApp {
             m_psnr: true,
+            m_vmaf: false,
             ref_path: p.to_string_lossy().into_owned(),
             duration: "10".to_owned(), // value was computed with clip 5
             ..RFMetricsApp::default()
@@ -2380,6 +2492,7 @@ mod tests {
             exec_s: 1.0,
             skip: None,
             clip_dur: Some(5.0),
+            vmaf_cfg: None,
         };
         app.rows[0].info = Some(MediaInfo::default());
         app.start_run(0.0);
@@ -2410,6 +2523,7 @@ mod tests {
         std::fs::write(&p, b"x").unwrap();
         let mut app = RFMetricsApp {
             m_psnr: true,
+            m_vmaf: false,
             ref_path: p.to_string_lossy().into_owned(),
             duration: "10".to_owned(),
             ..RFMetricsApp::default()
@@ -2423,6 +2537,7 @@ mod tests {
             exec_s: 1.0,
             skip: None,
             clip_dur: Some(10.0),
+            vmaf_cfg: None,
         };
         app.rows[0].info = Some(MediaInfo::default());
         app.start_run(0.0);
@@ -2437,6 +2552,262 @@ mod tests {
         assert!(toast.text.contains("Skipped 1 with existing PSNR"));
     }
 
+    /// VMAF options change invalidates VMAF alone: the stale-stamped VMAF
+    /// cell recomputes while a valid PSNR cell on the same row keeps
+    /// skipping (no Reset needed).
+    #[test]
+    fn start_run_vmaf_settings_change_recomputes_vmaf_only() {
+        use crate::metrics::MetricCell;
+        use crate::metrics::vmaf::{Pooling, VmafCfg};
+        use crate::probe::MediaInfo;
+        let p = std::env::temp_dir().join("rfmetrics-vmaf-restamp.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            m_psnr: true,
+            m_vmaf: true,
+            ref_path: p.to_string_lossy().into_owned(),
+            ..RFMetricsApp::default()
+        };
+        // Current UI settings snapshot to subsample 1; the stored VMAF
+        // value was computed under subsample 5.
+        app.vmaf_subsample = "1".to_owned();
+        app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+        app.ref_info_data = Some(MediaInfo::default());
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows[0].psnr = MetricCell::Done {
+            values: vec![30.0],
+            avg: 30.0,
+            exec_s: 1.0,
+            skip: None,
+            clip_dur: None,
+            vmaf_cfg: None,
+        };
+        app.rows[0].vmaf = MetricCell::Done {
+            values: vec![90.0],
+            avg: 90.0,
+            exec_s: 1.0,
+            skip: None,
+            clip_dur: None,
+            vmaf_cfg: Some(VmafCfg {
+                model: "vmaf_v0.6.1.json".to_owned(),
+                phone: false,
+                scale: false,
+                pooling: Pooling::Mean,
+                subsample: 5,
+            }),
+        };
+        app.rows[0].info = Some(MediaInfo::default());
+        app.start_run(0.0);
+        std::fs::remove_file(&p).ok();
+        assert!(app.measuring);
+        assert!(
+            matches!(&app.rows[0].psnr, MetricCell::Done { .. }),
+            "valid PSNR must keep skipping, got {:?}",
+            app.rows[0].psnr,
+        );
+        assert!(
+            matches!(&app.rows[0].vmaf, MetricCell::Running { .. }),
+            "stale-stamped VMAF must recompute, got {:?}",
+            app.rows[0].vmaf,
+        );
+        for _ in 0..200 {
+            app.drain_metric_results();
+            if !app.measuring {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!app.measuring);
+        // Spawn fails headless (bogus binary): the cell records the error
+        // while PSNR still holds its skipped value.
+        assert!(matches!(&app.rows[0].vmaf, MetricCell::Error { .. }));
+        assert!(matches!(&app.rows[0].psnr, MetricCell::Done { .. }));
+    }
+
+    /// Matching VMAF stamp still skips: unchanged options recompute nothing.
+    #[test]
+    fn start_run_vmaf_matching_settings_still_skips() {
+        use crate::metrics::MetricCell;
+        use crate::metrics::vmaf::{Pooling, VmafCfg};
+        use crate::probe::MediaInfo;
+        let p = std::env::temp_dir().join("rfmetrics-vmaf-samestamp.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            m_psnr: true,
+            m_vmaf: true,
+            ref_path: p.to_string_lossy().into_owned(),
+            ..RFMetricsApp::default()
+        };
+        app.vmaf_subsample = "1".to_owned();
+        app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+        app.ref_info_data = Some(MediaInfo::default());
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows[0].psnr = MetricCell::Done {
+            values: vec![30.0],
+            avg: 30.0,
+            exec_s: 1.0,
+            skip: None,
+            clip_dur: None,
+            vmaf_cfg: None,
+        };
+        app.rows[0].vmaf = MetricCell::Done {
+            values: vec![90.0],
+            avg: 90.0,
+            exec_s: 1.0,
+            skip: None,
+            clip_dur: None,
+            vmaf_cfg: Some(VmafCfg {
+                model: "vmaf_v0.6.1.json".to_owned(),
+                phone: false,
+                scale: false,
+                pooling: Pooling::Mean,
+                subsample: 1,
+            }),
+        };
+        app.rows[0].info = Some(MediaInfo::default());
+        app.start_run(0.0);
+        std::fs::remove_file(&p).ok();
+        assert!(!app.measuring);
+        assert!(matches!(&app.rows[0].psnr, MetricCell::Done { .. }));
+        assert!(matches!(&app.rows[0].vmaf, MetricCell::Done { .. }));
+        let toast = app.toast.as_ref().expect("skip toast shown");
+        assert_eq!(
+            toast.text,
+            "Skipped 1 with existing PSNR, VMAF (Reset to recompute)"
+        );
+    }
+
+    /// All-metrics skip lists every metric: the single toast slot must name
+    /// PSNR, SSIM, and VMAF instead of collapsing to the last one (VMAF).
+    #[test]
+    fn start_run_skip_toast_lists_all_metrics() {
+        use crate::metrics::MetricCell;
+        use crate::metrics::vmaf::{Pooling, VmafCfg};
+        let p = std::env::temp_dir().join("rfmetrics-skipall-metrics.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            m_psnr: true,
+            m_ssim: true,
+            m_vmaf: true,
+            ref_path: p.to_string_lossy().into_owned(),
+            ..RFMetricsApp::default()
+        };
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        let done = |avg: f64| MetricCell::Done {
+            values: vec![avg],
+            avg,
+            exec_s: 1.0,
+            skip: None,
+            clip_dur: None,
+            vmaf_cfg: None,
+        };
+        app.rows[0].psnr = done(30.0);
+        app.rows[0].ssim = done(0.9);
+        app.rows[0].vmaf = MetricCell::Done {
+            values: vec![90.0],
+            avg: 90.0,
+            exec_s: 1.0,
+            skip: None,
+            clip_dur: None,
+            vmaf_cfg: Some(VmafCfg {
+                model: "vmaf_v0.6.1.json".to_owned(),
+                phone: false,
+                scale: false,
+                pooling: Pooling::Mean,
+                subsample: 1,
+            }),
+        };
+        app.start_run(0.0);
+        std::fs::remove_file(&p).ok();
+        assert!(!app.measuring);
+        // Shared skip set merges into one line instead of repeating it
+        // per metric (previously only the VMAF line survived).
+        let toast = app.toast.as_ref().expect("skip toast shown");
+        assert_eq!(
+            toast.text,
+            "Skipped 1 with existing PSNR, SSIM, VMAF (Reset to recompute)"
+        );
+    }
+
+    /// VMAF recompute alongside skipped metrics lists shared filenames
+    /// once: 2 rows skip PSNR+SSIM while VMAF alone runs on both.
+    #[test]
+    fn start_run_skip_toast_merges_shared_rows() {
+        use crate::metrics::MetricCell;
+        use crate::metrics::vmaf::{Pooling, VmafCfg};
+        use crate::probe::MediaInfo;
+        let p = std::env::temp_dir().join("rfmetrics-skip-merge.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            m_psnr: true,
+            m_ssim: true,
+            m_vmaf: true,
+            ref_path: p.to_string_lossy().into_owned(),
+            ..RFMetricsApp::default()
+        };
+        app.vmaf_subsample = "1".to_owned();
+        app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+        app.ref_info_data = Some(MediaInfo::default());
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows.push(psnr_test_row("C:/vids/b.mp4", true));
+        app.rows[1].display = "b.mp4".to_owned();
+        let stale_vmaf = || MetricCell::Done {
+            values: vec![90.0],
+            avg: 90.0,
+            exec_s: 1.0,
+            skip: None,
+            clip_dur: None,
+            vmaf_cfg: Some(VmafCfg {
+                model: "vmaf_v0.6.1.json".to_owned(),
+                phone: false,
+                scale: false,
+                pooling: Pooling::Mean,
+                subsample: 5,
+            }),
+        };
+        for i in 0..2 {
+            app.rows[i].psnr = MetricCell::Done {
+                values: vec![30.0],
+                avg: 30.0,
+                exec_s: 1.0,
+                skip: None,
+                clip_dur: None,
+                vmaf_cfg: None,
+            };
+            app.rows[i].ssim = MetricCell::Done {
+                values: vec![0.9],
+                avg: 0.9,
+                exec_s: 1.0,
+                skip: None,
+                clip_dur: None,
+                vmaf_cfg: None,
+            };
+            app.rows[i].vmaf = stale_vmaf();
+            app.rows[i].info = Some(MediaInfo::default());
+        }
+        app.start_run(0.0);
+        std::fs::remove_file(&p).ok();
+        assert!(app.measuring);
+        // One line, filenames once — not repeated per metric.
+        let toast = app.toast.as_ref().expect("skip toast shown");
+        assert_eq!(
+            toast.text,
+            "Skipped 2 with existing PSNR, SSIM: a.mp4, b.mp4"
+        );
+        assert!(matches!(&app.rows[0].vmaf, MetricCell::Running { .. }));
+        assert!(matches!(&app.rows[1].vmaf, MetricCell::Running { .. }));
+        for _ in 0..200 {
+            app.drain_metric_results();
+            if !app.measuring {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!app.measuring);
+        assert!(matches!(&app.rows[0].psnr, MetricCell::Done { .. }));
+        assert!(matches!(&app.rows[1].ssim, MetricCell::Done { .. }));
+    }
+
     /// SSIM-only run: only the SSIM cell enters the run, PSNR stays Idle.
     #[test]
     fn start_run_ssim_only_runs_ssim_cell() {
@@ -2446,6 +2817,7 @@ mod tests {
         std::fs::write(&p, b"x").unwrap();
         let mut app = RFMetricsApp {
             m_ssim: true,
+            m_vmaf: false,
             ref_path: p.to_string_lossy().into_owned(),
             ..RFMetricsApp::default()
         };
@@ -2482,6 +2854,7 @@ mod tests {
         let mut app = RFMetricsApp {
             m_psnr: true,
             m_ssim: true,
+            m_vmaf: false,
             ref_path: p.to_string_lossy().into_owned(),
             ..RFMetricsApp::default()
         };
@@ -2494,6 +2867,7 @@ mod tests {
             exec_s: 1.0,
             skip: None,
             clip_dur: None,
+            vmaf_cfg: None,
         };
         app.rows[0].info = Some(MediaInfo::default());
         app.start_run(0.0);
@@ -2525,6 +2899,7 @@ mod tests {
         std::fs::write(&p, b"x").unwrap();
         let mut app = RFMetricsApp {
             m_xpsnr: true,
+            m_vmaf: false,
             ref_path: p.to_string_lossy().into_owned(),
             ..RFMetricsApp::default()
         };
@@ -2565,6 +2940,7 @@ mod tests {
         let mut app = RFMetricsApp {
             m_psnr: true,
             m_xpsnr: true,
+            m_vmaf: false,
             ref_path: p.to_string_lossy().into_owned(),
             ..RFMetricsApp::default()
         };
@@ -2577,6 +2953,7 @@ mod tests {
             exec_s: 1.0,
             skip: None,
             clip_dur: None,
+            vmaf_cfg: None,
         };
         app.rows[0].info = Some(MediaInfo::default());
         app.start_run(0.0);

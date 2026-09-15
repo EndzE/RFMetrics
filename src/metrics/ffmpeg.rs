@@ -15,15 +15,25 @@ pub enum MetricKind {
     Psnr,
     Ssim,
     Xpsnr,
+    Vmaf,
 }
 
 impl MetricKind {
+    /// All ffmpeg-backed metrics, in Python `METRICS` run order.
+    pub const ALL: [MetricKind; 4] = [
+        MetricKind::Psnr,
+        MetricKind::Ssim,
+        MetricKind::Vmaf,
+        MetricKind::Xpsnr,
+    ];
+
     /// Display name for cells, tooltips, and logs.
     pub fn name(self) -> &'static str {
         match self {
             Self::Psnr => "PSNR",
             Self::Ssim => "SSIM",
             Self::Xpsnr => "XPSNR",
+            Self::Vmaf => "VMAF",
         }
     }
 
@@ -33,6 +43,8 @@ impl MetricKind {
             Self::Psnr => "psnr",
             Self::Ssim => "ssim",
             Self::Xpsnr => "xpsnr",
+            // VMAF never uses `filtergraph` (own libvmaf builder in vmaf.rs).
+            Self::Vmaf => "libvmaf",
         }
     }
 
@@ -98,6 +110,17 @@ fn err_progress_re() -> &'static regex::Regex {
     RE.get_or_init(|| regex::Regex::new(r"frame=\s*(\d+)").unwrap())
 }
 
+/// Max `frame=` progress number in one stderr segment (`frame=  12`).
+/// A segment can hold several updates, so all matches are scanned —
+/// first-match-only scanning stuck VMAF at Frame: 0/1 on `\r`-joined
+/// progress blobs.
+fn max_frame_in(text: &str) -> Option<u64> {
+    err_progress_re()
+        .captures_iter(text)
+        .filter_map(|c| c.get(1)?.as_str().parse::<u64>().ok())
+        .max()
+}
+
 /// Per-frame value from a `stats_file=-` stdout line.
 /// PSNR (`n:1 ... psnr_avg:34.12 ...`) clamps to 0–100; SSIM
 /// (`n:1 ... All:0.985210 ...`, Y/U/V ignored) clamps to 0–1 and strips a
@@ -117,7 +140,8 @@ pub fn parse_frame_line(line: &str, kind: MetricKind) -> Option<f64> {
             1.0,
         ),
         // XPSNR combines three planes with weights: use parse_xpsnr_frame_line.
-        MetricKind::Xpsnr => return None,
+        // VMAF parses its JSON log instead: use vmaf::parse_vmaf_log.
+        MetricKind::Xpsnr | MetricKind::Vmaf => return None,
     };
     let v: f64 = raw.parse().ok()?;
     if v.is_nan() {
@@ -158,10 +182,39 @@ pub fn parse_summary(text: &str, kind: MetricKind) -> Option<f64> {
                 }
             }
             // XPSNR combines three planes with weights: use parse_xpsnr_summary.
-            MetricKind::Xpsnr => {}
+            // VMAF parses its JSON log instead: use vmaf::parse_vmaf_log.
+            MetricKind::Xpsnr | MetricKind::Vmaf => {}
         }
     }
     None
+}
+
+/// Timestamp reset shared by every filtergraph leg.
+pub(crate) const NORM: &str = "settb=AVTB,setpts=PTS-STARTPTS";
+
+/// Trim window shared by every filtergraph (Python `if skip or clip_dur:`
+/// parity — 0.0 is falsy, so a zero skip/clip disables trim instead of
+/// producing an empty `trim=start=0:end=0`).
+pub(crate) fn trim_window(skip: Option<f64>, clip_dur: Option<f64>) -> Vec<String> {
+    let mut window = Vec::new();
+    if skip.is_some_and(|v| v != 0.0) || clip_dur.is_some_and(|v| v != 0.0) {
+        let start = skip.unwrap_or(0.0);
+        let end = clip_dur
+            .filter(|&d| d != 0.0)
+            .map(|d| format!(":end={}", start + d))
+            .unwrap_or_default();
+        window.push(format!("trim=start={start}{end}"));
+    }
+    window
+}
+
+/// `-r` input flags shared by every ffmpeg invocation (Python parity: the
+/// same rate feeds both inputs).
+pub(crate) fn rate_args(ref_info: &MediaInfo, dist_info: &MediaInfo) -> Vec<String> {
+    match ref_info.fps.or(dist_info.fps) {
+        Some(fps) => vec!["-r".to_owned(), crate::probe::format_fps(fps)],
+        None => Vec::new(),
+    }
 }
 
 /// Python `_compute_series` filtergraph for filter-based metrics. Inputs are
@@ -176,18 +229,9 @@ pub fn filtergraph(
     skip: Option<f64>,
     clip_dur: Option<f64>,
 ) -> String {
-    const NORM: &str = "settb=AVTB,setpts=PTS-STARTPTS";
     // Python `if skip or clip_dur:` — 0.0 is falsy, so a zero skip/clip
     // disables trim instead of producing an empty `trim=start=0:end=0`.
-    let mut window = Vec::new();
-    if skip.is_some_and(|v| v != 0.0) || clip_dur.is_some_and(|v| v != 0.0) {
-        let start = skip.unwrap_or(0.0);
-        let end = clip_dur
-            .filter(|&d| d != 0.0)
-            .map(|d| format!(":end={}", start + d))
-            .unwrap_or_default();
-        window.push(format!("trim=start={start}{end}"));
-    }
+    let window = trim_window(skip, clip_dur);
     let mut pre: Vec<String> = window.iter().map(|s| s.to_string()).collect();
     pre.push(NORM.to_owned());
     if (dist_info.width, dist_info.height) != (ref_info.width, ref_info.height)
@@ -325,16 +369,10 @@ pub fn build_args(
     clip_dur: Option<f64>,
 ) -> Vec<String> {
     let mut args = vec!["-hide_banner".to_owned(), "-nostdin".to_owned()];
-    if let Some(fps) = ref_info.fps.or(dist_info.fps) {
-        args.push("-r".to_owned());
-        args.push(crate::probe::format_fps(fps));
-    }
+    args.extend(rate_args(ref_info, dist_info));
     args.push("-i".to_owned());
     args.push(dist_path.to_owned());
-    if let Some(fps) = ref_info.fps.or(dist_info.fps) {
-        args.push("-r".to_owned());
-        args.push(crate::probe::format_fps(fps));
-    }
+    args.extend(rate_args(ref_info, dist_info));
     args.push("-i".to_owned());
     args.push(ref_path.to_owned());
     args.push("-filter_complex".to_owned());
@@ -366,12 +404,133 @@ pub struct RunOutcome {
     pub error: Option<String>,
 }
 
-/// Blocking filter-metric run; call off the UI thread. Progress is
-/// monotonic-ish: only frame numbers above the shared high-water mark are
-/// reported, from both the stdout `n:` feed and the stderr `frame=` feed
-/// (Python dual-feed parity); the UI keeps the max per row.
+/// Result of pumping one ffmpeg child to completion.
+pub(crate) struct Pumped {
+    pub code: Option<i32>,
+    pub stderr: String,
+    pub exec_s: f64,
+    pub aborted: bool,
+}
+
+/// Shared process skeleton for every ffmpeg metric (Python parity: piped
+/// stdout/stderr, live `frame=` + `n:` progress, abort-slot publish/kill/
+/// reap). The caller owns parsing: stdout lines stream into `on_stdout_line`
+/// (VMAF ignores them but the pipe must still drain), progress from both
+/// feeds is deduplicated through a shared high-water mark.
 /// ponytail: plain wait(), no wait-timeout dep — a stuck ffmpeg only stalls
 /// this worker thread, never the UI.
+pub(crate) fn pump_process(
+    exe: &Path,
+    args: &[String],
+    cwd: Option<&Path>,
+    abort: &AtomicBool,
+    child_slot: &Mutex<Option<Child>>,
+    mut on_stdout_line: impl FnMut(&str) + Send,
+    on_progress: &(dyn Fn(u64) + Sync),
+) -> Result<Pumped, String> {
+    let start = std::time::Instant::now();
+    let mut cmd = Command::new(exe);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return Err(format!("spawn failed: {e}")),
+    };
+    // Take the pipes before publishing: the child moves into the slot next.
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    // Publish the child so Stop can kill it; reaped below once the pipes
+    // drain (or already reaped by Stop, which sets `abort` first).
+    if child_slot
+        .lock()
+        .map(|mut slot| slot.replace(child))
+        .is_err()
+    {
+        return Err("internal lock error".to_owned());
+    }
+    // Readers: live progress feed + full stderr capture.
+    // Scoped threads so borrowed callbacks need not be 'static.
+    let max_sent = Arc::new(AtomicU64::new(0));
+    let err_text = std::thread::scope(|s| {
+        let err_max = Arc::clone(&max_sent);
+        let err_handle = stderr.map(|err| {
+            s.spawn(move || {
+                use std::io::Read;
+                let mut lines = Vec::new();
+                let mut seg: Vec<u8> = Vec::new();
+                // ffmpeg draws its `frame=` meter with `\r` (no `\n` until
+                // exit); Python reads stderr in universal-newlines mode, so
+                // `\r` is a line boundary there too. Splitting on `\n` only
+                // yields zero complete lines mid-run — VMAF progress stuck
+                // at Frame: 0 with no stdout `n:` feed to fall back on.
+                let flush = |seg: &mut Vec<u8>, lines: &mut Vec<String>| {
+                    if seg.is_empty() {
+                        return;
+                    }
+                    let text = String::from_utf8_lossy(seg).into_owned();
+                    if let Some(f) = max_frame_in(&text)
+                        && f > err_max.fetch_max(f, Ordering::SeqCst)
+                    {
+                        on_progress(f);
+                    }
+                    lines.push(text);
+                    seg.clear();
+                };
+                let mut reader = BufReader::new(err);
+                let mut tmp = [0u8; 4096];
+                loop {
+                    match reader.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            for &b in &tmp[..n] {
+                                if b == b'\r' || b == b'\n' {
+                                    flush(&mut seg, &mut lines);
+                                } else {
+                                    seg.push(b);
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                flush(&mut seg, &mut lines);
+                lines.join("\n")
+            })
+        });
+        if let Some(out) = stdout {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                if let Some(f) = parse_progress(&line)
+                    && f > max_sent.fetch_max(f, Ordering::SeqCst)
+                {
+                    on_progress(f);
+                }
+                on_stdout_line(&line);
+            }
+        }
+        err_handle
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default()
+    });
+    // Reap: Stop takes + kills + waits ahead of us when aborting (it sets
+    // the flag first, so a missing child always means "aborted").
+    let status = child_slot
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+        .map(|mut c| c.wait());
+    let aborted = abort.load(Ordering::SeqCst);
+    Ok(Pumped {
+        code: status.and_then(|s| s.ok()).and_then(|s| s.code()),
+        stderr: err_text,
+        exec_s: start.elapsed().as_secs_f64(),
+        aborted,
+    })
+}
+
+/// Blocking filter-metric run; call off the UI thread. The UI keeps the max
+/// per row from the progress feed.
 pub fn run_metric(job: &RunInputs<'_>, on_progress: &(dyn Fn(u64) + Sync)) -> RunOutcome {
     let RunInputs {
         kind,
@@ -399,86 +558,35 @@ pub fn run_metric(job: &RunInputs<'_>, on_progress: &(dyn Fn(u64) + Sync)) -> Ru
         exec_s: 0.0,
         error: Some(msg),
     };
-    let start = std::time::Instant::now();
     let args = build_args(
         kind, ref_path, dist_path, ref_info, dist_info, skip, clip_dur,
     );
     log::debug!(target: "rfmetrics::metric", "run: \"{}\" {}", exe.display(), args.join(" "));
-    let mut child = match Command::new(exe)
-        .args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
+    let mut values = Vec::new();
+    let pumped = match pump_process(
+        exe,
+        &args,
+        None,
+        abort,
+        child_slot,
+        |line| {
+            if let Some(v) = match kind {
+                MetricKind::Xpsnr => parse_xpsnr_frame_line(line, weights),
+                kind => parse_frame_line(line, kind),
+            } {
+                values.push(v);
+            }
+        },
+        on_progress,
+    ) {
+        Ok(p) => p,
         Err(e) => {
-            log::warn!(target: "rfmetrics::metric", "{name} spawn failed: {e}");
-            return fail(format!("spawn failed: {e}"));
+            log::warn!(target: "rfmetrics::metric", "{name} {e}");
+            return fail(e);
         }
     };
-    // Take the pipes before publishing: the child moves into the slot next.
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    // Publish the child so Stop can kill it; reaped below once the pipes
-    // drain (or already reaped by Stop, which sets `abort` first).
-    if child_slot
-        .lock()
-        .map(|mut slot| slot.replace(child))
-        .is_err()
-    {
-        return fail("internal lock error".to_owned());
-    }
-    // Stderr reader: live `frame=` progress feed + summary capture.
-    // Scoped thread so the borrowed progress callback need not be 'static.
-    let max_sent = Arc::new(AtomicU64::new(0));
-    let (values, err_text) = std::thread::scope(|s| {
-        let err_max = Arc::clone(&max_sent);
-        let err_handle = stderr.map(|err| {
-            s.spawn(move || {
-                let mut lines = Vec::new();
-                for line in BufReader::new(err).lines().map_while(Result::ok) {
-                    if let Some(f) = err_progress_re()
-                        .captures(&line)
-                        .and_then(|c| c.get(1)?.as_str().parse::<u64>().ok())
-                        && f > err_max.fetch_max(f, Ordering::SeqCst)
-                    {
-                        on_progress(f);
-                    }
-                    lines.push(line);
-                }
-                lines.join("\n")
-            })
-        });
-        let mut values = Vec::new();
-        if let Some(out) = stdout {
-            for line in BufReader::new(out).lines().map_while(Result::ok) {
-                if let Some(f) = parse_progress(&line)
-                    && f > max_sent.fetch_max(f, Ordering::SeqCst)
-                {
-                    on_progress(f);
-                }
-                if let Some(v) = match kind {
-                    MetricKind::Xpsnr => parse_xpsnr_frame_line(&line, weights),
-                    kind => parse_frame_line(&line, kind),
-                } {
-                    values.push(v);
-                }
-            }
-        }
-        let err_text = err_handle
-            .map(|h| h.join().unwrap_or_default())
-            .unwrap_or_default();
-        (values, err_text)
-    });
-    // Reap: Stop takes + kills + waits ahead of us when aborting (it sets
-    // the flag first, so a missing child always means "aborted").
-    let status = child_slot
-        .lock()
-        .ok()
-        .and_then(|mut slot| slot.take())
-        .map(|mut c| c.wait());
-    let exec_s = start.elapsed().as_secs_f64();
-    if abort.load(Ordering::SeqCst) {
+    let (code, err_text, exec_s) = (pumped.code, pumped.stderr, pumped.exec_s);
+    if pumped.aborted {
         log::info!(target: "rfmetrics::metric", "{name} \"{dist_path}\" aborted after {exec_s:.1}s");
         return RunOutcome {
             values: Vec::new(),
@@ -487,7 +595,6 @@ pub fn run_metric(job: &RunInputs<'_>, on_progress: &(dyn Fn(u64) + Sync)) -> Ru
             error: Some("aborted".to_owned()),
         };
     }
-    let code = status.and_then(|s| s.ok()).and_then(|s| s.code());
     if values.is_empty() {
         let tail = err_text.lines().map(str::trim).rfind(|l| !l.is_empty());
         let msg = tail.unwrap_or(&format!("no {name} data")).to_owned();
@@ -529,6 +636,17 @@ mod tests {
             pix_fmt: Some("yuv420p".to_owned()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn stderr_progress_scans_all_matches_per_segment() {
+        // ffmpeg draws its progress meter with `\r`: one read can hold many
+        // `frame=` updates. First-match-only scanning reported just the
+        // first and VMAF (no stdout `n:` feed) stuck at Frame: 0.
+        let blob = "frame= 1 fps=100 q=-0.0 size=N/A time=00:00:01 bitrate=N/A speed=4x\rframe= 27 fps=110 q=-0.0 size=N/A time=00:00:02 bitrate=N/A speed=4x";
+        assert_eq!(max_frame_in(blob), Some(27));
+        assert_eq!(max_frame_in("frame=  3 fps=25"), Some(3));
+        assert_eq!(max_frame_in("no progress here"), None);
     }
 
     #[test]

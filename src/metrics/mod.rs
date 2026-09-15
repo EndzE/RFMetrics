@@ -1,4 +1,5 @@
 pub mod ffmpeg;
+pub mod vmaf;
 
 /// Per-cell lifecycle of one metric on one queue row (Python `results` dict
 /// entry + label text rolled into one).
@@ -17,6 +18,9 @@ pub enum MetricCell {
         /// must recompute instead of trusting this value.
         skip: Option<f64>,
         clip_dur: Option<f64>,
+        /// VMAF settings the run used (`None` for other metrics); a rerun
+        /// under different VMAF options recomputes just that column.
+        vmaf_cfg: Option<crate::metrics::vmaf::VmafCfg>,
     },
     Error {
         msg: String,
@@ -369,6 +373,7 @@ mod tests {
                 exec_s: 1.0,
                 skip: None,
                 clip_dur: None,
+                vmaf_cfg: None,
             }
             .cell_text(),
             "30.1235"
@@ -380,6 +385,7 @@ mod tests {
                 exec_s: 1.0,
                 skip: None,
                 clip_dur: None,
+                vmaf_cfg: None,
             }
             .tooltip("PSNR")
             .starts_with("PSNR\nAvg: 30.000000")
