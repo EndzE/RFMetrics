@@ -1452,11 +1452,16 @@ impl eframe::App for RFMetricsApp {
             ui.add_enabled_ui(vmaf_enabled, |ui| {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.add_sized([70.0, 18.0], egui::Label::new("Model").selectable(false));
-                        let models = self.vmaf_models.clone();
-                        let _ = egui::ComboBox::from_id_salt("vmaf_model")
-                            .width(220.0)
-                            .selected_text(&self.vmaf_model)
+                    ui.add_sized([70.0, 18.0], egui::Label::new("Model").selectable(false));
+                    let models = self.vmaf_models.clone();
+                    // Tall enough for every model: the default max menu
+                    // height scrolls past ~10 entries. This is a ceiling —
+                    // the popup still shrinks to its content.
+                    let menu_h = models.len() as f32 * 24.0 + 16.0;
+                    let _ = egui::ComboBox::from_id_salt("vmaf_model")
+                        .width(220.0)
+                        .height(menu_h)
+                        .selected_text(&self.vmaf_model)
                             .show_ui(ui, |ui| {
                                 for m in &models {
                                     let _ = ui.selectable_value(
