@@ -210,6 +210,9 @@ fn count_packets(exe: &Path, path: &str) -> Option<i64> {
         .args([
             "-v",
             "error",
+            // FFMetrics.conf parity: larger probe window for sparse headers.
+            "-probesize",
+            "50M",
             "-select_streams",
             "v:0",
             "-count_packets",
@@ -247,6 +250,9 @@ pub(crate) fn probe_media(path: &str, ffprobe: Option<&Path>) -> Option<MediaInf
         .args([
             "-v",
             "quiet",
+            // FFMetrics.conf parity: larger probe window for sparse headers.
+            "-probesize",
+            "50M",
             "-print_format",
             "json",
             "-show_format",
@@ -437,6 +443,9 @@ pub fn reference_media_text(path: &str, ffprobe: Option<&Path>) -> (String, Opti
         .args([
             "-v",
             "quiet",
+            // FFMetrics.conf parity: larger probe window for sparse headers.
+            "-probesize",
+            "50M",
             "-print_format",
             "json",
             "-show_format",

@@ -19,10 +19,16 @@ struct QueueRow {
     ssim: crate::metrics::MetricCell,
     vmaf: crate::metrics::MetricCell,
     xpsnr: crate::metrics::MetricCell,
+    ssim2: crate::metrics::MetricCell,
+    butter: crate::metrics::MetricCell,
+    cvvdp: crate::metrics::MetricCell,
     psnr_cache: CachedStats,
     ssim_cache: CachedStats,
     vmaf_cache: CachedStats,
     xpsnr_cache: CachedStats,
+    ssim2_cache: CachedStats,
+    butter_cache: CachedStats,
+    cvvdp_cache: CachedStats,
 }
 
 /// Cached per-row stats + cross-row ranks for one metric column (H1: the
@@ -41,6 +47,9 @@ impl QueueRow {
             MetricKind::Ssim => &self.ssim,
             MetricKind::Vmaf => &self.vmaf,
             MetricKind::Xpsnr => &self.xpsnr,
+            MetricKind::Ssim2 => &self.ssim2,
+            MetricKind::But => &self.butter,
+            MetricKind::Cvvdp => &self.cvvdp,
         }
     }
 
@@ -50,6 +59,9 @@ impl QueueRow {
             MetricKind::Ssim => &mut self.ssim,
             MetricKind::Vmaf => &mut self.vmaf,
             MetricKind::Xpsnr => &mut self.xpsnr,
+            MetricKind::Ssim2 => &mut self.ssim2,
+            MetricKind::But => &mut self.butter,
+            MetricKind::Cvvdp => &mut self.cvvdp,
         }
     }
 
@@ -59,6 +71,9 @@ impl QueueRow {
             MetricKind::Ssim => &self.ssim_cache,
             MetricKind::Vmaf => &self.vmaf_cache,
             MetricKind::Xpsnr => &self.xpsnr_cache,
+            MetricKind::Ssim2 => &self.ssim2_cache,
+            MetricKind::But => &self.butter_cache,
+            MetricKind::Cvvdp => &self.cvvdp_cache,
         }
     }
 
@@ -68,9 +83,18 @@ impl QueueRow {
             MetricKind::Ssim => &mut self.ssim_cache,
             MetricKind::Vmaf => &mut self.vmaf_cache,
             MetricKind::Xpsnr => &mut self.xpsnr_cache,
+            MetricKind::Ssim2 => &mut self.ssim2_cache,
+            MetricKind::But => &mut self.butter_cache,
+            MetricKind::Cvvdp => &mut self.cvvdp_cache,
         }
     }
 }
+
+/// File picker extensions (FFMetrics.conf `VideoFilesList` parity).
+const VIDEO_EXTS: &[&str] = &[
+    "264", "avi", "avs", "h264", "hevc", "m2ts", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "mts",
+    "mxf", "ts", "webm",
+];
 
 /// Python `normcase(abspath)` equivalent for the same-file guard rail.
 fn norm_key(p: &str) -> String {
@@ -302,6 +326,11 @@ pub struct RFMetricsApp {
     thumb_loading: bool,
     last_thumb_path: String,
     thumb_generation: u64,
+    /// Last state actually written to `ffmetrics-state.json`; the per-frame
+    /// snapshot compares against this so only real changes arm a write.
+    saved_snapshot: crate::state::AppState,
+    /// Egui time of the first unsaved change (`None` = clean).
+    pending_save_since: Option<f64>,
 }
 
 impl Default for RFMetricsApp {
@@ -312,7 +341,7 @@ impl Default for RFMetricsApp {
         let (probe_tx, probe_rx) = std::sync::mpsc::channel();
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
         let (metric_tx, metric_rx) = std::sync::mpsc::channel();
-        Self {
+        let mut app = Self {
             ref_path: String::new(),
             duration: String::new(),
             skip: String::new(),
@@ -361,7 +390,19 @@ impl Default for RFMetricsApp {
             thumb_loading: false,
             last_thumb_path: String::new(),
             thumb_generation: 0,
-        }
+            saved_snapshot: crate::state::AppState::default(),
+            pending_save_since: None,
+        };
+        // Hermetic tests: the developer's own state file must not leak
+        // into assertions about defaults.
+        let loaded = if cfg!(test) {
+            None
+        } else {
+            crate::state::load()
+        };
+        app.apply_state(loaded);
+        app.saved_snapshot = app.snapshot();
+        app
     }
 }
 
@@ -528,10 +569,16 @@ impl RFMetricsApp {
                 ssim: crate::metrics::MetricCell::Idle,
                 vmaf: crate::metrics::MetricCell::Idle,
                 xpsnr: crate::metrics::MetricCell::Idle,
+                ssim2: crate::metrics::MetricCell::Idle,
+                butter: crate::metrics::MetricCell::Idle,
+                cvvdp: crate::metrics::MetricCell::Idle,
                 psnr_cache: CachedStats::default(),
                 ssim_cache: CachedStats::default(),
                 vmaf_cache: CachedStats::default(),
                 xpsnr_cache: CachedStats::default(),
+                ssim2_cache: CachedStats::default(),
+                butter_cache: CachedStats::default(),
+                cvvdp_cache: CachedStats::default(),
             });
             fresh.push((key, s));
         }
@@ -679,7 +726,9 @@ impl RFMetricsApp {
                 let comp = s.comparable();
                 for k in 0..10 {
                     let (_, v, lower_better) = comp[k];
-                    ranks[k] = if lower_better {
+                    // BUTTERAUGLI is lower-is-better on every stat (Python
+                    // "lower is better, min 0"); StdDev already is.
+                    ranks[k] = if lower_better || kind == MetricKind::But {
                         crate::metrics::rank_low(v, stat_lo[k], stat_hi[k])
                     } else {
                         crate::metrics::rank(v, stat_lo[k], stat_hi[k])
@@ -712,6 +761,147 @@ impl RFMetricsApp {
         }
     }
 
+    /// Everything `ffmetrics-state.json` persists, read off the live UI.
+    fn snapshot(&self) -> crate::state::AppState {
+        crate::state::AppState {
+            ref_path: self.ref_path.clone(),
+            skip: self.skip.clone(),
+            duration: self.duration.clone(),
+            files: Some(
+                self.rows
+                    .iter()
+                    .map(|r| crate::state::FileEntry {
+                        path: r.path.clone(),
+                        include: r.include,
+                    })
+                    .collect(),
+            ),
+            metrics: crate::state::MetricsState {
+                psnr: Some(self.m_psnr),
+                ssim: Some(self.m_ssim),
+                vmaf: Some(self.m_vmaf),
+                xpsnr: Some(self.m_xpsnr),
+                ssim2: Some(self.m_ssim2),
+                butteraugli: Some(self.m_but),
+                cvvdp: Some(self.m_cvvdp),
+            },
+            vmaf: crate::state::VmafState {
+                model: Some(self.vmaf_model.clone()),
+                phone: Some(self.vmaf_phone),
+                scale: Some(self.vmaf_scale),
+                pooling: Some(self.vmaf_pooling.clone()),
+                subsample: Some(self.vmaf_subsample.clone()),
+                threads: Some(self.vmaf_threads.clone()),
+            },
+        }
+    }
+
+    /// Apply a loaded state file (tolerant per-key; absent keys keep live
+    /// defaults, saved models must still be on disk, queue entries must
+    /// still be files). Restored rows probe through the normal path.
+    fn apply_state(&mut self, loaded: Option<crate::state::AppState>) {
+        let Some(s) = loaded else {
+            return;
+        };
+        self.ref_path = s.ref_path;
+        self.skip = s.skip;
+        self.duration = s.duration;
+        if let Some(files) = s.files {
+            let live: Vec<&crate::state::FileEntry> = files
+                .iter()
+                .filter(|e| std::path::Path::new(&e.path).is_file())
+                .collect();
+            self.add_queue_files(
+                live.iter()
+                    .map(|e| std::path::PathBuf::from(&e.path))
+                    .collect(),
+            );
+            for e in live {
+                if let Some(row) = self
+                    .rows
+                    .iter_mut()
+                    .find(|r| norm_key(&r.path) == norm_key(&e.path))
+                {
+                    row.include = e.include;
+                }
+            }
+        }
+        let m = s.metrics;
+        if let Some(v) = m.psnr {
+            self.m_psnr = v;
+        }
+        if let Some(v) = m.ssim {
+            self.m_ssim = v;
+        }
+        if let Some(v) = m.vmaf {
+            self.m_vmaf = v;
+        }
+        if let Some(v) = m.xpsnr {
+            self.m_xpsnr = v;
+        }
+        if let Some(v) = m.ssim2 {
+            self.m_ssim2 = v;
+        }
+        if let Some(v) = m.butteraugli {
+            self.m_but = v;
+        }
+        if let Some(v) = m.cvvdp {
+            self.m_cvvdp = v;
+        }
+        let v = s.vmaf;
+        if let Some(model) = v.model
+            && self.vmaf_models.contains(&model)
+        {
+            self.vmaf_model = model;
+        }
+        if let Some(phone) = v.phone {
+            self.vmaf_phone = phone;
+        }
+        if let Some(scale) = v.scale {
+            self.vmaf_scale = scale;
+        }
+        if let Some(pooling) = v.pooling
+            && ["Mean", "Harmonic Mean"].contains(&pooling.as_str())
+        {
+            self.vmaf_pooling = pooling;
+        }
+        if let Some(subsample) = v.subsample
+            && ["1", "2", "3", "5", "10", "15"].contains(&subsample.as_str())
+        {
+            self.vmaf_subsample = subsample;
+        }
+        if let Some(threads) = v.threads {
+            self.vmaf_threads = threads;
+        }
+    }
+
+    /// Debounced state write (1s after the last detected change): compare
+    /// the live snapshot against the last write, arm/re-arm a single
+    /// wake-up while dirty, save once it settles.
+    fn autosave_tick(&mut self, ctx: &egui::Context, now: f64) {
+        use crate::state::SAVE_DEBOUNCE_SECS;
+        if self.snapshot() == self.saved_snapshot {
+            self.pending_save_since = None;
+            return;
+        }
+        match self.pending_save_since {
+            None => {
+                self.pending_save_since = Some(now);
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(SAVE_DEBOUNCE_SECS));
+            }
+            Some(since) if now - since >= SAVE_DEBOUNCE_SECS => {
+                let snap = self.snapshot();
+                crate::state::save(&snap);
+                self.saved_snapshot = snap;
+                self.pending_save_since = None;
+            }
+            Some(since) => {
+                let remaining = (SAVE_DEBOUNCE_SECS - (now - since)).max(0.0);
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(remaining));
+            }
+        }
+    }
+
     /// Start a run over included rows on one worker thread: each checked
     /// metric runs sequentially in Python `METRICS` order (Python
     /// `start`/`_worker` parity). Pre-flight failures land in the cells
@@ -727,6 +917,9 @@ impl RFMetricsApp {
                 MetricKind::Ssim => self.m_ssim,
                 MetricKind::Vmaf => self.m_vmaf,
                 MetricKind::Xpsnr => self.m_xpsnr,
+                MetricKind::Ssim2 => self.m_ssim2,
+                MetricKind::But => self.m_but,
+                MetricKind::Cvvdp => self.m_cvvdp,
             })
             .collect();
         if kinds.is_empty() {
@@ -854,17 +1047,40 @@ impl RFMetricsApp {
             self.toast(now, format!("{msg} (Reset to recompute)"), ToastKind::Info);
             return;
         }
-        let Some(ffmpeg_exe) = self.ffmpeg.path.clone() else {
-            for (kind, fresh, _) in &work {
+        // Per-family binary gates (Python parity: per-row "ffmpeg not
+        // found" / "FFVship not found"). A wrong-GPU FFVship build has a
+        // path but no usable version, so it gates on `usable` as well.
+        // Families are independent: an FFVship-only run needs no ffmpeg.
+        let ffmpeg_exe = self.ffmpeg.path.clone();
+        let ffvship_exe = if self.ffvship.usable {
+            self.ffvship.path.clone()
+        } else {
+            None
+        };
+        let mut missing: Vec<&str> = Vec::new();
+        for (kind, fresh, _) in &work {
+            if fresh.is_empty() {
+                continue;
+            }
+            let (exe, label) = if kind.is_ffvship() {
+                (&ffvship_exe, "FFVship not found")
+            } else {
+                (&ffmpeg_exe, "ffmpeg not found")
+            };
+            if exe.is_none() {
                 for &i in fresh {
                     *self.rows[i].cell_mut(*kind) = crate::metrics::MetricCell::Error {
-                        msg: "ffmpeg not found".to_owned(),
+                        msg: label.to_owned(),
                     };
                 }
+                if !missing.contains(&label) {
+                    missing.push(label);
+                }
             }
-            self.toast(now, "ffmpeg not found".to_owned(), ToastKind::Error);
-            return;
-        };
+        }
+        if !missing.is_empty() {
+            self.toast(now, missing.join(" + "), ToastKind::Error);
+        }
         let Some(ref_info) = self.ref_info_data.clone() else {
             self.toast(
                 now,
@@ -879,6 +1095,16 @@ impl RFMetricsApp {
         // above and must never be marked Running here.
         let mut jobs = Vec::new();
         for (kind, fresh, _) in &work {
+            // Kinds whose binary is missing were errored above; they
+            // contribute no jobs but must not block the runnable ones.
+            let Some(exe) = (if kind.is_ffvship() {
+                &ffvship_exe
+            } else {
+                &ffmpeg_exe
+            })
+            .clone() else {
+                continue;
+            };
             for &i in fresh {
                 if let Some(info) = self.rows[i].info.clone() {
                     jobs.push((
@@ -886,6 +1112,7 @@ impl RFMetricsApp {
                         norm_key(&self.rows[i].path),
                         self.rows[i].path.clone(),
                         info,
+                        exe.clone(),
                     ));
                     *self.rows[i].cell_mut(*kind) =
                         crate::metrics::MetricCell::Running { frame: 0 };
@@ -899,11 +1126,15 @@ impl RFMetricsApp {
             self.refresh_ranks(kind);
         }
         if jobs.is_empty() {
-            self.toast(
-                now,
-                "Files are still probing — try again in a moment".to_owned(),
-                ToastKind::Info,
-            );
+            // An exe-gated family already toasted above; only complain
+            // about probing when binaries were fine.
+            if missing.is_empty() {
+                self.toast(
+                    now,
+                    "Files are still probing — try again in a moment".to_owned(),
+                    ToastKind::Info,
+                );
+            }
             return;
         }
         self.run_generation = self.run_generation.wrapping_add(1);
@@ -917,7 +1148,7 @@ impl RFMetricsApp {
         let child_slot = Arc::clone(&self.current_child);
         std::thread::spawn(move || {
             use std::sync::atomic::Ordering;
-            for (kind, key, dist_path, dist_info) in jobs {
+            for (kind, key, dist_path, dist_info, exe) in jobs {
                 if abort.load(Ordering::SeqCst) {
                     break;
                 }
@@ -925,7 +1156,7 @@ impl RFMetricsApp {
                 let keyp = key.clone();
                 let job = crate::metrics::ffmpeg::RunInputs {
                     kind,
-                    exe: &ffmpeg_exe,
+                    exe: &exe,
                     ref_path: &ref_path,
                     dist_path: &dist_path,
                     ref_info: &ref_info,
@@ -935,24 +1166,20 @@ impl RFMetricsApp {
                     abort: &abort,
                     child_slot: &child_slot,
                 };
+                let progress = |f| {
+                    let _ = txp.send(MetricMsg::Progress {
+                        generation,
+                        kind,
+                        key: keyp.clone(),
+                        frame: f,
+                    });
+                };
                 let out = if kind == MetricKind::Vmaf {
-                    crate::metrics::vmaf::run_vmaf(&job, &vmaf_cfg, &|f| {
-                        let _ = txp.send(MetricMsg::Progress {
-                            generation,
-                            kind,
-                            key: keyp.clone(),
-                            frame: f,
-                        });
-                    })
+                    crate::metrics::vmaf::run_vmaf(&job, &vmaf_cfg, &progress)
+                } else if let Some(fkind) = kind.ffvship_kind() {
+                    crate::metrics::ffvship::run_ffvship(&job, fkind, &progress)
                 } else {
-                    crate::metrics::ffmpeg::run_metric(&job, &|f| {
-                        let _ = txp.send(MetricMsg::Progress {
-                            generation,
-                            kind,
-                            key: keyp.clone(),
-                            frame: f,
-                        });
-                    })
+                    crate::metrics::ffmpeg::run_metric(&job, &progress)
                 };
                 let _ = tx.send(MetricMsg::Done {
                     generation,
@@ -1099,42 +1326,16 @@ fn rank_fill(rank: crate::metrics::StatRank) -> Option<egui::Color32> {
 }
 
 /// Table metric-column layout, left to right — MUST match the header
-/// checkbox order. `None` slots are stale placeholders for unimplemented
-/// metrics (SSIM2/BUTTER/CVVDP): they render N/A so live columns stay
-/// under their own headers.
+/// checkbox order.
 const METRIC_COLUMNS: [(Option<MetricKind>, &str); 7] = [
     (Some(MetricKind::Psnr), "PSNR"),
     (Some(MetricKind::Ssim), "SSIM"),
     (Some(MetricKind::Vmaf), "VMAF"),
     (Some(MetricKind::Xpsnr), "XPSNR"),
-    (None, "SSIM2"),
-    (None, "BUTTER"),
-    (None, "CVVDP"),
+    (Some(MetricKind::Ssim2), "SSIM2"),
+    (Some(MetricKind::But), "BUTTER"),
+    (Some(MetricKind::Cvvdp), "CVVDP"),
 ];
-
-/// Stale placeholder for an unimplemented metric column: divider + N/A cell
-/// with the same selection-toggle behavior as live cells, plus a hover note
-/// so the N/A reads as "not yet" rather than broken.
-fn stale_metric_cell(
-    row: &mut egui_extras::TableRow<'_, '_>,
-    i: usize,
-    toggle_row: &mut Option<usize>,
-    title: &str,
-) {
-    let (_, r) = row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
-    if r.clicked() {
-        *toggle_row = Some(i);
-    }
-    let (_, r) = row.col(|ui| {
-        ui.centered_and_justified(|ui| {
-            ui.label("N/A")
-                .on_hover_text(format!("{title} is not implemented yet"));
-        });
-    });
-    if r.clicked() {
-        *toggle_row = Some(i);
-    }
-}
 
 /// Filter-metric Done tooltip in FFMetrics order: Avg, Exec, Frames, a blank
 /// line, Mean..StdDev, another blank line, then Percentiles. Each comparable
@@ -1303,6 +1504,8 @@ impl eframe::App for RFMetricsApp {
         if self.measuring {
             ui.ctx().request_repaint();
         }
+        // Debounced `ffmetrics-state.json` write (Python parity).
+        self.autosave_tick(ui.ctx(), now);
 
         let ref_hover = hovering && is_over_ref;
         let table_hover = hovering && is_over_table;
@@ -1328,13 +1531,7 @@ impl eframe::App for RFMetricsApp {
                                     if browse.inner.clicked()
                                         && let Some(path) = rfd::FileDialog::new()
                                             .set_title("Select reference video")
-                                            .add_filter(
-                                                "Video files",
-                                                &[
-                                                    "mp4", "mkv", "mov", "avi", "webm", "m2ts",
-                                                    "ts", "m4v",
-                                                ],
-                                            )
+                                            .add_filter("Video files", VIDEO_EXTS)
                                             .pick_file()
                                     {
                                         self.ref_path = path.to_string_lossy().into_owned();
@@ -1565,10 +1762,7 @@ impl eframe::App for RFMetricsApp {
                     .clicked()
                     && let Some(paths) = rfd::FileDialog::new()
                         .set_title("Select video files")
-                        .add_filter(
-                            "Video files",
-                            &["mp4", "mkv", "mov", "avi", "webm", "m2ts", "ts", "m4v"],
-                        )
+                        .add_filter("Video files", VIDEO_EXTS)
                         .add_filter("All files", &["*"])
                         .pick_files()
                 {
@@ -1724,10 +1918,9 @@ impl eframe::App for RFMetricsApp {
                                 // Metric columns in METRIC_COLUMNS order: live state
                                 // text on a rank fill (best green, worst red,
                                 // tie dim yellow) with per-stat chip tooltips
-                                // for Done cells, N/A stale placeholders else.
+                                // for Done cells.
                                 for (kind_opt, title) in METRIC_COLUMNS {
                                     let Some(kind) = kind_opt else {
-                                        stale_metric_cell(&mut row, i, &mut toggle_row, title);
                                         continue;
                                     };
                                     let (_, r) =
@@ -1883,8 +2076,8 @@ mod tests {
     fn metric_columns_keep_live_cells_under_their_headers() {
         use crate::metrics::ffmpeg::MetricKind;
         // Body order must mirror the header checkboxes (PSNR SSIM VMAF
-        // XPSNR SSIM2 BUTTER CVVDP); unimplemented slots stay N/A so e.g.
-        // SSIM2 placeholders can never slide under a live header.
+        // XPSNR SSIM2 BUTTER CVVDP); every slot is live, so no column can
+        // slide under the wrong header.
         let kinds: Vec<_> = METRIC_COLUMNS.iter().map(|(k, _)| *k).collect();
         assert_eq!(
             kinds,
@@ -1893,9 +2086,9 @@ mod tests {
                 Some(MetricKind::Ssim),
                 Some(MetricKind::Vmaf),
                 Some(MetricKind::Xpsnr),
-                None,
-                None,
-                None,
+                Some(MetricKind::Ssim2),
+                Some(MetricKind::But),
+                Some(MetricKind::Cvvdp),
             ]
         );
         let titles: Vec<_> = METRIC_COLUMNS.iter().map(|(_, t)| *t).collect();
@@ -2017,10 +2210,16 @@ mod tests {
             ssim: crate::metrics::MetricCell::Idle,
             vmaf: crate::metrics::MetricCell::Idle,
             xpsnr: crate::metrics::MetricCell::Idle,
+            ssim2: crate::metrics::MetricCell::Idle,
+            butter: crate::metrics::MetricCell::Idle,
+            cvvdp: crate::metrics::MetricCell::Idle,
             psnr_cache: CachedStats::default(),
             ssim_cache: CachedStats::default(),
             vmaf_cache: CachedStats::default(),
             xpsnr_cache: CachedStats::default(),
+            ssim2_cache: CachedStats::default(),
+            butter_cache: CachedStats::default(),
+            cvvdp_cache: CachedStats::default(),
         });
         let key = norm_key("C:/vids/a.mp4");
         app.probe_tx
@@ -2074,10 +2273,16 @@ mod tests {
             ssim: crate::metrics::MetricCell::Idle,
             vmaf: crate::metrics::MetricCell::Idle,
             xpsnr: crate::metrics::MetricCell::Idle,
+            ssim2: crate::metrics::MetricCell::Idle,
+            butter: crate::metrics::MetricCell::Idle,
+            cvvdp: crate::metrics::MetricCell::Idle,
             psnr_cache: CachedStats::default(),
             ssim_cache: CachedStats::default(),
             vmaf_cache: CachedStats::default(),
             xpsnr_cache: CachedStats::default(),
+            ssim2_cache: CachedStats::default(),
+            butter_cache: CachedStats::default(),
+            cvvdp_cache: CachedStats::default(),
         }
     }
 
@@ -3029,5 +3234,199 @@ mod tests {
         }
         assert!(!app.measuring);
         assert!(matches!(&app.rows[0].xpsnr, MetricCell::Done { .. }));
+    }
+
+    /// SSIM2-only run: only the SSIM2 cell enters the run, the rest stay
+    /// Idle. The binary doesn't exist so the worker fails the spawn
+    /// asynchronously (headless-safe).
+    #[test]
+    fn start_run_ssim2_only_runs_ssim2_cell() {
+        use crate::metrics::MetricCell;
+        use crate::probe::MediaInfo;
+        let p = std::env::temp_dir().join("rfmetrics-ssim2-only.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            m_ssim2: true,
+            m_vmaf: false,
+            ref_path: p.to_string_lossy().into_owned(),
+            ..RFMetricsApp::default()
+        };
+        app.ffvship.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+        app.ffvship.usable = true;
+        app.ref_info_data = Some(MediaInfo::default());
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows[0].info = Some(MediaInfo::default());
+        app.start_run(0.0);
+        std::fs::remove_file(&p).ok();
+        assert!(app.measuring);
+        assert!(matches!(app.rows[0].psnr, MetricCell::Idle));
+        assert!(matches!(
+            app.rows[0].ssim2,
+            MetricCell::Running { frame: 0 }
+        ));
+        for _ in 0..200 {
+            app.drain_metric_results();
+            if !app.measuring {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!app.measuring);
+        assert!(matches!(&app.rows[0].ssim2, MetricCell::Error { .. }));
+    }
+
+    /// Missing FFVship binary: FFVship cells error out without running,
+    /// while an ffmpeg-only selection is unaffected by the missing binary.
+    #[test]
+    fn start_run_ffvship_missing_binary_errors_cells() {
+        use crate::metrics::MetricCell;
+        use crate::probe::MediaInfo;
+        let p = std::env::temp_dir().join("rfmetrics-ffvship-missing.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            m_ssim2: true,
+            m_but: true,
+            m_cvvdp: true,
+            m_vmaf: false,
+            ref_path: p.to_string_lossy().into_owned(),
+            ..RFMetricsApp::default()
+        };
+        app.ffvship.path = None;
+        app.ffvship.usable = false;
+        app.ref_info_data = Some(MediaInfo::default());
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows[0].info = Some(MediaInfo::default());
+        app.start_run(0.0);
+        std::fs::remove_file(&p).ok();
+        assert!(!app.measuring);
+        for cell in [&app.rows[0].ssim2, &app.rows[0].butter, &app.rows[0].cvvdp] {
+            assert!(
+                matches!(cell, MetricCell::Error { msg } if msg == "FFVship not found"),
+                "expected FFVship gate, got {cell:?}"
+            );
+        }
+        assert!(app.toast.is_some());
+    }
+
+    /// BUTTER ranks min-wins on every stat (lower is better); other
+    /// metrics keep max-wins.
+    #[test]
+    fn butter_rank_is_min_wins() {
+        use crate::metrics::{MetricCell, StatRank};
+        let mut app = RFMetricsApp::default();
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows.push(psnr_test_row("C:/vids/b.mp4", true));
+        for (i, avg) in [3.0, 5.0].into_iter().enumerate() {
+            app.rows[i].butter = MetricCell::Done {
+                values: vec![avg, avg],
+                avg,
+                exec_s: 1.0,
+                skip: None,
+                clip_dur: None,
+                vmaf_cfg: None,
+            };
+            let stats = app.rows[i].butter.done_stats();
+            app.rows[i].butter_cache.stats = stats;
+        }
+        app.refresh_ranks(crate::metrics::ffmpeg::MetricKind::But);
+        assert_eq!(app.rows[0].butter_cache.ranks[0], StatRank::Best);
+        assert_eq!(app.rows[1].butter_cache.ranks[0], StatRank::Worst);
+    }
+
+    /// State round-trip: snapshot captures boxes, toggles, options, and
+    /// per-row include flags; apply restores them onto a fresh app.
+    #[test]
+    fn state_snapshot_apply_round_trip() {
+        use crate::probe::MediaInfo;
+        let p = std::env::temp_dir().join("rfmetrics-state-rt.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            ref_path: "C:/vids/ref.mp4".to_owned(),
+            skip: "5".to_owned(),
+            duration: "00:10".to_owned(),
+            m_psnr: true,
+            m_vmaf: false,
+            m_ssim2: true,
+            vmaf_phone: true,
+            vmaf_pooling: "Harmonic Mean".to_owned(),
+            vmaf_threads: "4".to_owned(),
+            ..RFMetricsApp::default()
+        };
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows.push(psnr_test_row("C:/vids/b.mp4", false));
+        app.rows[0].info = Some(MediaInfo::default());
+        let snap = app.snapshot();
+        std::fs::remove_file(&p).ok();
+
+        let mut fresh = RFMetricsApp::default();
+        fresh.apply_state(Some(snap));
+        assert_eq!(fresh.ref_path, "C:/vids/ref.mp4");
+        assert_eq!(fresh.skip, "5");
+        assert_eq!(fresh.duration, "00:10");
+        assert!(fresh.m_psnr && !fresh.m_vmaf && fresh.m_ssim2);
+        assert!(fresh.vmaf_phone);
+        assert_eq!(fresh.vmaf_pooling, "Harmonic Mean");
+        assert_eq!(fresh.vmaf_threads, "4");
+        // psnr_test_row paths don't exist on disk: only pre-existing rows
+        // could restore, so the queue stays empty here.
+        assert!(fresh.rows.is_empty());
+    }
+
+    /// State apply restores live queue files with their include flags and
+    /// drops missing ones.
+    #[test]
+    fn state_apply_restores_files_with_include() {
+        let a = std::env::temp_dir().join("rfmetrics-state-a.tmp");
+        let b = std::env::temp_dir().join("rfmetrics-state-b.tmp");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"x").unwrap();
+        let state = crate::state::AppState {
+            files: Some(vec![
+                crate::state::FileEntry {
+                    path: a.to_string_lossy().into_owned(),
+                    include: true,
+                },
+                crate::state::FileEntry {
+                    path: b.to_string_lossy().into_owned(),
+                    include: false,
+                },
+                crate::state::FileEntry {
+                    path: "C:/no/such/file.mp4".to_owned(),
+                    include: true,
+                },
+            ]),
+            ..Default::default()
+        };
+        let mut app = RFMetricsApp::default();
+        app.apply_state(Some(state));
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+        assert_eq!(app.rows.len(), 2);
+        assert!(app.rows[0].include);
+        assert!(!app.rows[1].include);
+        // Absent keys keep live defaults (VMAF-only).
+        assert!(!app.m_psnr && app.m_vmaf);
+    }
+
+    /// State apply validates options: unknown models/pooling/subsamples
+    /// keep live values instead of poisoning the run.
+    #[test]
+    fn state_apply_validates_vmaf_options() {
+        let mut app = RFMetricsApp::default();
+        let state = crate::state::AppState {
+            vmaf: crate::state::VmafState {
+                model: Some("evil.json".to_owned()),
+                pooling: Some("Median".to_owned()),
+                subsample: Some("7".to_owned()),
+                phone: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        app.apply_state(Some(state));
+        assert_eq!(app.vmaf_model, "vmaf_v0.6.1.json");
+        assert_eq!(app.vmaf_pooling, "Mean");
+        assert_eq!(app.vmaf_subsample, "1");
+        assert!(app.vmaf_phone);
     }
 }

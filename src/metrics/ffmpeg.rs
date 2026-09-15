@@ -16,15 +16,22 @@ pub enum MetricKind {
     Ssim,
     Xpsnr,
     Vmaf,
+    Ssim2,
+    But,
+    Cvvdp,
 }
 
 impl MetricKind {
-    /// All ffmpeg-backed metrics, in Python `METRICS` run order.
-    pub const ALL: [MetricKind; 4] = [
+    /// All metrics, in Python `METRICS` run order (ffmpeg-backed first,
+    /// then FFVship).
+    pub const ALL: [MetricKind; 7] = [
         MetricKind::Psnr,
         MetricKind::Ssim,
         MetricKind::Vmaf,
         MetricKind::Xpsnr,
+        MetricKind::Ssim2,
+        MetricKind::But,
+        MetricKind::Cvvdp,
     ];
 
     /// Display name for cells, tooltips, and logs.
@@ -34,10 +41,32 @@ impl MetricKind {
             Self::Ssim => "SSIM",
             Self::Xpsnr => "XPSNR",
             Self::Vmaf => "VMAF",
+            Self::Ssim2 => "SSIM2",
+            Self::But => "BUTTER",
+            Self::Cvvdp => "CVVDP",
+        }
+    }
+
+    /// FFVship-backed metrics ride `run_ffvship`, not the ffmpeg engine.
+    pub fn is_ffvship(self) -> bool {
+        matches!(self, Self::Ssim2 | Self::But | Self::Cvvdp)
+    }
+
+    /// The FFVship sub-kind (metric name, arity, pooling); `None` for
+    /// ffmpeg-backed metrics.
+    pub fn ffvship_kind(self) -> Option<crate::metrics::ffvship::FfvshipKind> {
+        use crate::metrics::ffvship::FfvshipKind;
+        match self {
+            Self::Ssim2 => Some(FfvshipKind::Ssimulacra2),
+            Self::But => Some(FfvshipKind::Butteraugli),
+            Self::Cvvdp => Some(FfvshipKind::Cvvdp),
+            Self::Psnr | Self::Ssim | Self::Xpsnr | Self::Vmaf => None,
         }
     }
 
     /// ffmpeg filter name in the `<order><filter>=…` segment.
+    /// Unreachable for FFVship metrics (no filtergraph); the worker
+    /// dispatches on `is_ffvship()` first.
     fn filter(self) -> &'static str {
         match self {
             Self::Psnr => "psnr",
@@ -45,6 +74,9 @@ impl MetricKind {
             Self::Xpsnr => "xpsnr",
             // VMAF never uses `filtergraph` (own libvmaf builder in vmaf.rs).
             Self::Vmaf => "libvmaf",
+            Self::Ssim2 | Self::But | Self::Cvvdp => {
+                unreachable!("FFVship metrics have no ffmpeg filter")
+            }
         }
     }
 
@@ -155,7 +187,14 @@ pub fn parse_frame_line(line: &str, kind: MetricKind) -> Option<f64> {
         ),
         // XPSNR combines three planes with weights: use parse_xpsnr_frame_line.
         // VMAF parses its JSON log instead: use vmaf::parse_vmaf_log.
-        MetricKind::Xpsnr | MetricKind::Vmaf => return None,
+        // FFVship parses live stdout instead: use ffvship::parse_series.
+        MetricKind::Xpsnr
+        | MetricKind::Vmaf
+        | MetricKind::Ssim2
+        | MetricKind::But
+        | MetricKind::Cvvdp => {
+            return None;
+        }
     };
     let v: f64 = raw.parse().ok()?;
     if v.is_nan() {
@@ -197,7 +236,12 @@ pub fn parse_summary(text: &str, kind: MetricKind) -> Option<f64> {
             }
             // XPSNR combines three planes with weights: use parse_xpsnr_summary.
             // VMAF parses its JSON log instead: use vmaf::parse_vmaf_log.
-            MetricKind::Xpsnr | MetricKind::Vmaf => {}
+            // FFVship pools live stdout instead: see ffvship::run_ffvship.
+            MetricKind::Xpsnr
+            | MetricKind::Vmaf
+            | MetricKind::Ssim2
+            | MetricKind::But
+            | MetricKind::Cvvdp => {}
         }
     }
     None
@@ -205,6 +249,21 @@ pub fn parse_summary(text: &str, kind: MetricKind) -> Option<f64> {
 
 /// Timestamp reset shared by every filtergraph leg.
 pub(crate) const NORM: &str = "settb=AVTB,setpts=PTS-STARTPTS";
+
+/// `setrange` segment for one leg (FFMetrics.conf `{{main-setrange}}` /
+/// `{{ref-setrange}}` parity): tags the leg's own probed colour range so a
+/// downstream `format` interprets levels correctly. Only known ffmpeg range
+/// tokens pass through; anything else (or unknown) is `None` = no segment.
+/// Callers emit it only when the legs' tags differ — matching-range content
+/// shows no setrange segment in the original's FFMetrics.log.
+pub(crate) fn setrange_segment(range_tag: Option<&str>) -> Option<String> {
+    match range_tag {
+        Some("tv" | "pc" | "limited" | "full") => {
+            Some(format!("setrange=range={}", range_tag.unwrap()))
+        }
+        _ => None,
+    }
+}
 
 /// Trim window shared by every filtergraph (Python `if skip or clip_dur:`
 /// parity — 0.0 is falsy, so a zero skip/clip disables trim instead of
@@ -253,11 +312,20 @@ pub fn filtergraph(
     {
         pre.push(format!("scale={w}:{h}"));
     }
+    // Colour-range legs differ: tag each side with its own range (conf
+    // `scale,setrange,format` order); matching/unknown ranges emit nothing.
+    let range_differs = ref_info.range_tag.as_deref() != dist_info.range_tag.as_deref();
+    if range_differs && let Some(s) = setrange_segment(dist_info.range_tag.as_deref()) {
+        pre.push(s);
+    }
     if ref_info.pix_fmt.is_some() && dist_info.pix_fmt != ref_info.pix_fmt {
         pre.push(format!("format={}", ref_info.pix_fmt.as_deref().unwrap()));
     }
     let mut ref_leg: Vec<String> = window;
     ref_leg.push(NORM.to_owned());
+    if range_differs && let Some(s) = setrange_segment(ref_info.range_tag.as_deref()) {
+        ref_leg.push(s);
+    }
     format!(
         "[0:v]{}[main];[1:v]{}[ref];{}{}=eof_action=endall:stats_file=-",
         pre.join(","),
@@ -382,7 +450,14 @@ pub fn build_args(
     skip: Option<f64>,
     clip_dur: Option<f64>,
 ) -> Vec<String> {
-    let mut args = vec!["-hide_banner".to_owned(), "-nostdin".to_owned()];
+    let mut args = vec![
+        "-hide_banner".to_owned(),
+        "-nostdin".to_owned(),
+        // FFMetrics.conf `Metric.Template` parity: larger probe window for
+        // sparse headers (ts/m2ts/mxf); the original's log shows it live.
+        "-probesize".to_owned(),
+        "50M".to_owned(),
+    ];
     args.extend(rate_args(ref_info, dist_info));
     args.push("-i".to_owned());
     args.push(dist_path.to_owned());
@@ -946,5 +1021,66 @@ mod tests {
                 "[ref][main]xpsnr=eof_action=endall:stats_file=-"
             )
         );
+    }
+
+    #[test]
+    fn setrange_tokens() {
+        assert_eq!(
+            setrange_segment(Some("tv")),
+            Some("setrange=range=tv".to_owned())
+        );
+        assert_eq!(
+            setrange_segment(Some("pc")),
+            Some("setrange=range=pc".to_owned())
+        );
+        assert_eq!(setrange_segment(None), None);
+        assert_eq!(setrange_segment(Some("mystery")), None);
+    }
+
+    #[test]
+    fn setrange_only_when_ranges_differ() {
+        use super::MetricKind::Psnr;
+        // Matching or unknown ranges: no segment (FFMetrics.log parity).
+        let g = filtergraph(Psnr, &ref_info(), &ref_info(), None, None);
+        assert!(!g.contains("setrange"));
+        // tv vs pc: each leg tagged with its own range.
+        let mut rf = ref_info();
+        rf.range_tag = Some("tv".to_owned());
+        let mut dist = ref_info();
+        dist.range_tag = Some("pc".to_owned());
+        let g = filtergraph(Psnr, &rf, &dist, None, None);
+        assert!(g.contains("[0:v]settb=AVTB,setpts=PTS-STARTPTS,setrange=range=pc[main]"));
+        assert!(g.contains("[1:v]settb=AVTB,setpts=PTS-STARTPTS,setrange=range=tv[ref]"));
+    }
+
+    #[test]
+    fn setrange_sits_between_scale_and_format() {
+        use super::MetricKind::Psnr;
+        let mut rf = ref_info();
+        rf.range_tag = Some("tv".to_owned());
+        let mut dist = ref_info();
+        dist.range_tag = Some("pc".to_owned());
+        dist.width = Some(1280);
+        dist.height = Some(720);
+        dist.pix_fmt = Some("yuv444p".to_owned());
+        let g = filtergraph(Psnr, &rf, &dist, None, None);
+        assert!(g.contains(
+            "[0:v]settb=AVTB,setpts=PTS-STARTPTS,scale=1920:1080,setrange=range=pc,format=yuv420p[main]"
+        ));
+    }
+
+    #[test]
+    fn args_start_with_probesize() {
+        use super::MetricKind::Psnr;
+        let a = build_args(
+            Psnr,
+            "ref.mp4",
+            "dist.mp4",
+            &ref_info(),
+            &ref_info(),
+            None,
+            None,
+        );
+        assert_eq!(&a[..4], &["-hide_banner", "-nostdin", "-probesize", "50M"]);
     }
 }

@@ -6,7 +6,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::metrics::ffmpeg::{NORM, RunInputs, RunOutcome, pump_process, rate_args, trim_window};
+use crate::metrics::ffmpeg::{
+    NORM, RunInputs, RunOutcome, pump_process, rate_args, setrange_segment, trim_window,
+};
 use crate::probe::MediaInfo;
 
 /// Pooling selector (UI strings `Mean`/`Harmonic Mean` map here at Start).
@@ -223,6 +225,15 @@ pub fn build_filter(
     {
         main_pre.push(format!("scale={w}:{h}"));
     }
+    // Colour-range legs differ: tag each side with its own range (conf
+    // `scale,setrange,format` order); matching/unknown ranges emit nothing.
+    let range_differs = ref_info.range_tag.as_deref() != dist_info.range_tag.as_deref();
+    if range_differs && let Some(s) = setrange_segment(dist_info.range_tag.as_deref()) {
+        main_pre.push(s);
+    }
+    if range_differs && let Some(s) = setrange_segment(ref_info.range_tag.as_deref()) {
+        ref_pre.push(s);
+    }
     if ref_info.pix_fmt.is_some() && dist_info.pix_fmt != ref_info.pix_fmt {
         main_pre.push(format!("format={}", ref_info.pix_fmt.as_deref().unwrap()));
     }
@@ -382,7 +393,13 @@ pub fn run_vmaf(job: &RunInputs, cfg: &VmafCfg, on_progress: &(dyn Fn(u64) + Syn
             return fail(e);
         }
     };
-    let mut args = vec!["-hide_banner".to_owned(), "-nostdin".to_owned()];
+    let mut args = vec![
+        "-hide_banner".to_owned(),
+        "-nostdin".to_owned(),
+        // FFMetrics.conf parity (see `build_args`): sparse-header probe window.
+        "-probesize".to_owned(),
+        "50M".to_owned(),
+    ];
     args.extend(rate_args(ref_info, dist_info));
     args.push("-i".to_owned());
     args.push(dist_path.to_owned());
@@ -864,5 +881,30 @@ mod tests {
     fn log_rejects_garbage() {
         assert!(parse_vmaf_log("not json", 100.0).is_none());
         assert!(parse_vmaf_log("{}", 100.0).unwrap().values.is_empty());
+    }
+
+    #[test]
+    fn setrange_tags_differing_ranges() {
+        let (_g, dir) = models_dir(&["vmaf_v0.6.1.json"]);
+        let mut dist = ref_info();
+        dist.range_tag = Some("pc".to_owned());
+        let mut rf = ref_info();
+        rf.range_tag = Some("tv".to_owned());
+        let f = build_filter(&rf, &dist, None, None, &cfg(), &dir, "v.json", 0).unwrap();
+        assert!(f.contains("[0:v]settb=AVTB,setpts=PTS-STARTPTS,setrange=range=pc[main]"));
+        assert!(f.contains("[1:v]settb=AVTB,setpts=PTS-STARTPTS,setrange=range=tv[ref]"));
+        // Same range: no segment (FFMetrics.log parity).
+        let f = build_filter(
+            &ref_info(),
+            &ref_info(),
+            None,
+            None,
+            &cfg(),
+            &dir,
+            "v.json",
+            0,
+        )
+        .unwrap();
+        assert!(!f.contains("setrange"));
     }
 }

@@ -4,6 +4,7 @@ mod logging;
 mod metrics;
 mod preview;
 mod probe;
+mod state;
 
 fn main() -> eframe::Result<()> {
     logging::init_logging();

@@ -74,6 +74,9 @@ pub fn extract_thumbnail(
             .args([
                 "-hide_banner",
                 "-nostdin",
+                // FFMetrics.conf `Thumbnail.Template` parity.
+                "-probesize",
+                "50M",
                 "-ss",
                 ss,
                 "-i",
