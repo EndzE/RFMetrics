@@ -204,6 +204,8 @@ pub fn parse_media(v: &Stream, fmt: &Format) -> MediaInfo {
 /// Reads packet headers only (no decoding), so it is fast but not free —
 /// called only when the cheap JSON probe has no usable count.
 fn count_packets(exe: &Path, path: &str) -> Option<i64> {
+    let start = std::time::Instant::now();
+    log::debug!(target: "rfmetrics::probe", "count_packets: \"{}\" -count_packets \"{path}\"", exe.display());
     let out = Command::new(exe)
         .args([
             "-v",
@@ -219,11 +221,18 @@ fn count_packets(exe: &Path, path: &str) -> Option<i64> {
         ])
         .output()
         .ok()?;
-    String::from_utf8_lossy(&out.stdout)
+    let n = String::from_utf8_lossy(&out.stdout)
         .trim()
         .parse::<i64>()
         .ok()
-        .filter(|&n| n > 0)
+        .filter(|&n| n > 0);
+    log::info!(
+        target: "rfmetrics::probe",
+        "count_packets \"{path}\" → {} ({}ms)",
+        n.map_or("none".to_owned(), |n| n.to_string()),
+        start.elapsed().as_millis(),
+    );
+    n
 }
 
 /// Shared ffprobe spawn + parse; `None` = no usable video stream.
@@ -232,6 +241,8 @@ fn probe_media(path: &str, ffprobe: Option<&Path>) -> Option<MediaInfo> {
         return None;
     }
     let exe = ffprobe?;
+    let start = std::time::Instant::now();
+    log::debug!(target: "rfmetrics::probe", "probe: \"{}\" -show_format -show_streams \"{path}\"", exe.display());
     let out = Command::new(exe)
         .args([
             "-v",
@@ -244,12 +255,22 @@ fn probe_media(path: &str, ffprobe: Option<&Path>) -> Option<MediaInfo> {
         ])
         .output()
         .ok()?;
-    let data: ProbeOutput = serde_json::from_slice(&out.stdout).ok()?;
+    let data: ProbeOutput = match serde_json::from_slice(&out.stdout) {
+        Ok(d) => d,
+        Err(e) => {
+            log::warn!(target: "rfmetrics::probe", "probe \"{path}\" invalid JSON: {e} ({}ms)", start.elapsed().as_millis());
+            return None;
+        }
+    };
     let v = data
         .streams
         .iter()
         .find(|s| s.codec_type.as_deref() == Some("video"))
-        .or_else(|| data.streams.first())?;
+        .or_else(|| data.streams.first());
+    let Some(v) = v else {
+        log::warn!(target: "rfmetrics::probe", "probe \"{path}\" no video stream ({}ms)", start.elapsed().as_millis());
+        return None;
+    };
     let mut info = parse_media(v, &data.format);
     // `duration × fps` is only an estimate (wrong on VFR/long-GOP files),
     // so when `nb_frames` gave nothing usable, count packets instead.
@@ -261,6 +282,14 @@ fn probe_media(path: &str, ffprobe: Option<&Path>) -> Option<MediaInfo> {
     if !has_nb && let Some(n) = count_packets(exe, path) {
         info.total_frames = Some(n);
     }
+    log::info!(
+        target: "rfmetrics::probe",
+        "probe \"{path}\" → {}x{} {:?} ({}ms)",
+        info.width.unwrap_or(-1),
+        info.height.unwrap_or(-1),
+        info.encoder,
+        start.elapsed().as_millis(),
+    );
     Some(info)
 }
 
@@ -397,6 +426,8 @@ pub fn reference_media_text(path: &str, ffprobe: Option<&Path>) -> String {
     let Some(exe) = ffprobe else {
         return "ffprobe not found".to_owned();
     };
+    let start = std::time::Instant::now();
+    log::debug!(target: "rfmetrics::probe", "probe ref: \"{}\" -show_format -show_streams \"{path}\"", exe.display());
     let out = match Command::new(exe)
         .args([
             "-v",
@@ -410,11 +441,17 @@ pub fn reference_media_text(path: &str, ffprobe: Option<&Path>) -> String {
         .output()
     {
         Ok(o) => o,
-        Err(e) => return format!("Probe failed: {e}"),
+        Err(e) => {
+            log::warn!(target: "rfmetrics::probe", "probe ref \"{path}\" spawn failed: {e}");
+            return format!("Probe failed: {e}");
+        }
     };
     let data: ProbeOutput = match serde_json::from_slice(&out.stdout) {
         Ok(d) => d,
-        Err(_) => return "Probe failed: invalid output".to_owned(),
+        Err(_) => {
+            log::warn!(target: "rfmetrics::probe", "probe ref \"{path}\" invalid output ({}ms)", start.elapsed().as_millis());
+            return "Probe failed: invalid output".to_owned();
+        }
     };
     let streams = &data.streams;
     let Some(v) = streams
@@ -422,6 +459,7 @@ pub fn reference_media_text(path: &str, ffprobe: Option<&Path>) -> String {
         .find(|s| s.codec_type.as_deref() == Some("video"))
         .or_else(|| streams.first())
     else {
+        log::warn!(target: "rfmetrics::probe", "probe ref \"{path}\" no video stream ({}ms)", start.elapsed().as_millis());
         return "No video stream".to_owned();
     };
     let mut info = parse_media(v, &data.format);
@@ -469,9 +507,12 @@ pub fn reference_media_text(path: &str, ffprobe: Option<&Path>) -> String {
         parts.push(format!("Total Frames: {n}"));
     }
     if parts.is_empty() {
+        log::info!(target: "rfmetrics::probe", "probe ref \"{path}\" → no info ({}ms)", start.elapsed().as_millis());
         "—".to_owned()
     } else {
-        parts.join(", ")
+        let text = parts.join(", ");
+        log::info!(target: "rfmetrics::probe", "probe ref \"{path}\" → {text} ({}ms)", start.elapsed().as_millis());
+        text
     }
 }
 

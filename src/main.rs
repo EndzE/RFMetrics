@@ -1,9 +1,11 @@
 mod app;
 mod binaries;
+mod logging;
 mod preview;
 mod probe;
 
 fn main() -> eframe::Result<()> {
+    logging::init_logging();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1300.0, 600.0])

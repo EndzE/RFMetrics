@@ -256,6 +256,8 @@ impl RFMetricsApp {
                 ProbeMsg::Reference { generation, text } => {
                     if generation == self.ref_generation {
                         self.ref_info = text;
+                    } else {
+                        log::debug!(target: "rfmetrics::app", "discarded stale ref probe (gen {generation})");
                     }
                 }
                 ProbeMsg::RowMedia { key, media, tip } => {
@@ -307,6 +309,7 @@ impl RFMetricsApp {
     fn drain_thumbs(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.thumb_rx.try_recv() {
             if msg.generation != self.thumb_generation {
+                log::debug!(target: "rfmetrics::app", "discarded stale thumbnail (gen {})", msg.generation);
                 continue;
             }
             self.thumb_loading = false;
@@ -461,10 +464,11 @@ impl eframe::App for RFMetricsApp {
                 }
                 let extra = iter.len();
                 if extra > 0 {
+                    let text =
+                        format!("Reference takes one file — kept the first, ignored {extra} more");
+                    log::warn!(target: "rfmetrics::app", "toast warning: {text}");
                     self.toast = Some(Toast {
-                        text: format!(
-                            "Reference takes one file — kept the first, ignored {extra} more"
-                        ),
+                        text,
                         until: now + TOAST_SECS,
                         kind: ToastKind::Warning,
                     });
@@ -768,7 +772,14 @@ impl eframe::App for RFMetricsApp {
                                 row.col(|ui| {
                                     if ui.button("▶").clicked() {
                                         let path = self.rows[i].path.clone();
-                                        let _ = open::that(&path);
+                                        if let Err(e) = open::that(&path) {
+                                            log::error!(target: "rfmetrics::app", "open \"{path}\" failed: {e}");
+                                            self.toast = Some(Toast {
+                                                text: format!("Could not open file: {e}"),
+                                                until: now + TOAST_SECS,
+                                                kind: ToastKind::Error,
+                                            });
+                                        }
                                     }
                                 });
                                 let (_, r) =

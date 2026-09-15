@@ -17,7 +17,7 @@ pub struct BinaryInfo {
 }
 
 /// Directory holding the running executable (Rust analog of Python's script dir).
-fn exe_dir() -> Option<PathBuf> {
+pub(crate) fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
@@ -81,15 +81,29 @@ struct VersionOutput {
 
 // ponytail: no timeout on std Command; one local spawn at startup is ~ms
 fn run_version(exe: &Path, arg: &str) -> Option<VersionOutput> {
-    Command::new(exe)
-        .arg(arg)
-        .output()
-        .ok()
-        .map(|o| VersionOutput {
-            stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
-            code: o.status.code(),
-        })
+    let start = std::time::Instant::now();
+    log::debug!(target: "rfmetrics::binaries", "run: \"{}\" {arg}", exe.display());
+    let out = match Command::new(exe).arg(arg).output() {
+        Ok(o) => o,
+        Err(e) => {
+            log::warn!(target: "rfmetrics::binaries", "run: \"{}\" {arg} spawn failed: {e}", exe.display());
+            return None;
+        }
+    };
+    let v = VersionOutput {
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        code: out.status.code(),
+    };
+    log::info!(
+        target: "rfmetrics::binaries",
+        "run: \"{}\" {arg} → exit {} ({}ms){}",
+        exe.display(),
+        exit_str(v.code),
+        start.elapsed().as_millis(),
+        stderr_snippet(&v.stderr),
+    );
+    Some(v)
 }
 
 fn exit_str(code: Option<i32>) -> String {
@@ -123,6 +137,7 @@ fn stderr_snippet(stderr: &str) -> String {
 pub fn ffmpeg_info() -> BinaryInfo {
     let (path, origin) = find_ffmpeg();
     let Some(exe) = path.clone() else {
+        log::warn!(target: "rfmetrics::binaries", "ffmpeg not found (checked next to app and PATH)");
         return BinaryInfo {
             path: None,
             origin: "",
@@ -139,6 +154,7 @@ pub fn ffmpeg_info() -> BinaryInfo {
         usable: false,
     };
     let Some(v) = run_version(&exe, "-version") else {
+        log::warn!(target: "rfmetrics::binaries", "ffmpeg at {} ({origin}) failed to run", exe.display());
         return missing(format!(
             "Found at {} ({origin}) but failed to run",
             exe.display()
@@ -151,6 +167,7 @@ pub fn ffmpeg_info() -> BinaryInfo {
         .find(|l| !l.is_empty())
         .unwrap_or("");
     if full.is_empty() {
+        log::warn!(target: "rfmetrics::binaries", "ffmpeg at {} ({origin}) gave no version output (exit {})", exe.display(), exit_str(v.code));
         return missing(format!(
             "Found at {} ({origin}) but got no version output (exit {}){}",
             exe.display(),
@@ -167,6 +184,7 @@ pub fn ffmpeg_info() -> BinaryInfo {
     let full = Regex::new(r"(?i)\s*copyright.*$")
         .map(|re| re.replace(full, "").trim_end().to_owned())
         .unwrap_or_else(|_| full.to_owned());
+    log::info!(target: "rfmetrics::binaries", "ffmpeg: {short} at {} ({origin})", exe.display());
     BinaryInfo {
         path: Some(exe.clone()),
         origin,
@@ -211,6 +229,7 @@ fn parse_ffvship_version(stdout: &str, stderr: &str) -> Option<String> {
 pub fn ffvship_info() -> BinaryInfo {
     let (path, origin) = find_ffvship();
     let Some(exe) = path.clone() else {
+        log::warn!(target: "rfmetrics::binaries", "FFVship not found (checked next to app, FFVship folder, PATH)");
         return BinaryInfo {
             path: None,
             origin: "",
@@ -227,6 +246,7 @@ pub fn ffvship_info() -> BinaryInfo {
         usable: false,
     };
     let Some(v) = run_version(&exe, "--version") else {
+        log::warn!(target: "rfmetrics::binaries", "FFVship at {} ({origin}) failed to run", exe.display());
         return missing(format!(
             "Found at {} ({origin}) but failed to run",
             exe.display()
@@ -234,6 +254,7 @@ pub fn ffvship_info() -> BinaryInfo {
     };
     if let Some(vs) = parse_ffvship_version(&v.stdout, &v.stderr) {
         let raw = first_line(&v.stdout, &v.stderr);
+        log::info!(target: "rfmetrics::binaries", "FFVship: {vs} at {} ({origin})", exe.display());
         return BinaryInfo {
             path: Some(exe.clone()),
             origin,
@@ -258,6 +279,7 @@ pub fn ffvship_info() -> BinaryInfo {
         detail.push_str(&format!("\noutput: {spoke}"));
         detail.push_str(&stderr_snippet(&v.stderr));
     }
+    log::warn!(target: "rfmetrics::binaries", "FFVship at {} ({origin}) gave no version (exit {})", exe.display(), exit_str(v.code));
     BinaryInfo {
         path: Some(exe.clone()),
         origin,
@@ -269,7 +291,14 @@ pub fn ffvship_info() -> BinaryInfo {
 
 /// ffprobe has no bottom-bar label; path is held for the later probe step.
 pub fn ffprobe_path(ffmpeg_path: Option<&Path>) -> Option<PathBuf> {
-    find_ffprobe(ffmpeg_path).0
+    let (path, origin) = find_ffprobe(ffmpeg_path);
+    match &path {
+        Some(p) => {
+            log::info!(target: "rfmetrics::binaries", "ffprobe at {} ({origin})", p.display())
+        }
+        None => log::warn!(target: "rfmetrics::binaries", "ffprobe not found"),
+    }
+    path
 }
 
 #[cfg(test)]

@@ -29,9 +29,16 @@ fn fit_size(w: u32, h: u32) -> (u32, u32) {
 
 fn decode_and_fit(png_bytes: &[u8]) -> Option<egui::ColorImage> {
     if png_bytes.len() <= 100 {
+        log::debug!(target: "rfmetrics::preview", "thumbnail decode skipped: {} bytes", png_bytes.len());
         return None;
     }
-    let img = image::load_from_memory(png_bytes).ok()?.to_rgba8();
+    let img = match image::load_from_memory(png_bytes) {
+        Ok(i) => i.to_rgba8(),
+        Err(e) => {
+            log::warn!(target: "rfmetrics::preview", "thumbnail PNG decode failed: {e}");
+            return None;
+        }
+    };
     let (w, h) = (img.width(), img.height());
     if w == 0 || h == 0 {
         return None;
@@ -61,7 +68,9 @@ pub fn extract_thumbnail(
         BOX_H * 2
     );
     for ss in seek_candidates(duration) {
-        let out = Command::new(ffmpeg)
+        let start = std::time::Instant::now();
+        log::debug!(target: "rfmetrics::preview", "thumbnail: -ss {ss} -i \"{path}\"");
+        let out = match Command::new(ffmpeg)
             .args([
                 "-hide_banner",
                 "-nostdin",
@@ -80,11 +89,43 @@ pub fn extract_thumbnail(
                 "pipe:1",
             ])
             .output()
-            .ok()?;
+        {
+            Ok(o) => o,
+            Err(e) => {
+                log::warn!(target: "rfmetrics::preview", "thumbnail ffmpeg -ss {ss} \"{path}\" spawn failed: {e}");
+                return None;
+            }
+        };
         if let Some(img) = decode_and_fit(&out.stdout) {
+            log::info!(
+                target: "rfmetrics::preview",
+                "thumbnail \"{path}\" -ss {ss} → {} bytes ({}ms)",
+                out.stdout.len(),
+                start.elapsed().as_millis(),
+            );
             return Some(img);
         }
+        log::debug!(
+            target: "rfmetrics::preview",
+            "thumbnail -ss {ss} yielded no image ({} bytes, {}ms){}",
+            out.stdout.len(),
+            start.elapsed().as_millis(),
+            {
+                let err = String::from_utf8_lossy(&out.stderr);
+                let s = err.trim();
+                if s.is_empty() {
+                    String::new()
+                } else {
+                    let mut snippet: String = s.chars().take(300).collect();
+                    if s.chars().count() > 300 {
+                        snippet.push('…');
+                    }
+                    format!(" stderr: {snippet}")
+                }
+            },
+        );
     }
+    log::warn!(target: "rfmetrics::preview", "thumbnail \"{path}\" all seeks failed");
     None
 }
 
