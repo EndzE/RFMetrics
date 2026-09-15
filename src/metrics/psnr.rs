@@ -71,10 +71,13 @@ pub fn filtergraph(
     clip_dur: Option<f64>,
 ) -> String {
     const NORM: &str = "settb=AVTB,setpts=PTS-STARTPTS";
+    // Python `if skip or clip_dur:` — 0.0 is falsy, so a zero skip/clip
+    // disables trim instead of producing an empty `trim=start=0:end=0`.
     let mut window = Vec::new();
-    if skip.is_some() || clip_dur.is_some() {
+    if skip.is_some_and(|v| v != 0.0) || clip_dur.is_some_and(|v| v != 0.0) {
         let start = skip.unwrap_or(0.0);
         let end = clip_dur
+            .filter(|&d| d != 0.0)
             .map(|d| format!(":end={}", start + d))
             .unwrap_or_default();
         window.push(format!("trim=start={start}{end}"));
@@ -341,6 +344,24 @@ mod tests {
         assert!(g.contains("[1:v]trim=start=5:end=15,"));
         assert!(!g.contains("scale="));
         assert!(!g.contains("format="));
+    }
+
+    #[test]
+    fn graph_zero_skip_and_clip_disable_trim() {
+        // Python `if skip or clip_dur:` — 0.0 is falsy, so zero values
+        // measure the full video instead of an empty clip.
+        let plain = filtergraph(&ref_info(), &ref_info(), None, None);
+        assert_eq!(
+            filtergraph(&ref_info(), &ref_info(), Some(0.0), Some(0.0)),
+            plain
+        );
+        assert!(!plain.contains("trim="));
+        // Mixed: zero side drops out, nonzero side applies.
+        let g = filtergraph(&ref_info(), &ref_info(), Some(0.0), Some(10.0));
+        assert!(g.contains("trim=start=0:end=10"));
+        let g = filtergraph(&ref_info(), &ref_info(), Some(5.0), Some(0.0));
+        assert!(g.contains("[0:v]trim=start=5,"));
+        assert!(!g.contains(":end="));
     }
 
     #[test]

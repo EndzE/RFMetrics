@@ -179,6 +179,10 @@ enum MetricMsg {
         avg: Option<f64>,
         exec_s: f64,
         error: Option<String>,
+        /// Trim settings the run used; stamped onto the `Done` cell so a
+        /// rerun under different skip/clip recomputes instead of skipping.
+        skip: Option<f64>,
+        clip_dur: Option<f64>,
     },
     /// End of the worker loop; `aborted` settles still-Running cells to
     /// Idle while keeping finished (`Done`) results on screen.
@@ -507,6 +511,8 @@ impl RFMetricsApp {
                     avg,
                     exec_s,
                     error,
+                    skip,
+                    clip_dur,
                 } => {
                     if generation != self.psnr_generation {
                         log::debug!(target: "rfmetrics::app", "discarded stale PSNR result");
@@ -520,6 +526,8 @@ impl RFMetricsApp {
                                 avg: avg.unwrap_or_else(|| crate::metrics::mean(&values)),
                                 values,
                                 exec_s,
+                                skip,
+                                clip_dur,
                             },
                         };
                     }
@@ -631,8 +639,40 @@ impl RFMetricsApp {
             );
             return;
         };
+        // Rows already holding a valid value sit the rerun out — but only
+        // when the trim settings still match: a value computed under a
+        // different skip/clip is stale and must recompute. Pre-flight
+        // error cells above touch `targets` (settings uncomparable there);
+        // everything below touches `fresh` only, never valid results.
+        let mut skipped: Vec<String> = Vec::new();
+        let mut fresh: Vec<usize> = Vec::new();
+        for &i in &targets {
+            if let crate::metrics::MetricCell::Done {
+                skip: s,
+                clip_dur: c,
+                ..
+            } = &self.rows[i].psnr
+                && *s == skip
+                && *c == clip_dur
+            {
+                skipped.push(self.rows[i].display.clone());
+            } else {
+                fresh.push(i);
+            }
+        }
+        if fresh.is_empty() {
+            self.toast(
+                now,
+                format!(
+                    "Skipped {} row(s) — PSNR already computed (Reset to recompute)",
+                    skipped.len()
+                ),
+                ToastKind::Info,
+            );
+            return;
+        }
         let Some(ffmpeg_exe) = self.ffmpeg.path.clone() else {
-            for &i in &targets {
+            for &i in &fresh {
                 self.rows[i].psnr = crate::metrics::MetricCell::Error {
                     msg: "ffmpeg not found".to_owned(),
                 };
@@ -650,8 +690,10 @@ impl RFMetricsApp {
         };
         // Rows whose probe hasn't landed yet sit this run out (cells stay
         // as-is); running the ready ones beats failing the whole batch.
+        // NOTE: `fresh`, not `targets` — Done rows were partitioned out
+        // above and must never be marked Running here.
         let mut jobs = Vec::new();
-        for &i in &targets {
+        for &i in &fresh {
             if let Some(info) = self.rows[i].info.clone() {
                 jobs.push((
                     norm_key(&self.rows[i].path),
@@ -711,6 +753,8 @@ impl RFMetricsApp {
                     avg: out.avg,
                     exec_s: out.exec_s,
                     error: out.error,
+                    skip,
+                    clip_dur,
                 });
             }
             let _ = tx.send(MetricMsg::PsnrFinished {
@@ -718,6 +762,17 @@ impl RFMetricsApp {
                 aborted: abort.load(Ordering::SeqCst),
             });
         });
+        if !skipped.is_empty() {
+            let mut list = skipped.join(", ");
+            if list.chars().count() > 80 {
+                list = format!("{}…", list.chars().take(79).collect::<String>());
+            }
+            self.toast(
+                now,
+                format!("Skipped {} with existing PSNR: {list}", skipped.len()),
+                ToastKind::Info,
+            );
+        }
     }
 
     /// Signal the worker to stop and kill the in-flight ffmpeg, if any.
@@ -858,6 +913,45 @@ fn tip_plain_row(ui: &mut egui::Ui, label: &str, val: &str) {
     tip_stat_row(ui, label, val, crate::metrics::StatRank::Plain);
 }
 
+/// Drop routing decision: pure so the guard rails stay unit-tested.
+/// Mid-run drops are `Blocked` (toast) — the worker snapshotted its jobs
+/// at Start, so ref/queue changes must wait for Stop.
+#[derive(Debug, PartialEq, Eq)]
+enum DropAction {
+    Ignore,
+    Blocked,
+    SetRef {
+        first: std::path::PathBuf,
+        extra: usize,
+    },
+    Queue(Vec<std::path::PathBuf>),
+}
+
+fn route_drop(
+    measuring: bool,
+    is_over_ref: bool,
+    is_over_table: bool,
+    dropped: Vec<std::path::PathBuf>,
+) -> DropAction {
+    if dropped.is_empty() {
+        return DropAction::Ignore;
+    }
+    if measuring {
+        return DropAction::Blocked;
+    }
+    if is_over_ref {
+        let mut iter = dropped.into_iter();
+        // `dropped` is non-empty (checked above), so `first` exists.
+        let first = iter.next().unwrap_or_default();
+        let extra = iter.len();
+        DropAction::SetRef { first, extra }
+    } else if is_over_table {
+        DropAction::Queue(dropped)
+    } else {
+        DropAction::Ignore
+    }
+}
+
 impl eframe::App for RFMetricsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let (hovering, dropped) = ui.ctx().input(|i| {
@@ -870,6 +964,10 @@ impl eframe::App for RFMetricsApp {
                     .collect::<Vec<_>>(),
             )
         });
+
+        // Drops are disabled mid-run (guard rail): ignore the drag state so
+        // targets never outline and `route_drop` below can only Block.
+        let hovering = hovering && !self.measuring;
 
         // Continuously repaint while dragging so hover outlines update smoothly
         if hovering {
@@ -891,26 +989,26 @@ impl eframe::App for RFMetricsApp {
         // Strict target routing (Python parity: a drop outside a target
         // does nothing). The reference box takes one file; extras are
         // reported via toast instead of silently vanishing.
-        if !dropped.is_empty() {
-            if is_over_ref {
-                let mut iter = dropped.into_iter();
-                if let Some(first) = iter.next() {
-                    self.ref_path = first.to_string_lossy().into_owned();
-                }
-                let extra = iter.len();
-                if extra > 0 {
-                    let text =
-                        format!("Reference takes one file — kept the first, ignored {extra} more");
-                    log::warn!(target: "rfmetrics::app", "toast warning: {text}");
-                    self.toast = Some(Toast {
-                        text,
-                        until: now + TOAST_SECS,
-                        kind: ToastKind::Warning,
-                    });
-                }
-            } else if is_over_table {
-                self.add_queue_files(dropped);
+        match route_drop(self.measuring, is_over_ref, is_over_table, dropped) {
+            DropAction::Ignore => {}
+            DropAction::Blocked => {
+                self.toast(
+                    now,
+                    "Stop the run before changing files".to_owned(),
+                    ToastKind::Info,
+                );
             }
+            DropAction::SetRef { first, extra } => {
+                self.ref_path = first.to_string_lossy().into_owned();
+                if extra > 0 {
+                    self.toast(
+                        now,
+                        format!("Reference takes one file — kept the first, ignored {extra} more"),
+                        ToastKind::Warning,
+                    );
+                }
+            }
+            DropAction::Queue(paths) => self.add_queue_files(paths),
         }
         self.refresh_ref_info();
         let ctx = ui.ctx().clone();
@@ -967,19 +1065,25 @@ impl eframe::App for RFMetricsApp {
                         ui.label(&self.ref_info);
                         ui.horizontal(|ui| {
                             ui.add(egui::Label::new("Duration:").selectable(false));
-                            let _ = ui.add_enabled(
-                                !run_locked,
-                                egui::TextEdit::singleline(&mut self.duration)
-                                    .hint_text("00:00.000")
-                                    .desired_width(110.0),
-                            );
+                            let _ = ui
+                                .add_enabled(
+                                    !run_locked,
+                                    egui::TextEdit::singleline(&mut self.duration)
+                                        .hint_text("00:00.000")
+                                        .desired_width(110.0),
+                                )
+                                .on_hover_text(
+                                    "Clip length to measure: seconds (10) or hh:mm:ss (.000)",
+                                );
                             ui.add(egui::Label::new("Skip:").selectable(false));
-                            let _ = ui.add_enabled(
-                                !run_locked,
-                                egui::TextEdit::singleline(&mut self.skip)
-                                    .hint_text("00:00.000")
-                                    .desired_width(110.0),
-                            );
+                            let _ = ui
+                                .add_enabled(
+                                    !run_locked,
+                                    egui::TextEdit::singleline(&mut self.skip)
+                                        .hint_text("00:00.000")
+                                        .desired_width(110.0),
+                                )
+                                .on_hover_text("Skip from start: seconds (5) or hh:mm:ss (.000)");
                         });
                     });
                     // Reference thumbnail 136x76 (black box parity with Python).
@@ -1459,7 +1563,35 @@ impl eframe::App for RFMetricsApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProbeMsg, QueueRow, RFMetricsApp, display_names, norm_key};
+    use super::{
+        DropAction, ProbeMsg, QueueRow, RFMetricsApp, display_names, norm_key, route_drop,
+    };
+
+    #[test]
+    fn drop_routing() {
+        use std::path::PathBuf;
+        let files = || vec![PathBuf::from("C:/v/a.mp4"), PathBuf::from("C:/v/b.mp4")];
+        // Empty drop: nothing, even mid-run.
+        assert_eq!(route_drop(false, true, true, vec![]), DropAction::Ignore);
+        assert_eq!(route_drop(true, true, true, vec![]), DropAction::Ignore);
+        // Mid-run drops block with a toast instead of mutating state.
+        assert_eq!(route_drop(true, true, false, files()), DropAction::Blocked);
+        assert_eq!(route_drop(true, false, true, files()), DropAction::Blocked);
+        // Reference takes one file; extras are reported, not lost.
+        assert_eq!(
+            route_drop(false, true, false, files()),
+            DropAction::SetRef {
+                first: PathBuf::from("C:/v/a.mp4"),
+                extra: 1,
+            }
+        );
+        // Table queues everything; outside any target is ignored.
+        assert_eq!(
+            route_drop(false, false, true, files()),
+            DropAction::Queue(files())
+        );
+        assert_eq!(route_drop(false, false, false, files()), DropAction::Ignore);
+    }
 
     #[test]
     fn same_file_keys_equal() {
@@ -1673,6 +1805,7 @@ mod tests {
             MetricCell::Running { frame: 25 }
         ));
         // No-summary avg falls back to the arithmetic mean; run ends.
+        // Settings stamp through: the cell remembers this trim.
         app.metric_tx
             .send(MetricMsg::PsnrDone {
                 generation: 1,
@@ -1681,12 +1814,15 @@ mod tests {
                 avg: None,
                 exec_s: 1.5,
                 error: None,
+                skip: None,
+                clip_dur: Some(5.0),
             })
             .unwrap();
         app.drain_metric_results();
         assert!(matches!(
             &app.rows[0].psnr,
-            MetricCell::Done { avg, .. } if (*avg - 31.0).abs() < 1e-9
+            MetricCell::Done { avg, skip, clip_dur, .. }
+                if (*avg - 31.0).abs() < 1e-9 && skip.is_none() && *clip_dur == Some(5.0)
         ));
         assert!(!app.measuring);
     }
@@ -1706,6 +1842,8 @@ mod tests {
                 avg: Some(30.0),
                 exec_s: 1.0,
                 error: None,
+                skip: None,
+                clip_dur: None,
             })
             .unwrap();
         app.drain_metric_results();
@@ -1733,6 +1871,8 @@ mod tests {
             values: vec![30.0],
             avg: 30.0,
             exec_s: 1.0,
+            skip: None,
+            clip_dur: None,
         };
         app.rows[1].psnr = MetricCell::Running { frame: 12 };
         app.measuring = true;
@@ -1774,5 +1914,202 @@ mod tests {
             .unwrap();
         app.drain_metric_results();
         assert!(!app.measuring);
+    }
+
+    #[test]
+    fn start_psnr_bad_time_marks_all_included() {
+        use crate::metrics::MetricCell;
+        let p = std::env::temp_dir().join("rfmetrics-psnr-skip.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            m_psnr: true,
+            ref_path: p.to_string_lossy().into_owned(),
+            skip: "abc".to_owned(), // unparseable: settings uncomparable
+            ..RFMetricsApp::default()
+        };
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows.push(psnr_test_row("C:/vids/b.mp4", true));
+        app.rows[0].psnr = MetricCell::Done {
+            values: vec![30.0],
+            avg: 30.0,
+            exec_s: 1.0,
+            skip: None,
+            clip_dur: None,
+        };
+        app.start_psnr(0.0);
+        std::fs::remove_file(&p).ok();
+        // Garbage settings can't be compared against the stored trim, so
+        // even valid rows take the error (Python writes all targets too).
+        for i in 0..2 {
+            assert!(
+                matches!(&app.rows[i].psnr, MetricCell::Error { msg } if msg == "bad time"),
+                "row {i} should be bad time, got {:?}",
+                app.rows[i].psnr,
+            );
+        }
+        assert!(!app.measuring);
+    }
+
+    #[test]
+    fn start_psnr_all_done_toasts_without_running() {
+        use crate::metrics::MetricCell;
+        let p = std::env::temp_dir().join("rfmetrics-psnr-skipall.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            m_psnr: true,
+            ref_path: p.to_string_lossy().into_owned(),
+            ..RFMetricsApp::default()
+        };
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows[0].psnr = MetricCell::Done {
+            values: vec![30.0],
+            avg: 30.0,
+            exec_s: 1.0,
+            skip: None,
+            clip_dur: None,
+        };
+        app.start_psnr(0.0);
+        std::fs::remove_file(&p).ok();
+        assert!(!app.measuring);
+        assert!(app.psnr_pending == 0);
+        let toast = app.toast.as_ref().expect("skip toast shown");
+        assert!(toast.text.contains("Skipped 1 row(s)"));
+        assert!(matches!(&app.rows[0].psnr, MetricCell::Done { .. }));
+    }
+
+    /// Regression: the jobs loop must iterate `fresh`, never `targets`.
+    /// A Done row is skipped AND stays Done; only the fresh row runs.
+    #[test]
+    fn start_psnr_rerun_leaves_done_row_untouched() {
+        use crate::metrics::MetricCell;
+        use crate::probe::MediaInfo;
+        let p = std::env::temp_dir().join("rfmetrics-psnr-rerun.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            m_psnr: true,
+            ref_path: p.to_string_lossy().into_owned(),
+            ..RFMetricsApp::default()
+        };
+        // Fabricate everything past the pre-flights so the run reaches the
+        // jobs loop; the ffmpeg binary doesn't exist, so the worker fails
+        // the spawn asynchronously and the test stays headless-safe.
+        app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+        app.ref_info_data = Some(MediaInfo::default());
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows.push(psnr_test_row("C:/vids/b.mp4", true));
+        app.rows[0].psnr = MetricCell::Done {
+            values: vec![30.0],
+            avg: 30.0,
+            exec_s: 1.0,
+            skip: None,
+            clip_dur: None,
+        };
+        app.rows[0].info = Some(MediaInfo::default());
+        app.rows[1].info = Some(MediaInfo::default());
+        app.start_psnr(0.0);
+        std::fs::remove_file(&p).ok();
+        // Sync state right after Start: Done row untouched, fresh Running.
+        assert!(
+            matches!(&app.rows[0].psnr, MetricCell::Done { avg, .. } if (*avg - 30.0).abs() < 1e-9),
+            "Done row must never re-enter Running, got {:?}",
+            app.rows[0].psnr,
+        );
+        assert!(matches!(app.rows[1].psnr, MetricCell::Running { frame: 0 }));
+        assert!(app.measuring);
+        // Let the doomed worker land, then settle.
+        for _ in 0..200 {
+            app.drain_metric_results();
+            if !app.measuring {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!app.measuring);
+        assert!(
+            matches!(&app.rows[0].psnr, MetricCell::Done { .. }),
+            "Done row must survive the whole rerun, got {:?}",
+            app.rows[0].psnr,
+        );
+        assert!(matches!(&app.rows[1].psnr, MetricCell::Error { .. }));
+    }
+
+    /// Guard rail: a Done value stamped with different trim settings is
+    /// stale — changing Duration/Skip must recompute, never skip.
+    #[test]
+    fn start_psnr_changed_trim_recomputes_done_row() {
+        use crate::metrics::MetricCell;
+        use crate::probe::MediaInfo;
+        let p = std::env::temp_dir().join("rfmetrics-psnr-staletrim.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            m_psnr: true,
+            ref_path: p.to_string_lossy().into_owned(),
+            duration: "10".to_owned(), // value was computed with clip 5
+            ..RFMetricsApp::default()
+        };
+        app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+        app.ref_info_data = Some(MediaInfo::default());
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows[0].psnr = MetricCell::Done {
+            values: vec![30.0],
+            avg: 30.0,
+            exec_s: 1.0,
+            skip: None,
+            clip_dur: Some(5.0),
+        };
+        app.rows[0].info = Some(MediaInfo::default());
+        app.start_psnr(0.0);
+        std::fs::remove_file(&p).ok();
+        // Stale trim: the row re-enters the run instead of skipping.
+        assert!(
+            matches!(app.rows[0].psnr, MetricCell::Running { .. }),
+            "stale-trim Done must recompute, got {:?}",
+            app.rows[0].psnr,
+        );
+        assert!(app.measuring);
+        for _ in 0..200 {
+            app.drain_metric_results();
+            if !app.measuring {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!app.measuring);
+    }
+
+    /// Same trim stamp still skips, even with nonzero settings.
+    #[test]
+    fn start_psnr_matching_trim_still_skips() {
+        use crate::metrics::MetricCell;
+        use crate::probe::MediaInfo;
+        let p = std::env::temp_dir().join("rfmetrics-psnr-sametrim.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            m_psnr: true,
+            ref_path: p.to_string_lossy().into_owned(),
+            duration: "10".to_owned(),
+            ..RFMetricsApp::default()
+        };
+        app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+        app.ref_info_data = Some(MediaInfo::default());
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows[0].psnr = MetricCell::Done {
+            values: vec![30.0],
+            avg: 30.0,
+            exec_s: 1.0,
+            skip: None,
+            clip_dur: Some(10.0),
+        };
+        app.rows[0].info = Some(MediaInfo::default());
+        app.start_psnr(0.0);
+        std::fs::remove_file(&p).ok();
+        assert!(!app.measuring);
+        assert!(
+            matches!(&app.rows[0].psnr, MetricCell::Done { .. }),
+            "matching-trim Done must skip, got {:?}",
+            app.rows[0].psnr,
+        );
+        let toast = app.toast.as_ref().expect("skip toast shown");
+        assert!(toast.text.contains("Skipped 1 row(s)"));
     }
 }

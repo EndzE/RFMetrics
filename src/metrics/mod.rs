@@ -13,6 +13,10 @@ pub enum MetricCell {
         values: Vec<f64>,
         avg: f64,
         exec_s: f64,
+        /// Trim settings the run used; a rerun under different skip/clip
+        /// must recompute instead of trusting this value.
+        skip: Option<f64>,
+        clip_dur: Option<f64>,
     },
     Error {
         msg: String,
@@ -39,6 +43,7 @@ impl MetricCell {
                 values,
                 avg,
                 exec_s,
+                ..
             } => {
                 format!("{title}\n{}", stats_text(Some(*avg), *exec_s, values))
             }
@@ -53,6 +58,7 @@ impl MetricCell {
                 values,
                 avg,
                 exec_s,
+                ..
             } => DoneStats::new(values, *avg, *exec_s),
             _ => None,
         }
@@ -224,34 +230,37 @@ pub fn stats_text(avg: Option<f64>, exec_s: f64, values: &[f64]) -> String {
     lines.join("\n")
 }
 
-/// Python `_parse_time_spec`: plain seconds (`"12.5"`) or `mm:ss[.xxx]` /
-/// `hh:mm:ss[.xxx]`. Empty → `None` (no trim); anything else unparseable,
-/// negative, or non-finite → `None` (caller reports "bad time").
+/// Python `_parse_time_spec` verbatim port: plain seconds (`"12.5"`) or
+/// `mm:ss[.xxx]` / `hh:mm:ss[.xxx]`. Empty → `None` (no trim); anything
+/// else unparseable → `None` (caller reports "bad time"). Quirks kept:
+/// `-` anywhere rejects (`"1e-3"` invalid), heads must be integers
+/// (`"1.5:02"` invalid), seconds may exceed 59 (`"1:75"` is 135s).
 pub fn parse_time_spec(raw: &str) -> Option<f64> {
     let s = raw.trim();
-    if s.is_empty() || s.starts_with('-') {
+    if s.is_empty() || s.contains('-') {
         return None;
     }
     if !s.contains(':') {
         return s.parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0);
     }
     let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() > 3 || parts.iter().any(|p| p.is_empty()) {
+    if parts.len() > 3 || parts.iter().any(|p| p.trim().is_empty()) {
         return None;
     }
     let mut total = 0.0;
     for p in &parts[..parts.len() - 1] {
-        let v: f64 = p.parse().ok()?;
-        if !v.is_finite() || v < 0.0 {
+        let v: i64 = p.trim().parse().ok()?;
+        if v < 0 {
             return None;
         }
-        total = total * 60.0 + v;
+        total = total * 60.0 + v as f64;
     }
-    let last: f64 = parts[parts.len() - 1].parse().ok()?;
-    if !last.is_finite() || last < 0.0 || last >= 60.0 {
+    let last: f64 = parts[parts.len() - 1].trim().parse().ok()?;
+    if !last.is_finite() || last < 0.0 {
         return None;
     }
-    Some(total * 60.0 + last)
+    let total = total * 60.0 + last;
+    total.is_finite().then_some(total)
 }
 
 #[cfg(test)]
@@ -304,9 +313,14 @@ mod tests {
         assert_eq!(parse_time_spec("-5"), None);
         assert_eq!(parse_time_spec("abc"), None);
         assert_eq!(parse_time_spec("1:2:3:4"), None);
-        assert_eq!(parse_time_spec("1:75"), None);
         assert_eq!(parse_time_spec("inf"), None);
         assert_eq!(parse_time_spec("1:"), None);
+        // Python-parity quirks:
+        assert_eq!(parse_time_spec("1e-3"), None); // `-` anywhere rejects
+        assert_eq!(parse_time_spec("1.5:02"), None); // heads must be integers
+        assert_eq!(parse_time_spec("1:75"), Some(135.0)); // seconds may exceed 59
+        assert_eq!(parse_time_spec("1: 02"), Some(62.0)); // inner space tolerated
+        assert_eq!(parse_time_spec("0:75"), Some(75.0));
     }
 
     #[test]
@@ -351,7 +365,9 @@ mod tests {
             MetricCell::Done {
                 values: vec![30.0],
                 avg: 30.123_456,
-                exec_s: 1.0
+                exec_s: 1.0,
+                skip: None,
+                clip_dur: None,
             }
             .cell_text(),
             "30.1235"
@@ -360,7 +376,9 @@ mod tests {
             MetricCell::Done {
                 values: vec![30.0],
                 avg: 30.0,
-                exec_s: 1.0
+                exec_s: 1.0,
+                skip: None,
+                clip_dur: None,
             }
             .tooltip("PSNR")
             .starts_with("PSNR\nAvg: 30.000000")
