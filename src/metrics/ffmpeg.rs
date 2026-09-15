@@ -121,6 +121,20 @@ fn max_frame_in(text: &str) -> Option<u64> {
         .max()
 }
 
+/// Cap for the stderr dump appended to failure log lines (original
+/// `ERROR:` + stderr parity without progress-meter flooding).
+pub(crate) const STDERR_TAIL_LINES: usize = 30;
+
+/// Last `n` non-empty stderr lines, chronological, for the log file.
+pub(crate) fn stderr_tail(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
 /// Per-frame value from a `stats_file=-` stdout line.
 /// PSNR (`n:1 ... psnr_avg:34.12 ...`) clamps to 0–100; SSIM
 /// (`n:1 ... All:0.985210 ...`, Y/U/V ignored) clamps to 0–1 and strips a
@@ -561,7 +575,9 @@ pub fn run_metric(job: &RunInputs<'_>, on_progress: &(dyn Fn(u64) + Sync)) -> Ru
     let args = build_args(
         kind, ref_path, dist_path, ref_info, dist_info, skip, clip_dur,
     );
-    log::debug!(target: "rfmetrics::metric", "run: \"{}\" {}", exe.display(), args.join(" "));
+    // `info`: the exact repro command is the core artifact of an issue
+    // report (FFMetrics.log parity) — one line per metric job.
+    log::info!(target: "rfmetrics::metric", "run: \"{}\" {}", exe.display(), args.join(" "));
     let mut values = Vec::new();
     let pumped = match pump_process(
         exe,
@@ -598,7 +614,8 @@ pub fn run_metric(job: &RunInputs<'_>, on_progress: &(dyn Fn(u64) + Sync)) -> Ru
     if values.is_empty() {
         let tail = err_text.lines().map(str::trim).rfind(|l| !l.is_empty());
         let msg = tail.unwrap_or(&format!("no {name} data")).to_owned();
-        log::warn!(target: "rfmetrics::metric", "{name} no data for \"{dist_path}\" (exit {code:?}, {exec_s:.1}s): {msg}");
+        let dump = stderr_tail(&err_text, STDERR_TAIL_LINES);
+        log::warn!(target: "rfmetrics::metric", "{name} no data for \"{dist_path}\" (exit {code:?}, {exec_s:.1}s): {msg}\n{dump}");
         return RunOutcome {
             values,
             avg: None,
@@ -647,6 +664,20 @@ mod tests {
         assert_eq!(max_frame_in(blob), Some(27));
         assert_eq!(max_frame_in("frame=  3 fps=25"), Some(3));
         assert_eq!(max_frame_in("no progress here"), None);
+    }
+
+    #[test]
+    fn stderr_tail_keeps_last_non_empty_lines() {
+        assert_eq!(stderr_tail("", 30), "");
+        assert_eq!(stderr_tail("a\n\nb\n", 30), "a\nb");
+        let many: String = (1..=40)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tail = stderr_tail(&many, 30);
+        assert_eq!(tail.lines().count(), 30);
+        assert!(tail.starts_with("line 11\n"));
+        assert!(tail.ends_with("line 40"));
     }
 
     #[test]

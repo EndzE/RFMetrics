@@ -349,7 +349,8 @@ pub fn run_vmaf(job: &RunInputs, cfg: &VmafCfg, on_progress: &(dyn Fn(u64) + Syn
     args.push("-filter_complex".to_owned());
     args.push(filt);
     args.extend(["-f".to_owned(), "null".to_owned(), "-".to_owned()]);
-    log::debug!(target: "rfmetrics::metric", "run: \"{}\" {}", exe.display(), args.join(" "));
+    // `info`: see `run_metric` — the repro command belongs in issue reports.
+    log::info!(target: "rfmetrics::metric", "run: \"{}\" {}", exe.display(), args.join(" "));
     // Stdout carries no VMAF scores; drain it so the pipe never blocks.
     let pumped = match pump_process(
         exe,
@@ -393,7 +394,11 @@ pub fn run_vmaf(job: &RunInputs, cfg: &VmafCfg, on_progress: &(dyn Fn(u64) + Syn
             })
             .unwrap_or(&format!("FFmpeg failed with code {:?}", pumped.code))
             .to_owned();
-        log::warn!(target: "rfmetrics::metric", "VMAF no data for \"{dist_path}\" (exit {:?}, {:.1}s): {msg}", pumped.code, pumped.exec_s);
+        let dump = crate::metrics::ffmpeg::stderr_tail(
+            &pumped.stderr,
+            crate::metrics::ffmpeg::STDERR_TAIL_LINES,
+        );
+        log::warn!(target: "rfmetrics::metric", "VMAF no data for \"{dist_path}\" (exit {:?}, {:.1}s): {msg}\n{dump}", pumped.code, pumped.exec_s);
         return RunOutcome {
             values: Vec::new(),
             avg: None,
@@ -418,7 +423,11 @@ pub fn run_vmaf(job: &RunInputs, cfg: &VmafCfg, on_progress: &(dyn Fn(u64) + Syn
             .map(str::trim)
             .rfind(|l| !l.is_empty());
         let msg = tail.unwrap_or("no VMAF data").to_owned();
-        log::warn!(target: "rfmetrics::metric", "VMAF no data for \"{dist_path}\" (exit {:?}, {:.1}s): {msg}", pumped.code, pumped.exec_s);
+        let dump = crate::metrics::ffmpeg::stderr_tail(
+            &pumped.stderr,
+            crate::metrics::ffmpeg::STDERR_TAIL_LINES,
+        );
+        log::warn!(target: "rfmetrics::metric", "VMAF no data for \"{dist_path}\" (exit {:?}, {:.1}s): {msg}\n{dump}", pumped.code, pumped.exec_s);
         return RunOutcome {
             values,
             avg: None,
