@@ -262,6 +262,7 @@ pub struct RFMetricsApp {
     vmaf_scale: bool,
     vmaf_pooling: String,
     vmaf_subsample: String,
+    vmaf_threads: String,
     vmaf_models: Vec<String>,
     rows: Vec<QueueRow>,
     ffmpeg: crate::binaries::BinaryInfo,
@@ -327,6 +328,7 @@ impl Default for RFMetricsApp {
             vmaf_scale: false,
             vmaf_pooling: "Mean".to_owned(),
             vmaf_subsample: "1".to_owned(),
+            vmaf_threads: "auto".to_owned(),
             vmaf_models: crate::metrics::vmaf::list_models(
                 &crate::metrics::vmaf::vmaf_home().join("vmaf-models"),
             ),
@@ -797,6 +799,11 @@ impl RFMetricsApp {
                 crate::metrics::vmaf::Pooling::Mean
             },
             subsample: self.vmaf_subsample.parse::<u32>().unwrap_or(1).max(1),
+            // "auto" (or garbage) follows the system CPU, as before.
+            n_threads: match self.vmaf_threads.parse::<u32>() {
+                Ok(n) => n.max(1),
+                Err(_) => crate::metrics::vmaf::system_threads(),
+            },
         };
         // Per metric: rows already holding a valid value sit the rerun out —
         // but only when the trim settings still match: a value computed
@@ -1503,6 +1510,23 @@ impl eframe::App for RFMetricsApp {
                                     );
                                 }
                             });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_sized([70.0, 18.0], egui::Label::new("Threads").selectable(false));
+                        let _ = egui::ComboBox::from_id_salt("vmaf_threads")
+                            .width(220.0)
+                            .selected_text(&self.vmaf_threads)
+                            .show_ui(ui, |ui| {
+                                for v in ["auto", "1", "2", "4", "8", "16", "32"] {
+                                    let _ = ui.selectable_value(
+                                        &mut self.vmaf_threads,
+                                        v.to_owned(),
+                                        v,
+                                    );
+                                }
+                            })
+                            .response
+                            .on_hover_text("auto follows the system CPU count");
                     });
                 });
             });
@@ -2571,6 +2595,7 @@ mod tests {
         // Current UI settings snapshot to subsample 1; the stored VMAF
         // value was computed under subsample 5.
         app.vmaf_subsample = "1".to_owned();
+        app.vmaf_threads = "4".to_owned();
         app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
         app.ref_info_data = Some(MediaInfo::default());
         app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
@@ -2594,6 +2619,7 @@ mod tests {
                 scale: false,
                 pooling: Pooling::Mean,
                 subsample: 5,
+                n_threads: 4,
             }),
         };
         app.rows[0].info = Some(MediaInfo::default());
@@ -2639,6 +2665,7 @@ mod tests {
             ..RFMetricsApp::default()
         };
         app.vmaf_subsample = "1".to_owned();
+        app.vmaf_threads = "4".to_owned();
         app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
         app.ref_info_data = Some(MediaInfo::default());
         app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
@@ -2662,6 +2689,7 @@ mod tests {
                 scale: false,
                 pooling: Pooling::Mean,
                 subsample: 1,
+                n_threads: 4,
             }),
         };
         app.rows[0].info = Some(MediaInfo::default());
@@ -2692,6 +2720,8 @@ mod tests {
             ref_path: p.to_string_lossy().into_owned(),
             ..RFMetricsApp::default()
         };
+        // Pin threads: the "auto" default resolves machine-dependently.
+        app.vmaf_threads = "4".to_owned();
         app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
         let done = |avg: f64| MetricCell::Done {
             values: vec![avg],
@@ -2715,6 +2745,7 @@ mod tests {
                 scale: false,
                 pooling: Pooling::Mean,
                 subsample: 1,
+                n_threads: 4,
             }),
         };
         app.start_run(0.0);
@@ -2746,6 +2777,7 @@ mod tests {
             ..RFMetricsApp::default()
         };
         app.vmaf_subsample = "1".to_owned();
+        app.vmaf_threads = "4".to_owned();
         app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
         app.ref_info_data = Some(MediaInfo::default());
         app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
@@ -2763,6 +2795,7 @@ mod tests {
                 scale: false,
                 pooling: Pooling::Mean,
                 subsample: 5,
+                n_threads: 4,
             }),
         };
         for i in 0..2 {

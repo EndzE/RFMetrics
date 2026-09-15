@@ -35,6 +35,15 @@ pub struct VmafCfg {
     pub scale: bool,
     pub pooling: Pooling,
     pub subsample: u32,
+    /// Resolved thread count (`0` omits the option).
+    pub n_threads: u32,
+}
+
+/// System thread count for libvmaf (`0` when undetectable → option omitted).
+pub fn system_threads() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(0)
 }
 
 /// Home directory for models + temp logs: next to the exe (Python
@@ -320,9 +329,6 @@ pub fn run_vmaf(job: &RunInputs, cfg: &VmafCfg, on_progress: &(dyn Fn(u64) + Syn
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "vmaf_log.json".to_owned());
-    let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get() as u32)
-        .unwrap_or(0);
     let filt = match build_filter(
         ref_info,
         dist_info,
@@ -331,7 +337,7 @@ pub fn run_vmaf(job: &RunInputs, cfg: &VmafCfg, on_progress: &(dyn Fn(u64) + Syn
         cfg,
         &models_dir,
         &logname,
-        n_threads,
+        cfg.n_threads,
     ) {
         Ok(f) => f,
         Err(e) => {
@@ -472,6 +478,9 @@ mod tests {
             scale: false,
             pooling: Pooling::Mean,
             subsample: 1,
+            // Filter tests pass threads to `build_filter` directly; the
+            // snapshot value only matters to `run_vmaf`.
+            n_threads: 0,
         }
     }
 
