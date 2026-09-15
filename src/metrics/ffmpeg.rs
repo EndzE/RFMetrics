@@ -7,12 +7,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::probe::MediaInfo;
 
 /// Filter-based metric sharing the `_compute_series` engine: identical
-/// `[main][ref]` order, trim/scale/format legs, worker, and stats.
-/// Only the filter name and the output parsers differ per kind.
+/// trim/scale/format legs, worker, and stats. The filter name, the input
+/// order (XPSNR alone inverts to `[ref][main]`), and the output parsers
+/// differ per kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricKind {
     Psnr,
     Ssim,
+    Xpsnr,
 }
 
 impl MetricKind {
@@ -21,14 +23,24 @@ impl MetricKind {
         match self {
             Self::Psnr => "PSNR",
             Self::Ssim => "SSIM",
+            Self::Xpsnr => "XPSNR",
         }
     }
 
-    /// ffmpeg filter name in the `[main][ref]<filter>=…` segment.
+    /// ffmpeg filter name in the `<order><filter>=…` segment.
     fn filter(self) -> &'static str {
         match self {
             Self::Psnr => "psnr",
             Self::Ssim => "ssim",
+            Self::Xpsnr => "xpsnr",
+        }
+    }
+
+    /// Input order segment: XPSNR alone inverts to `[ref][main]`.
+    fn order(self) -> &'static str {
+        match self {
+            Self::Xpsnr => "[ref][main]",
+            _ => "[main][ref]",
         }
     }
 }
@@ -58,6 +70,29 @@ fn ssim_summary_re() -> &'static regex::Regex {
     RE.get_or_init(|| regex::Regex::new(r"All:(\S+)").unwrap())
 }
 
+/// Matches `_XPSNR_NUM`: plain/scientific floats plus `inf`/`nan`.
+const XPSNR_NUM: &str = r"[-+]?(?:\d+(?:\.\d+)?(?:[eE][-+]?\d+)?|inf|nan)";
+
+fn xpsnr_frame_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(&format!(
+            r"(?i)XPSNR\s+y:\s*({XPSNR_NUM})\s+XPSNR\s+u:\s*({XPSNR_NUM})\s+XPSNR\s+v:\s*({XPSNR_NUM})"
+        ))
+        .unwrap()
+    })
+}
+
+fn xpsnr_summary_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(&format!(
+            r"(?i)XPSNR\s+y:\s*({XPSNR_NUM})\s+u:\s*({XPSNR_NUM})\s+v:\s*({XPSNR_NUM})"
+        ))
+        .unwrap()
+    })
+}
+
 fn err_progress_re() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| regex::Regex::new(r"frame=\s*(\d+)").unwrap())
@@ -81,6 +116,8 @@ pub fn parse_frame_line(line: &str, kind: MetricKind) -> Option<f64> {
                 .trim_end_matches(')'),
             1.0,
         ),
+        // XPSNR combines three planes with weights: use parse_xpsnr_frame_line.
+        MetricKind::Xpsnr => return None,
     };
     let v: f64 = raw.parse().ok()?;
     if v.is_nan() {
@@ -120,6 +157,8 @@ pub fn parse_summary(text: &str, kind: MetricKind) -> Option<f64> {
                     return Some(v);
                 }
             }
+            // XPSNR combines three planes with weights: use parse_xpsnr_summary.
+            MetricKind::Xpsnr => {}
         }
     }
     None
@@ -162,11 +201,117 @@ pub fn filtergraph(
     let mut ref_leg: Vec<String> = window;
     ref_leg.push(NORM.to_owned());
     format!(
-        "[0:v]{}[main];[1:v]{}[ref];[main][ref]{}=eof_action=endall:stats_file=-",
+        "[0:v]{}[main];[1:v]{}[ref];{}{}=eof_action=endall:stats_file=-",
         pre.join(","),
         ref_leg.join(","),
+        kind.order(),
         kind.filter(),
     )
+}
+
+/// Plane weights as `(y, u, v)` sample counts (Python
+/// `_xpsnr_plane_weights` parity): exact counts when the reference
+/// dimensions are known (`w*h`, `ceil(w/2)*ceil(h/2)`), 4:1:1 / 2:1:1
+/// ratios without them, `1.0` default (incl. unknown formats).
+/// Format comes from the reference first, the distorted as fallback.
+pub fn xpsnr_weights(
+    pix_fmt: Option<&str>,
+    width: Option<i64>,
+    height: Option<i64>,
+) -> (f64, f64, f64) {
+    let fmt = pix_fmt.unwrap_or_default().to_lowercase();
+    if let (Some(w), Some(h)) = (width, height)
+        && w > 0
+        && h > 0
+    {
+        if fmt.contains("420") || fmt.contains("nv12") || fmt.contains("nv21") {
+            let uv = (((w + 1) / 2) * ((h + 1) / 2)) as f64;
+            if uv > 0.0 {
+                return ((w * h) as f64, uv, uv);
+            }
+        }
+        if fmt.contains("422") {
+            let uv = (((w + 1) / 2) * h) as f64;
+            if uv > 0.0 {
+                return ((w * h) as f64, uv, uv);
+            }
+        }
+        if fmt.contains("444") {
+            return (1.0, 1.0, 1.0);
+        }
+    }
+    if fmt.contains("420") || fmt.contains("nv12") || fmt.contains("nv21") {
+        return (4.0, 1.0, 1.0);
+    }
+    if fmt.contains("422") {
+        return (2.0, 1.0, 1.0);
+    }
+    (1.0, 1.0, 1.0)
+}
+
+/// Per-plane sanitize (Python `_sanitize_db` parity): identical files
+/// yield `inf`/`nan` from ffmpeg; those become 100.0/0.0. Otherwise
+/// unclamped — negative dB stays negative.
+pub fn sanitize_db(value: f64) -> f64 {
+    if value.is_nan() {
+        0.0
+    } else if value.is_infinite() {
+        100.0
+    } else {
+        value
+    }
+}
+
+fn weighted_avg(y: f64, u: f64, v: f64, weights: (f64, f64, f64)) -> f64 {
+    let (wy, wu, wv) = weights;
+    let total = wy + wu + wv;
+    let total = if total > 0.0 { total } else { 1.0 };
+    (wy * y + wu * u + wv * v) / total
+}
+
+/// Per-frame XPSNR value from a stats line
+/// (`n:1 XPSNR y: 42.1 XPSNR u: 45.0 XPSNR v: 44.2`), plane-weighted.
+/// Frame regex requires the `XPSNR` prefix on every plane.
+pub fn parse_xpsnr_frame_line(line: &str, weights: (f64, f64, f64)) -> Option<f64> {
+    if !line.trim_start().starts_with("n:") {
+        return None;
+    }
+    let c = xpsnr_frame_re().captures(line)?;
+    let y = sanitize_db(c.get(1)?.as_str().parse().ok()?);
+    let u = sanitize_db(c.get(2)?.as_str().parse().ok()?);
+    let v = sanitize_db(c.get(3)?.as_str().parse().ok()?);
+    Some(weighted_avg(y, u, v, weights))
+}
+
+/// Pooled XPSNR from ffmpeg's stderr summary
+/// (`... XPSNR y: 43.1 u: 44.0 v: 43.8 ...`), scanned bottom-up.
+/// Summary form has no `XPSNR` prefix on u/v; the scan requires
+/// case-sensitive `XPSNR` in the line and skips `n:` lines.
+pub fn parse_xpsnr_summary(text: &str, weights: (f64, f64, f64)) -> Option<f64> {
+    for line in text.lines().rev() {
+        if !line.contains("XPSNR") || line.trim_start().starts_with("n:") {
+            continue;
+        }
+        if let Some(c) = xpsnr_summary_re().captures(line) {
+            // Unparseable numbers skip the line (Python `except
+            // ValueError: continue`), not the whole scan.
+            let (Ok(y), Ok(u), Ok(v)) = (
+                c.get(1).unwrap().as_str().parse::<f64>(),
+                c.get(2).unwrap().as_str().parse::<f64>(),
+                c.get(3).unwrap().as_str().parse::<f64>(),
+            ) else {
+                continue;
+            };
+            // Python also sanitizes the summary planes (inf/nan safety).
+            return Some(weighted_avg(
+                sanitize_db(y),
+                sanitize_db(u),
+                sanitize_db(v),
+                weights,
+            ));
+        }
+    }
+    None
 }
 
 /// Full ffmpeg argv (minus the exe) for a filter-metric run.
@@ -241,6 +386,13 @@ pub fn run_metric(job: &RunInputs<'_>, on_progress: &(dyn Fn(u64) + Sync)) -> Ru
         child_slot,
     } = *job;
     let name = kind.name();
+    // XPSNR weights come from the reference (pix_fmt, then dims), with the
+    // distorted pix_fmt as fallback — computed once per run, not per line.
+    let weights = xpsnr_weights(
+        ref_info.pix_fmt.as_deref().or(dist_info.pix_fmt.as_deref()),
+        ref_info.width,
+        ref_info.height,
+    );
     let fail = |msg: String| RunOutcome {
         values: Vec::new(),
         avg: None,
@@ -305,7 +457,10 @@ pub fn run_metric(job: &RunInputs<'_>, on_progress: &(dyn Fn(u64) + Sync)) -> Ru
                 {
                     on_progress(f);
                 }
-                if let Some(v) = parse_frame_line(&line, kind) {
+                if let Some(v) = match kind {
+                    MetricKind::Xpsnr => parse_xpsnr_frame_line(&line, weights),
+                    kind => parse_frame_line(&line, kind),
+                } {
                     values.push(v);
                 }
             }
@@ -344,7 +499,10 @@ pub fn run_metric(job: &RunInputs<'_>, on_progress: &(dyn Fn(u64) + Sync)) -> Ru
             error: Some(msg),
         };
     }
-    let avg = parse_summary(&err_text, kind);
+    let avg = match kind {
+        MetricKind::Xpsnr => parse_xpsnr_summary(&err_text, weights),
+        kind => parse_summary(&err_text, kind),
+    };
     let show = avg.unwrap_or_else(|| values.iter().sum::<f64>() / values.len() as f64);
     log::info!(
         target: "rfmetrics::metric",
@@ -527,5 +685,117 @@ mod tests {
         assert!(i1 < i2);
         assert!(a.contains(&"-r".to_owned()) && a.contains(&"25".to_owned()));
         assert_eq!(a.last().unwrap(), "-");
+    }
+
+    #[test]
+    fn xpsnr_weights_match_python_branches() {
+        // Exact sample counts for 1920x1080 4:2:0 (not just 4:1:1).
+        assert_eq!(
+            xpsnr_weights(Some("yuv420p"), Some(1920), Some(1080)),
+            (2073600.0, 518400.0, 518400.0)
+        );
+        // Odd dims use ceil halves: 5x5 -> y=25, uv=3x3=9.
+        assert_eq!(
+            xpsnr_weights(Some("yuv420p"), Some(5), Some(5)),
+            (25.0, 9.0, 9.0)
+        );
+        // nv12/nv21 aliases of 420; 422 halves width only.
+        assert_eq!(
+            xpsnr_weights(Some("nv12"), Some(1920), Some(1080)),
+            (2073600.0, 518400.0, 518400.0)
+        );
+        assert_eq!(
+            xpsnr_weights(Some("yuv422p"), Some(1920), Some(1080)),
+            (2073600.0, 1036800.0, 1036800.0)
+        );
+        // 444 and unknown formats weigh planes equally.
+        assert_eq!(
+            xpsnr_weights(Some("yuv444p"), Some(1920), Some(1080)),
+            (1.0, 1.0, 1.0)
+        );
+        assert_eq!(
+            xpsnr_weights(Some("rgb24"), Some(1920), Some(1080)),
+            (1.0, 1.0, 1.0)
+        );
+        assert_eq!(xpsnr_weights(None, Some(1920), Some(1080)), (1.0, 1.0, 1.0));
+        // Unknown dims fall back to ratios.
+        assert_eq!(xpsnr_weights(Some("yuv420p"), None, None), (4.0, 1.0, 1.0));
+        assert_eq!(xpsnr_weights(Some("NV21"), None, None), (4.0, 1.0, 1.0));
+        assert_eq!(
+            xpsnr_weights(Some("yuv422p10le"), None, None),
+            (2.0, 1.0, 1.0)
+        );
+        assert_eq!(xpsnr_weights(None, None, None), (1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn sanitize_db_pins_inf_and_nan() {
+        assert_eq!(sanitize_db(f64::INFINITY), 100.0);
+        assert_eq!(sanitize_db(f64::NEG_INFINITY), 100.0);
+        assert_eq!(sanitize_db(f64::NAN), 0.0);
+        assert_eq!(sanitize_db(42.5), 42.5);
+        assert_eq!(sanitize_db(-3.0), -3.0); // unclamped otherwise
+    }
+
+    #[test]
+    fn xpsnr_frame_lines() {
+        let w = (4.0, 1.0, 1.0);
+        assert_eq!(
+            parse_xpsnr_frame_line("n:1 XPSNR y: 42.0 XPSNR u: 45.0 XPSNR v: 44.0", w),
+            Some((4.0 * 42.0 + 45.0 + 44.0) / 6.0)
+        );
+        // Non-n: lines and missing planes are skipped.
+        assert_eq!(parse_xpsnr_frame_line("frame= 12 fps=25", w), None);
+        assert_eq!(parse_xpsnr_frame_line("n:2 XPSNR y: 42.0", w), None);
+        // Summary form (no XPSNR prefix on u/v) is not a frame line.
+        assert_eq!(
+            parse_xpsnr_frame_line("n:3 XPSNR y: 42.0 u: 45.0 v: 44.0", w),
+            None
+        );
+        // Identical files: inf -> 100, nan -> 0 per plane.
+        assert_eq!(
+            parse_xpsnr_frame_line("n:4 XPSNR y: inf XPSNR u: inf XPSNR v: inf", w),
+            Some(100.0)
+        );
+        assert_eq!(
+            parse_xpsnr_frame_line("n:5 XPSNR y: nan XPSNR u: 45.0 XPSNR v: 44.0", w),
+            Some((45.0 + 44.0) / 6.0)
+        );
+        // Case-insensitive like the Python regex.
+        assert!(
+            parse_xpsnr_frame_line("n:6 xpsnr y: 40.0 xpsnr u: 40.0 xpsnr v: 40.0", w).is_some()
+        );
+    }
+
+    #[test]
+    fn xpsnr_summary_scans_bottom_up() {
+        let w = (4.0, 1.0, 1.0);
+        let err = "[Parsed_xpsnr_0] XPSNR y: 40.0 u: 41.0 v: 42.0\n\
+                   [Parsed_xpsnr_0] XPSNR y: 43.0 u: 44.0 v: 45.0\n";
+        assert_eq!(
+            parse_xpsnr_summary(err, w),
+            Some((4.0 * 43.0 + 44.0 + 45.0) / 6.0)
+        );
+        // Per-frame lines never count, even mentioning XPSNR planes.
+        assert_eq!(
+            parse_xpsnr_summary("n:7 XPSNR y: 1.0 XPSNR u: 1.0 XPSNR v: 1.0", w),
+            None
+        );
+        assert_eq!(parse_xpsnr_summary("nothing here", w), None);
+    }
+
+    #[test]
+    fn xpsnr_graph_inverts_input_order() {
+        use super::MetricKind::{Psnr, Xpsnr};
+        let psnr = filtergraph(Psnr, &ref_info(), &ref_info(), Some(5.0), Some(10.0));
+        let xpsnr = filtergraph(Xpsnr, &ref_info(), &ref_info(), Some(5.0), Some(10.0));
+        // Same legs — only the order segment and filter name differ.
+        assert_eq!(
+            xpsnr,
+            psnr.replace(
+                "[main][ref]psnr=eof_action=endall:stats_file=-",
+                "[ref][main]xpsnr=eof_action=endall:stats_file=-"
+            )
+        );
     }
 }

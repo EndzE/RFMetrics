@@ -66,7 +66,7 @@ impl MetricCell {
 }
 
 /// Cross-row rank of one stat value (screenshot green/red/yellow rules).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StatRank {
     /// Holds the column extreme on the winning side: green.
     Best,
@@ -75,6 +75,7 @@ pub enum StatRank {
     /// Single row or all equal: dim yellow (neither won nor lost).
     Tie,
     /// Mid-pack (3+ rows) or unrankable: no highlight.
+    #[default]
     Plain,
 }
 

@@ -17,6 +17,19 @@ struct QueueRow {
     info: Option<crate::probe::MediaInfo>,
     psnr: crate::metrics::MetricCell,
     ssim: crate::metrics::MetricCell,
+    xpsnr: crate::metrics::MetricCell,
+    psnr_cache: CachedStats,
+    ssim_cache: CachedStats,
+    xpsnr_cache: CachedStats,
+}
+
+/// Cached per-row stats + cross-row ranks for one metric column (H1: the
+/// values-vec clone+sort in `DoneStats::new` and the rank scan run on
+/// result arrival, not per frame; the render loop only reads).
+#[derive(Debug, Clone, Default)]
+struct CachedStats {
+    stats: Option<crate::metrics::DoneStats>,
+    ranks: [crate::metrics::StatRank; 10],
 }
 
 impl QueueRow {
@@ -24,6 +37,7 @@ impl QueueRow {
         match kind {
             MetricKind::Psnr => &self.psnr,
             MetricKind::Ssim => &self.ssim,
+            MetricKind::Xpsnr => &self.xpsnr,
         }
     }
 
@@ -31,6 +45,23 @@ impl QueueRow {
         match kind {
             MetricKind::Psnr => &mut self.psnr,
             MetricKind::Ssim => &mut self.ssim,
+            MetricKind::Xpsnr => &mut self.xpsnr,
+        }
+    }
+
+    fn cached(&self, kind: MetricKind) -> &CachedStats {
+        match kind {
+            MetricKind::Psnr => &self.psnr_cache,
+            MetricKind::Ssim => &self.ssim_cache,
+            MetricKind::Xpsnr => &self.xpsnr_cache,
+        }
+    }
+
+    fn cached_mut(&mut self, kind: MetricKind) -> &mut CachedStats {
+        match kind {
+            MetricKind::Psnr => &mut self.psnr_cache,
+            MetricKind::Ssim => &mut self.ssim_cache,
+            MetricKind::Xpsnr => &mut self.xpsnr_cache,
         }
     }
 }
@@ -480,6 +511,10 @@ impl RFMetricsApp {
                 info: None,
                 psnr: crate::metrics::MetricCell::Idle,
                 ssim: crate::metrics::MetricCell::Idle,
+                xpsnr: crate::metrics::MetricCell::Idle,
+                psnr_cache: CachedStats::default(),
+                ssim_cache: CachedStats::default(),
+                xpsnr_cache: CachedStats::default(),
             });
             fresh.push((key, s));
         }
@@ -505,6 +540,7 @@ impl RFMetricsApp {
     /// Apply metric worker results; stale generations (post-Reset) drop.
     /// Progress keeps the max frame per row (dual stdout/stderr feeds).
     fn drain_metric_results(&mut self) {
+        let mut scored_changed = false;
         while let Ok(msg) = self.metric_rx.try_recv() {
             match msg {
                 MetricMsg::Progress {
@@ -542,6 +578,10 @@ impl RFMetricsApp {
                     self.pending = self.pending.saturating_sub(1);
                     if let Some(row) = self.rows.iter_mut().find(|r| norm_key(&r.path) == key) {
                         *row.cell_mut(kind) = match error {
+                            // Killed by Stop: settle quietly like unstarted
+                            // rows (H4); `Finished{aborted}` below handles
+                            // the still-Running ones.
+                            Some(msg) if msg == "aborted" => crate::metrics::MetricCell::Idle,
                             Some(msg) => crate::metrics::MetricCell::Error { msg },
                             None => crate::metrics::MetricCell::Done {
                                 avg: avg.unwrap_or_else(|| crate::metrics::mean(&values)),
@@ -551,6 +591,11 @@ impl RFMetricsApp {
                                 clip_dur,
                             },
                         };
+                        // Cache the stats once (clone+sort lives here, not
+                        // per frame); ranks refresh below for this metric.
+                        let stats = row.cell(kind).done_stats();
+                        row.cached_mut(kind).stats = stats;
+                        scored_changed = true;
                     }
                     if self.pending == 0 {
                         self.measuring = false;
@@ -578,6 +623,49 @@ impl RFMetricsApp {
                     self.measuring = false;
                 }
             }
+        }
+        // Ranks depend on the whole scored set, so refresh after applying
+        // the batch — not per message, and never per frame. The scan itself
+        // is trivial (min/max over 10 scalars per scored row, no sorting).
+        if scored_changed {
+            self.refresh_ranks(MetricKind::Psnr);
+            self.refresh_ranks(MetricKind::Ssim);
+        }
+    }
+
+    /// Recompute cross-row ranks for one metric from the cached stats.
+    /// Call whenever the scored set changes: `Done` landing, a rerun
+    /// marking cells `Running`, Reset, or row removal.
+    fn refresh_ranks(&mut self, kind: MetricKind) {
+        let mut stat_lo = [f64::INFINITY; 10];
+        let mut stat_hi = [f64::NEG_INFINITY; 10];
+        let mut scored = 0usize;
+        for row in &self.rows {
+            if let Some(s) = &row.cached(kind).stats {
+                scored += 1;
+                for (k, (_, v, _)) in s.comparable().iter().enumerate() {
+                    stat_lo[k] = stat_lo[k].min(*v);
+                    stat_hi[k] = stat_hi[k].max(*v);
+                }
+            }
+        }
+        for row in &mut self.rows {
+            let cached = row.cached_mut(kind);
+            let mut ranks = [crate::metrics::StatRank::Plain; 10];
+            if scored >= 2
+                && let Some(s) = &cached.stats
+            {
+                let comp = s.comparable();
+                for k in 0..10 {
+                    let (_, v, lower_better) = comp[k];
+                    ranks[k] = if lower_better {
+                        crate::metrics::rank_low(v, stat_lo[k], stat_hi[k])
+                    } else {
+                        crate::metrics::rank(v, stat_lo[k], stat_hi[k])
+                    };
+                }
+            }
+            cached.ranks = ranks;
         }
     }
 
@@ -611,11 +699,12 @@ impl RFMetricsApp {
         if self.measuring {
             return;
         }
-        let kinds: Vec<MetricKind> = [MetricKind::Psnr, MetricKind::Ssim]
+        let kinds: Vec<MetricKind> = [MetricKind::Psnr, MetricKind::Ssim, MetricKind::Xpsnr]
             .into_iter()
             .filter(|k| match k {
                 MetricKind::Psnr => self.m_psnr,
                 MetricKind::Ssim => self.m_ssim,
+                MetricKind::Xpsnr => self.m_xpsnr,
             })
             .collect();
         if kinds.is_empty() {
@@ -749,8 +838,14 @@ impl RFMetricsApp {
                     ));
                     *self.rows[i].cell_mut(*kind) =
                         crate::metrics::MetricCell::Running { frame: 0 };
+                    // Leaving the scored set: drop the cached stats now so
+                    // the refresh below can't rank a stale value.
+                    self.rows[i].cached_mut(*kind).stats = None;
                 }
             }
+        }
+        for &kind in &kinds {
+            self.refresh_ranks(kind);
         }
         if jobs.is_empty() {
             self.toast(
@@ -868,6 +963,10 @@ impl RFMetricsApp {
         for row in &mut self.rows {
             row.psnr = crate::metrics::MetricCell::Idle;
             row.ssim = crate::metrics::MetricCell::Idle;
+            row.xpsnr = crate::metrics::MetricCell::Idle;
+            row.psnr_cache = CachedStats::default();
+            row.ssim_cache = CachedStats::default();
+            row.xpsnr_cache = CachedStats::default();
         }
         log::info!(target: "rfmetrics::app", "metric results cleared");
     }
@@ -912,43 +1011,42 @@ fn rank_fill(rank: crate::metrics::StatRank) -> Option<egui::Color32> {
     }
 }
 
-/// Per-row (stats, ranks) for one metric column; ranks stay Plain unless
-/// 2+ rows scored (colors need a comparison).
-fn rank_details(
-    rows: &[QueueRow],
-    pick: impl Fn(&QueueRow) -> Option<crate::metrics::DoneStats>,
-) -> Vec<Option<(crate::metrics::DoneStats, [crate::metrics::StatRank; 10])>> {
-    let scored: Vec<(usize, crate::metrics::DoneStats)> = rows
-        .iter()
-        .enumerate()
-        .filter_map(|(i, r)| pick(r).map(|s| (i, s)))
-        .collect();
-    let comparable = scored.len() >= 2;
-    let mut stat_lo = [f64::INFINITY; 10];
-    let mut stat_hi = [f64::NEG_INFINITY; 10];
-    for (_, s) in &scored {
-        for (k, (_, v, _)) in s.comparable().iter().enumerate() {
-            stat_lo[k] = stat_lo[k].min(*v);
-            stat_hi[k] = stat_hi[k].max(*v);
-        }
+/// Table metric-column layout, left to right — MUST match the header
+/// checkbox order. `None` slots are stale placeholders for unimplemented
+/// metrics (VMAF until it lands): they render N/A so live columns like
+/// XPSNR stay under their own headers.
+const METRIC_COLUMNS: [(Option<MetricKind>, &str); 7] = [
+    (Some(MetricKind::Psnr), "PSNR"),
+    (Some(MetricKind::Ssim), "SSIM"),
+    (None, "VMAF"),
+    (Some(MetricKind::Xpsnr), "XPSNR"),
+    (None, "SSIM2"),
+    (None, "BUTTER"),
+    (None, "CVVDP"),
+];
+
+/// Stale placeholder for an unimplemented metric column: divider + N/A cell
+/// with the same selection-toggle behavior as live cells, plus a hover note
+/// so the N/A reads as "not yet" rather than broken.
+fn stale_metric_cell(
+    row: &mut egui_extras::TableRow<'_, '_>,
+    i: usize,
+    toggle_row: &mut Option<usize>,
+    title: &str,
+) {
+    let (_, r) = row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
+    if r.clicked() {
+        *toggle_row = Some(i);
     }
-    let mut detail = vec![None; rows.len()];
-    for (i, s) in &scored {
-        let comp = s.comparable();
-        let mut ranks = [crate::metrics::StatRank::Plain; 10];
-        if comparable {
-            for k in 0..10 {
-                let (_, v, lower_better) = comp[k];
-                ranks[k] = if lower_better {
-                    crate::metrics::rank_low(v, stat_lo[k], stat_hi[k])
-                } else {
-                    crate::metrics::rank(v, stat_lo[k], stat_hi[k])
-                };
-            }
-        }
-        detail[*i] = Some((s.clone(), ranks));
+    let (_, r) = row.col(|ui| {
+        ui.centered_and_justified(|ui| {
+            ui.label("N/A")
+                .on_hover_text(format!("{title} is not implemented yet"));
+        });
+    });
+    if r.clicked() {
+        *toggle_row = Some(i);
     }
-    detail
 }
 
 /// Filter-metric Done tooltip in FFMetrics order: Avg, Exec, Frames, a blank
@@ -1348,6 +1446,9 @@ impl eframe::App for RFMetricsApp {
                 {
                     self.rows.retain(|r| !r.selected);
                     self.refresh_queue_names();
+                    // The scored set may have shrunk: re-rank both columns.
+                    self.refresh_ranks(MetricKind::Psnr);
+                    self.refresh_ranks(MetricKind::Ssim);
                 }
             });
             ui.add_space(4.0);
@@ -1368,10 +1469,8 @@ impl eframe::App for RFMetricsApp {
                 }
                 ui.scope(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
-                    // Screenshot green/red rules: per-stat column extremes
-                    // across scored rows rank every metric cell + tooltip chip.
-                    let psnr_detail = rank_details(&self.rows, |r| r.psnr.done_stats());
-                    let ssim_detail = rank_details(&self.rows, |r| r.ssim.done_stats());
+                    // Metric stats + ranks come from the per-row cache (H1:
+                    // computed on result arrival, never per frame).
                     let mut table = egui_extras::TableBuilder::new(ui)
                         .striped(false)
                         .resizable(false)
@@ -1389,6 +1488,12 @@ impl eframe::App for RFMetricsApp {
                             .column(egui_extras::Column::exact(3.0))
                             .column(egui_extras::Column::exact(82.0));
                     }
+                    // Row-click side effects deferred past the loop (L3): the
+                    // hot path borrows rows read-only, so no per-frame clones
+                    // are needed to dodge the borrow checker.
+                    let mut toggle_row: Option<usize> = None;
+                    let mut open_path: Option<String> = None;
+                    let mut hovered_next: Option<usize> = None;
                     table
                         .header(18.0, |mut header| {
                             header.col(|_| {});
@@ -1435,99 +1540,94 @@ impl eframe::App for RFMetricsApp {
                                 row.set_hovered(hover_delayed);
                                 // Free-space click toggles selection; widget clicks
                                 // (checkbox, play, text drag-select) must not.
-                                let mut label_clicked = false;
-                                let mut bg_clicked = false;
+                                // (`toggle_row` etc. are set here, applied below.)
                                 row.col(|ui| {
                                     ui.checkbox(&mut self.rows[i].include, "");
                                 });
                                 let (_, r) =
                                     row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
                                 if r.clicked() {
-                                    bg_clicked = true;
+                                    toggle_row = Some(i);
                                 }
                                 row.col(|ui| {
                                     if ui.button("▶").clicked() {
-                                        let path = self.rows[i].path.clone();
-                                        if let Err(e) = open::that(&path) {
-                                            log::error!(target: "rfmetrics::app", "open \"{path}\" failed: {e}");
-                                            self.toast = Some(Toast {
-                                                text: format!("Could not open file: {e}"),
-                                                until: now + TOAST_SECS,
-                                                kind: ToastKind::Error,
-                                            });
-                                        }
+                                        open_path = Some(self.rows[i].path.clone());
                                     }
                                 });
                                 let (_, r) =
                                     row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
                                 if r.clicked() {
-                                    bg_clicked = true;
+                                    toggle_row = Some(i);
                                 }
                                 let (_, r) = row.col(|ui| {
                                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-                                    let (display, path) = {
-                                        let r = &self.rows[i];
-                                        (r.display.clone(), r.path.clone())
-                                    };
+                                    let row_data = &self.rows[i];
                                     // Plain selectable text: no button hover
                                     // outline; drag-select/copy still works and
                                     // the full path shows as tooltip (Python parity).
-                                    ui.add(egui::Label::new(&display).selectable(true))
-                                        .on_hover_text(&path);
+                                    ui.add(egui::Label::new(&row_data.display).selectable(true))
+                                        .on_hover_text(&row_data.path);
                                 });
                                 if r.clicked() {
-                                    label_clicked = true;
+                                    toggle_row = Some(i);
                                 }
                                 let (_, r) =
                                     row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
                                 if r.clicked() {
-                                    bg_clicked = true;
+                                    toggle_row = Some(i);
                                 }
                                 let (_, r) = row.col(|ui| {
-                                    let (media, tip) = {
-                                        let r = &self.rows[i];
-                                        (r.media.clone(), r.media_tip.clone())
-                                    };
-                                    ui.label(&media).on_hover_text(&tip);
+                                    let row_data = &self.rows[i];
+                                    ui.label(&row_data.media).on_hover_text(&row_data.media_tip);
                                 });
                                 if r.clicked() {
-                                    bg_clicked = true;
+                                    toggle_row = Some(i);
                                 }
-                                // Filter-metric columns: live state text on a rank
-                                // fill (best green, worst red, tie dim yellow),
-                                // per-stat chip grid tooltip for Done cells.
-                                for (kind, title, detail) in [
-                                    (MetricKind::Psnr, "PSNR", &psnr_detail),
-                                    (MetricKind::Ssim, "SSIM", &ssim_detail),
-                                ] {
-                                    let (_, r) = row.col(|ui| {
-                                        vline(ui, egui::Color32::from_gray(0x38))
-                                    });
+                                // Metric columns in METRIC_COLUMNS order: live state
+                                // text on a rank fill (best green, worst red,
+                                // tie dim yellow) with per-stat chip tooltips
+                                // for Done cells, N/A stale placeholders else.
+                                for (kind_opt, title) in METRIC_COLUMNS {
+                                    let Some(kind) = kind_opt else {
+                                        stale_metric_cell(&mut row, i, &mut toggle_row, title);
+                                        continue;
+                                    };
+                                    let (_, r) =
+                                        row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
                                     if r.clicked() {
-                                        bg_clicked = true;
+                                        toggle_row = Some(i);
                                     }
                                     let (_, r) = row.col(|ui| {
-                                        let (text, tip, cell_detail) = {
-                                            let cell = &self.rows[i].cell(kind);
-                                            (
-                                                cell.cell_text(),
-                                                cell.tooltip(title),
-                                                detail[i].clone(),
-                                            )
+                                        let (text, tip, stats, ranks) = {
+                                            let row_data = &self.rows[i];
+                                            let cell = row_data.cell(kind);
+                                            let cached = row_data.cached(kind);
+                                            let text = cell.cell_text();
+                                            // The ~15-line stats string is only
+                                            // built for unscored cells; Done
+                                            // cells use the chip grid below.
+                                            match &cached.stats {
+                                                Some(s) => (
+                                                    text,
+                                                    String::new(),
+                                                    Some(s.clone()),
+                                                    cached.ranks,
+                                                ),
+                                                None => {
+                                                    (text, cell.tooltip(title), None, cached.ranks)
+                                                }
+                                            }
                                         };
                                         let mut cell_frame = egui::Frame::NONE;
-                                        if let Some(fill) = cell_detail
-                                            .as_ref()
-                                            .and_then(|(_, r)| rank_fill(r[0]))
-                                        {
+                                        if let Some(fill) = rank_fill(ranks[0]) {
                                             cell_frame = cell_frame.fill(fill);
                                         }
                                         cell_frame.show(ui, |ui| {
                                             ui.set_width(ui.available_width());
                                             ui.centered_and_justified(|ui| {
                                                 let resp = ui.label(&text);
-                                                match cell_detail {
-                                                    Some((stats, ranks)) => {
+                                                match stats {
+                                                    Some(stats) => {
                                                         resp.on_hover_ui(|ui| {
                                                             metric_stat_tooltip(
                                                                 ui, title, &stats, &ranks,
@@ -1542,32 +1642,31 @@ impl eframe::App for RFMetricsApp {
                                         });
                                     });
                                     if r.clicked() {
-                                        bg_clicked = true;
+                                        toggle_row = Some(i);
                                     }
-                                }
-                                for _ in 0..5 {
-                                    let (_, r) =
-                                        row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
-                                    if r.clicked() {
-                                        bg_clicked = true;
-                                    }
-                                    let (_, r) = row.col(|ui| {
-                                        ui.centered_and_justified(|ui| {
-                                            ui.label("N/A");
-                                        });
-                                    });
-                                    if r.clicked() {
-                                        bg_clicked = true;
-                                    }
-                                }
-                                if label_clicked || bg_clicked {
-                                    self.rows[i].selected = !self.rows[i].selected;
                                 }
                                 if row.response().hovered() {
-                                    self.hovered_now = Some(i);
+                                    hovered_next = Some(i);
                                 }
                             });
                         });
+                    // Deferred row-click side effects (L3): selection
+                    // toggle, open-in-player (error toast needs `now`),
+                    // and hover tracking all land after the loop.
+                    if let Some(i) = toggle_row {
+                        self.rows[i].selected = !self.rows[i].selected;
+                    }
+                    if let Some(path) = open_path
+                        && let Err(e) = open::that(&path)
+                    {
+                        log::error!(target: "rfmetrics::app", "open \"{path}\" failed: {e}");
+                        self.toast = Some(Toast {
+                            text: format!("Could not open file: {e}"),
+                            until: now + TOAST_SECS,
+                            kind: ToastKind::Error,
+                        });
+                    }
+                    self.hovered_now = hovered_next;
                 });
             });
             self.table_rect = Some(table_resp.response.rect);
@@ -1638,8 +1737,35 @@ impl eframe::App for RFMetricsApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        DropAction, ProbeMsg, QueueRow, RFMetricsApp, display_names, norm_key, route_drop,
+        CachedStats, DropAction, METRIC_COLUMNS, ProbeMsg, QueueRow, RFMetricsApp, display_names,
+        norm_key, route_drop,
     };
+
+    #[test]
+    fn metric_columns_keep_live_cells_under_their_headers() {
+        use crate::metrics::ffmpeg::MetricKind;
+        // Body order must mirror the header checkboxes (PSNR SSIM VMAF
+        // XPSNR SSIM2 BUTTER CVVDP); unimplemented slots stay N/A so e.g.
+        // XPSNR values can never slide under the VMAF header.
+        let kinds: Vec<_> = METRIC_COLUMNS.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            kinds,
+            [
+                Some(MetricKind::Psnr),
+                Some(MetricKind::Ssim),
+                None,
+                Some(MetricKind::Xpsnr),
+                None,
+                None,
+                None,
+            ]
+        );
+        let titles: Vec<_> = METRIC_COLUMNS.iter().map(|(_, t)| *t).collect();
+        assert_eq!(
+            titles,
+            ["PSNR", "SSIM", "VMAF", "XPSNR", "SSIM2", "BUTTER", "CVVDP"]
+        );
+    }
 
     #[test]
     fn drop_routing() {
@@ -1751,6 +1877,10 @@ mod tests {
             info: None,
             psnr: crate::metrics::MetricCell::Idle,
             ssim: crate::metrics::MetricCell::Idle,
+            xpsnr: crate::metrics::MetricCell::Idle,
+            psnr_cache: CachedStats::default(),
+            ssim_cache: CachedStats::default(),
+            xpsnr_cache: CachedStats::default(),
         });
         let key = norm_key("C:/vids/a.mp4");
         app.probe_tx
@@ -1802,6 +1932,10 @@ mod tests {
             info: None,
             psnr: crate::metrics::MetricCell::Idle,
             ssim: crate::metrics::MetricCell::Idle,
+            xpsnr: crate::metrics::MetricCell::Idle,
+            psnr_cache: CachedStats::default(),
+            ssim_cache: CachedStats::default(),
+            xpsnr_cache: CachedStats::default(),
         }
     }
 
@@ -1944,6 +2078,62 @@ mod tests {
     }
 
     #[test]
+    fn drain_caches_stats_and_ranks_once() {
+        use super::MetricMsg;
+        use crate::metrics::StatRank;
+        use crate::metrics::ffmpeg::MetricKind;
+        let mut app = RFMetricsApp::default();
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows.push(psnr_test_row("C:/vids/b.mp4", true));
+        app.run_generation = 1;
+        for (path, avg) in [("C:/vids/a.mp4", 30.0), ("C:/vids/b.mp4", 40.0)] {
+            app.metric_tx
+                .send(MetricMsg::Done {
+                    generation: 1,
+                    kind: MetricKind::Psnr,
+                    key: norm_key(path),
+                    values: vec![avg - 1.0, avg, avg + 1.0],
+                    avg: Some(avg),
+                    exec_s: 1.0,
+                    error: None,
+                    skip: None,
+                    clip_dur: None,
+                })
+                .unwrap();
+        }
+        app.drain_metric_results();
+        // Stats cached on arrival (no per-frame clone+sort in the render).
+        assert!(app.rows[0].psnr_cache.stats.is_some());
+        assert!(app.rows[1].psnr_cache.stats.is_some());
+        // Ranks resolved across the scored set: avg index 0 decides the cell.
+        assert_eq!(app.rows[0].psnr_cache.ranks[0], StatRank::Worst);
+        assert_eq!(app.rows[1].psnr_cache.ranks[0], StatRank::Best);
+        // Reset clears the cache back to Plain.
+        app.reset_psnr();
+        assert!(app.rows[0].psnr_cache.stats.is_none());
+        assert_eq!(app.rows[0].psnr_cache.ranks, [StatRank::Plain; 10]);
+    }
+
+    #[test]
+    fn refresh_ranks_single_row_stays_plain() {
+        use crate::metrics::ffmpeg::MetricKind;
+        use crate::metrics::{MetricCell, StatRank};
+        let mut app = RFMetricsApp::default();
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows[0].psnr = MetricCell::Done {
+            values: vec![30.0, 31.0],
+            avg: 30.5,
+            exec_s: 1.0,
+            skip: None,
+            clip_dur: None,
+        };
+        let stats = app.rows[0].psnr.done_stats();
+        app.rows[0].psnr_cache.stats = stats;
+        app.refresh_ranks(MetricKind::Psnr);
+        assert_eq!(app.rows[0].psnr_cache.ranks, [StatRank::Plain; 10]);
+    }
+
+    #[test]
     fn stop_keeps_done_and_settles_running_to_idle() {
         use super::MetricMsg;
         use crate::metrics::MetricCell;
@@ -1982,6 +2172,51 @@ mod tests {
         ));
         assert!(matches!(app.rows[1].psnr, MetricCell::Idle));
         assert!(matches!(app.rows[1].ssim, MetricCell::Idle));
+        assert!(!app.measuring);
+        assert_eq!(app.pending, 0);
+    }
+
+    #[test]
+    fn stop_settles_killed_cell_to_idle() {
+        use super::MetricMsg;
+        use crate::metrics::MetricCell;
+        use crate::metrics::ffmpeg::MetricKind;
+        let mut app = RFMetricsApp::default();
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows.push(psnr_test_row("C:/vids/b.mp4", true));
+        // a is the killed in-flight job, b never started.
+        app.rows[0].psnr = MetricCell::Running { frame: 42 };
+        app.rows[1].psnr = MetricCell::Running { frame: 0 };
+        app.measuring = true;
+        app.pending = 2;
+        app.run_generation = 1;
+
+        // The killed job reports back first: quiet settle, not an error.
+        app.metric_tx
+            .send(MetricMsg::Done {
+                generation: 1,
+                kind: MetricKind::Psnr,
+                key: norm_key("C:/vids/a.mp4"),
+                values: Vec::new(),
+                avg: None,
+                exec_s: 3.5,
+                error: Some("aborted".to_owned()),
+                skip: None,
+                clip_dur: None,
+            })
+            .unwrap();
+        app.drain_metric_results();
+        assert!(matches!(app.rows[0].psnr, MetricCell::Idle));
+
+        // `Finished` settles the unstarted row; the run ends.
+        app.metric_tx
+            .send(MetricMsg::Finished {
+                generation: 1,
+                aborted: true,
+            })
+            .unwrap();
+        app.drain_metric_results();
+        assert!(matches!(app.rows[1].psnr, MetricCell::Idle));
         assert!(!app.measuring);
         assert_eq!(app.pending, 0);
     }
@@ -2279,5 +2514,88 @@ mod tests {
         }
         assert!(!app.measuring);
         assert!(matches!(&app.rows[0].psnr, MetricCell::Done { .. }));
+    }
+
+    /// XPSNR-only run: only the XPSNR cell enters the run, the rest stay Idle.
+    #[test]
+    fn start_run_xpsnr_only_runs_xpsnr_cell() {
+        use crate::metrics::MetricCell;
+        use crate::probe::MediaInfo;
+        let p = std::env::temp_dir().join("rfmetrics-xpsnr-only.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            m_xpsnr: true,
+            ref_path: p.to_string_lossy().into_owned(),
+            ..RFMetricsApp::default()
+        };
+        // Fabricate past the pre-flights; the binary doesn't exist so the
+        // worker fails the spawn asynchronously (headless-safe).
+        app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+        app.ref_info_data = Some(MediaInfo::default());
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows[0].info = Some(MediaInfo::default());
+        app.start_run(0.0);
+        std::fs::remove_file(&p).ok();
+        assert!(app.measuring);
+        assert!(matches!(app.rows[0].psnr, MetricCell::Idle));
+        assert!(matches!(app.rows[0].ssim, MetricCell::Idle));
+        assert!(matches!(
+            app.rows[0].xpsnr,
+            MetricCell::Running { frame: 0 }
+        ));
+        for _ in 0..200 {
+            app.drain_metric_results();
+            if !app.measuring {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!app.measuring);
+        assert!(matches!(app.rows[0].psnr, MetricCell::Idle));
+        assert!(matches!(&app.rows[0].xpsnr, MetricCell::Error { .. }));
+    }
+
+    /// Mixed run: valid XPSNR skips while fresh PSNR on the same row runs.
+    #[test]
+    fn start_run_skips_done_xpsnr_but_runs_fresh_psnr() {
+        use crate::metrics::MetricCell;
+        use crate::probe::MediaInfo;
+        let p = std::env::temp_dir().join("rfmetrics-xpsnr-mixed.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            m_psnr: true,
+            m_xpsnr: true,
+            ref_path: p.to_string_lossy().into_owned(),
+            ..RFMetricsApp::default()
+        };
+        app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+        app.ref_info_data = Some(MediaInfo::default());
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows[0].xpsnr = MetricCell::Done {
+            values: vec![40.0],
+            avg: 40.0,
+            exec_s: 1.0,
+            skip: None,
+            clip_dur: None,
+        };
+        app.rows[0].info = Some(MediaInfo::default());
+        app.start_run(0.0);
+        std::fs::remove_file(&p).ok();
+        assert!(app.measuring);
+        assert!(matches!(app.rows[0].psnr, MetricCell::Running { frame: 0 }));
+        assert!(
+            matches!(&app.rows[0].xpsnr, MetricCell::Done { .. }),
+            "valid XPSNR must skip, got {:?}",
+            app.rows[0].xpsnr,
+        );
+        for _ in 0..200 {
+            app.drain_metric_results();
+            if !app.measuring {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!app.measuring);
+        assert!(matches!(&app.rows[0].xpsnr, MetricCell::Done { .. }));
     }
 }
