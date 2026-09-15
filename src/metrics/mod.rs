@@ -20,13 +20,6 @@ pub enum MetricCell {
 }
 
 impl MetricCell {
-    pub fn avg(&self) -> Option<f64> {
-        match self {
-            Self::Done { avg, .. } => Some(*avg),
-            _ => None,
-        }
-    }
-
     /// Short cell text (Python `_done_metric` / progress handler parity).
     pub fn cell_text(&self) -> String {
         match self {
@@ -52,6 +45,126 @@ impl MetricCell {
             Self::Error { msg } => format!("Error: {msg}"),
         }
     }
+
+    /// Comparable statistics for a finished run; `None` unless `Done`.
+    pub fn done_stats(&self) -> Option<DoneStats> {
+        match self {
+            Self::Done {
+                values,
+                avg,
+                exec_s,
+            } => DoneStats::new(values, *avg, *exec_s),
+            _ => None,
+        }
+    }
+}
+
+/// Cross-row rank of one stat value (screenshot green/red/yellow rules).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatRank {
+    /// Holds the column extreme on the winning side: green.
+    Best,
+    /// Holds the column extreme on the losing side: red.
+    Worst,
+    /// Single row or all equal: dim yellow (neither won nor lost).
+    Tie,
+    /// Mid-pack (3+ rows) or unrankable: no highlight.
+    Plain,
+}
+
+/// Max-wins rank of `v` against the column range `[lo, hi]`.
+pub fn rank(v: f64, lo: f64, hi: f64) -> StatRank {
+    if lo == hi {
+        StatRank::Tie
+    } else if v == hi {
+        StatRank::Best
+    } else if v == lo {
+        StatRank::Worst
+    } else {
+        StatRank::Plain
+    }
+}
+
+/// Min-wins rank (lower = better): StdDev only. A tighter spread means a
+/// more consistent encode, so FFMetrics-original colors the lower StdDev
+/// green (e.g. 1.117 beats 1.326).
+pub fn rank_low(v: f64, lo: f64, hi: f64) -> StatRank {
+    if lo == hi {
+        StatRank::Tie
+    } else if v == lo {
+        StatRank::Best
+    } else if v == hi {
+        StatRank::Worst
+    } else {
+        StatRank::Plain
+    }
+}
+
+/// The comparable per-run statistics of one finished cell, in tooltip order.
+#[derive(Debug, Clone)]
+pub struct DoneStats {
+    pub avg: f64,
+    pub mean: f64,
+    pub harm: f64,
+    pub min: f64,
+    pub max: f64,
+    pub stddev: f64,
+    pub p1: f64,
+    pub p5: f64,
+    pub p10: f64,
+    pub p25: f64,
+    pub exec_s: f64,
+    pub frames: usize,
+}
+
+impl DoneStats {
+    pub fn new(values: &[f64], avg: f64, exec_s: f64) -> Option<Self> {
+        if values.is_empty() {
+            return None;
+        }
+        let mut s = values.to_vec();
+        s.sort_by(|a, b| a.total_cmp(b));
+        Some(Self {
+            avg,
+            mean: mean(values),
+            harm: harm_mean(values),
+            min: s[0],
+            max: s[s.len() - 1],
+            stddev: pstdev(values),
+            p1: percentile(&s, 1.0),
+            p5: percentile(&s, 5.0),
+            p10: percentile(&s, 10.0),
+            p25: percentile(&s, 25.0),
+            exec_s,
+            frames: values.len(),
+        })
+    }
+
+    /// Comparable (label, value, lower_better) triples in tooltip order.
+    /// Only StdDev is lower-better; everything else is max-wins.
+    pub fn comparable(&self) -> [(&'static str, f64, bool); 10] {
+        [
+            ("Avg:", self.avg, false),
+            ("Mean:", self.mean, false),
+            ("Mean (harm):", self.harm, false),
+            ("Min:", self.min, false),
+            ("Max:", self.max, false),
+            ("StdDev (pop):", self.stddev, true),
+            ("Percentile 1:", self.p1, false),
+            ("Percentile 5:", self.p5, false),
+            ("Percentile 10:", self.p10, false),
+            ("Percentile 25:", self.p25, false),
+        ]
+    }
+}
+
+/// `MM:SS.ss` rendering of an execution time (shared by text/grid tooltips).
+pub fn format_exec(exec_s: f64) -> String {
+    format!(
+        "{:02}:{:05.2}",
+        (exec_s / 60.0).floor() as i64,
+        exec_s % 60.0
+    )
 }
 
 pub fn mean(values: &[f64]) -> f64 {
@@ -91,11 +204,7 @@ pub fn stats_text(avg: Option<f64>, exec_s: f64, values: &[f64]) -> String {
     let mut s = values.to_vec();
     s.sort_by(|a, b| a.total_cmp(b));
     let show = avg.unwrap_or_else(|| mean(values));
-    let exec = format!(
-        "{:02}:{:05.2}",
-        (exec_s / 60.0).floor() as i64,
-        exec_s % 60.0
-    );
+    let exec = format_exec(exec_s);
     let mut lines = vec![
         format!("Avg: {show:.6}"),
         format!("Exec time: {exec}"),
@@ -198,6 +307,40 @@ mod tests {
         assert_eq!(parse_time_spec("1:75"), None);
         assert_eq!(parse_time_spec("inf"), None);
         assert_eq!(parse_time_spec("1:"), None);
+    }
+
+    #[test]
+    fn rank_rules() {
+        use super::StatRank;
+        assert_eq!(rank(48.0, 46.0, 48.0), StatRank::Best);
+        assert_eq!(rank(46.0, 46.0, 48.0), StatRank::Worst);
+        assert_eq!(rank(47.0, 46.0, 48.0), StatRank::Plain);
+        // Single row / all equal: tie, never best-vs-worst.
+        assert_eq!(rank(30.0, 30.0, 30.0), StatRank::Tie);
+        // NaN compares equal to nothing: no highlight.
+        assert_eq!(rank(f64::NAN, 1.0, 2.0), StatRank::Plain);
+    }
+
+    #[test]
+    fn rank_low_inverts_best_worst() {
+        use super::StatRank;
+        // FFMetrics-original: StdDev 1.117 beats 1.326 (lower = greener).
+        assert_eq!(rank_low(1.117, 1.117, 1.326), StatRank::Best);
+        assert_eq!(rank_low(1.326, 1.117, 1.326), StatRank::Worst);
+        assert_eq!(rank_low(1.2, 1.117, 1.326), StatRank::Plain);
+        assert_eq!(rank_low(1.2, 1.2, 1.2), StatRank::Tie);
+    }
+
+    #[test]
+    fn done_stats_shape() {
+        let s = DoneStats::new(&[28.0, 30.0, 32.0], 30.5, 61.5).unwrap();
+        assert_eq!(s.frames, 3);
+        assert_eq!(s.avg, 30.5);
+        assert_eq!(s.comparable().len(), 10);
+        assert_eq!(s.comparable()[0], ("Avg:", 30.5, false));
+        assert!(s.comparable()[5].2); // only StdDev is lower-better
+        assert_eq!(format_exec(s.exec_s), "01:01.50");
+        assert!(DoneStats::new(&[], 0.0, 0.0).is_none());
     }
 
     #[test]

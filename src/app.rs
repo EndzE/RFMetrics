@@ -780,6 +780,84 @@ fn panel_frame(ui: &egui::Ui, hovering: bool) -> egui::Frame {
     frame
 }
 
+/// Screenshot green/red fills, muted for the dark theme (light text stays
+/// readable): best green, worst red, all-tied dim yellow. Colors apply only
+/// with 2+ scored rows; a lone result stays uncolored.
+const BEST_FILL: egui::Color32 = egui::Color32::from_rgb(0x2E, 0x6B, 0x3E);
+const WORST_FILL: egui::Color32 = egui::Color32::from_rgb(0x7A, 0x36, 0x36);
+const TIE_FILL: egui::Color32 = egui::Color32::from_rgb(0x6B, 0x5F, 0x2A);
+
+/// Cell/chip background for a stat rank; `None` = no highlight.
+fn rank_fill(rank: crate::metrics::StatRank) -> Option<egui::Color32> {
+    match rank {
+        crate::metrics::StatRank::Best => Some(BEST_FILL),
+        crate::metrics::StatRank::Worst => Some(WORST_FILL),
+        crate::metrics::StatRank::Tie => Some(TIE_FILL),
+        crate::metrics::StatRank::Plain => None,
+    }
+}
+
+/// PSNR Done tooltip in FFMetrics order: Avg, Exec, Frames, a blank line,
+/// the "Frames statistics" group, another blank line, then Percentiles.
+/// Each comparable value is chipped by its cross-row rank; Exec time and
+/// Frames count are display-only (no chip).
+/// Plain horizontal rows with content-hugging widths: grids and expanding
+/// layouts feed back into the tooltip auto-size and balloon while hovered.
+fn psnr_stat_tooltip(
+    ui: &mut egui::Ui,
+    stats: &crate::metrics::DoneStats,
+    ranks: &[crate::metrics::StatRank; 10],
+) {
+    ui.label(egui::RichText::new("PSNR").strong());
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 1.0);
+        let comp = stats.comparable();
+        let (label, v, _) = comp[0];
+        tip_stat_row(ui, label, &format!("{v:.6}"), ranks[0]);
+        tip_plain_row(ui, "Exec time:", &crate::metrics::format_exec(stats.exec_s));
+        tip_plain_row(ui, "Frames count:", &stats.frames.to_string());
+        ui.add_space(5.0);
+        for k in 1..=5 {
+            let (label, v, _) = comp[k];
+            tip_stat_row(ui, label, &format!("{v:.6}"), ranks[k]);
+        }
+        ui.add_space(5.0);
+        for k in 6..10 {
+            let (label, v, _) = comp[k];
+            tip_stat_row(ui, label, &format!("{v:.6}"), ranks[k]);
+        }
+    });
+}
+
+/// One tooltip row: fixed label + right-aligned value, chipped when ranked.
+fn tip_stat_row(ui: &mut egui::Ui, label: &str, val: &str, rank: crate::metrics::StatRank) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [96.0, 15.0],
+            egui::Label::new(label).halign(egui::Align::LEFT),
+        );
+        let val = egui::Label::new(val).halign(egui::Align::RIGHT);
+        match rank_fill(rank) {
+            Some(fill) => {
+                egui::Frame::NONE
+                    .fill(fill)
+                    .inner_margin(egui::Margin::symmetric(4, 0))
+                    .show(ui, |ui| {
+                        ui.add_sized([80.0, 15.0], val);
+                    });
+            }
+            None => {
+                ui.add_sized([88.0, 15.0], val);
+            }
+        }
+    });
+}
+
+/// Display-only tooltip row (Exec time, Frames count): never chipped.
+fn tip_plain_row(ui: &mut egui::Ui, label: &str, val: &str) {
+    tip_stat_row(ui, label, val, crate::metrics::StatRank::Plain);
+}
+
 impl eframe::App for RFMetricsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let (hovering, dropped) = ui.ctx().input(|i| {
@@ -1086,13 +1164,46 @@ impl eframe::App for RFMetricsApp {
                 }
                 ui.scope(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
-                    // Max-avg wins PSNR (Python `_refresh_bold` parity;
-                    // ties all bold, unscored rows never bold).
-                    let psnr_best = self
+                    // Screenshot green/red rules: per-stat column extremes
+                    // across scored rows rank every PSNR cell + tooltip chip.
+                    // Colors need something to compare against: with fewer
+                    // than 2 scored rows every rank stays Plain (no color).
+                    let scored: Vec<(usize, crate::metrics::DoneStats)> = self
                         .rows
                         .iter()
-                        .filter_map(|r| r.psnr.avg())
-                        .max_by(f64::total_cmp);
+                        .enumerate()
+                        .filter_map(|(i, r)| r.psnr.done_stats().map(|s| (i, s)))
+                        .collect();
+                    let comparable = scored.len() >= 2;
+                    let mut stat_lo = [f64::INFINITY; 10];
+                    let mut stat_hi = [f64::NEG_INFINITY; 10];
+                    for (_, s) in &scored {
+                        for (k, (_, v, _)) in s.comparable().iter().enumerate() {
+                            stat_lo[k] = stat_lo[k].min(*v);
+                            stat_hi[k] = stat_hi[k].max(*v);
+                        }
+                    }
+                    let mut psnr_detail: Vec<
+                        Option<(
+                            crate::metrics::DoneStats,
+                            [crate::metrics::StatRank; 10],
+                        )>,
+                    > = vec![None; self.rows.len()];
+                    for (i, s) in &scored {
+                        let comp = s.comparable();
+                        let mut ranks = [crate::metrics::StatRank::Plain; 10];
+                        if comparable {
+                            for k in 0..10 {
+                                let (_, v, lower_better) = comp[k];
+                                ranks[k] = if lower_better {
+                                    crate::metrics::rank_low(v, stat_lo[k], stat_hi[k])
+                                } else {
+                                    crate::metrics::rank(v, stat_lo[k], stat_hi[k])
+                                };
+                            }
+                        }
+                        psnr_detail[*i] = Some((s.clone(), ranks));
+                    }
                     let mut table = egui_extras::TableBuilder::new(ui)
                         .striped(false)
                         .resizable(false)
@@ -1222,20 +1333,35 @@ impl eframe::App for RFMetricsApp {
                                     bg_clicked = true;
                                 }
                                 let (_, r) = row.col(|ui| {
-                                    ui.centered_and_justified(|ui| {
-                                        let (text, tip, avg) = {
-                                            let cell = &self.rows[i].psnr;
-                                            (
-                                                cell.cell_text(),
-                                                cell.tooltip("PSNR"),
-                                                cell.avg(),
-                                            )
-                                        };
-                                        let mut rich = egui::RichText::new(text);
-                                        if avg.is_some_and(|a| Some(a) == psnr_best) {
-                                            rich = rich.strong();
-                                        }
-                                        ui.label(rich).on_hover_text(tip);
+                                    let (text, tip, detail) = {
+                                        let cell = &self.rows[i].psnr;
+                                        (
+                                            cell.cell_text(),
+                                            cell.tooltip("PSNR"),
+                                            psnr_detail[i].clone(),
+                                        )
+                                    };
+                                    let mut cell_frame = egui::Frame::NONE;
+                                    if let Some(fill) =
+                                        detail.as_ref().and_then(|(_, r)| rank_fill(r[0]))
+                                    {
+                                        cell_frame = cell_frame.fill(fill);
+                                    }
+                                    cell_frame.show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.centered_and_justified(|ui| {
+                                            let resp = ui.label(&text);
+                                            match detail {
+                                                Some((stats, ranks)) => {
+                                                    resp.on_hover_ui(|ui| {
+                                                        psnr_stat_tooltip(ui, &stats, &ranks);
+                                                    });
+                                                }
+                                                None => {
+                                                    resp.on_hover_text(&tip);
+                                                }
+                                            }
+                                        });
                                     });
                                 });
                                 if r.clicked() {
