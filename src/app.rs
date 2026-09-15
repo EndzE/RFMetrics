@@ -800,6 +800,9 @@ impl eframe::App for RFMetricsApp {
 
         let cursor_pos = get_cursor_pos(ui.ctx());
         let now = ui.ctx().input(|i| i.time);
+        // While the metric worker runs, run-scoped inputs lock: dimmed and
+        // unclickable so paths, trim, queue, and toggles can't shift mid-run.
+        let run_locked = self.measuring;
 
         // Direct OS-cursor hit test; winit gives no position during OLE drags.
         let is_over_ref =
@@ -858,9 +861,10 @@ impl eframe::App for RFMetricsApp {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui
-                                        .add_sized([90.0, 24.0], egui::Button::new("Browse"))
-                                        .clicked()
+                                    let browse = ui.add_enabled_ui(!run_locked, |ui| {
+                                        ui.add_sized([90.0, 24.0], egui::Button::new("Browse"))
+                                    });
+                                    if browse.inner.clicked()
                                         && let Some(path) = rfd::FileDialog::new()
                                             .set_title("Select reference video")
                                             .add_filter(
@@ -874,7 +878,8 @@ impl eframe::App for RFMetricsApp {
                                     {
                                         self.ref_path = path.to_string_lossy().into_owned();
                                     }
-                                    let _ = ui.add(
+                                    let _ = ui.add_enabled(
+                                        !run_locked,
                                         egui::TextEdit::singleline(&mut self.ref_path)
                                             .desired_width(f32::INFINITY),
                                     );
@@ -884,13 +889,15 @@ impl eframe::App for RFMetricsApp {
                         ui.label(&self.ref_info);
                         ui.horizontal(|ui| {
                             ui.add(egui::Label::new("Duration:").selectable(false));
-                            let _ = ui.add(
+                            let _ = ui.add_enabled(
+                                !run_locked,
                                 egui::TextEdit::singleline(&mut self.duration)
                                     .hint_text("00:00.000")
                                     .desired_width(110.0),
                             );
                             ui.add(egui::Label::new("Skip:").selectable(false));
-                            let _ = ui.add(
+                            let _ = ui.add_enabled(
+                                !run_locked,
                                 egui::TextEdit::singleline(&mut self.skip)
                                     .hint_text("00:00.000")
                                     .desired_width(110.0),
@@ -952,7 +959,10 @@ impl eframe::App for RFMetricsApp {
                     }
                 }
                 if ui
-                    .add_sized([90.0, 24.0], egui::Button::new("Reset"))
+                    .add_enabled_ui(!run_locked, |ui| {
+                        ui.add_sized([90.0, 24.0], egui::Button::new("Reset"))
+                    })
+                    .inner
                     .clicked()
                 {
                     self.reset_psnr();
@@ -1031,7 +1041,10 @@ impl eframe::App for RFMetricsApp {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui
-                    .add_sized([110.0, 24.0], egui::Button::new("Add files"))
+                    .add_enabled_ui(!run_locked, |ui| {
+                        ui.add_sized([110.0, 24.0], egui::Button::new("Add files"))
+                    })
+                    .inner
                     .clicked()
                     && let Some(paths) = rfd::FileDialog::new()
                         .set_title("Select video files")
@@ -1045,7 +1058,10 @@ impl eframe::App for RFMetricsApp {
                     self.add_queue_files(paths);
                 }
                 if ui
-                    .add_sized([130.0, 24.0], egui::Button::new("Remove Selected"))
+                    .add_enabled_ui(!run_locked, |ui| {
+                        ui.add_sized([130.0, 24.0], egui::Button::new("Remove Selected"))
+                    })
+                    .inner
                     .clicked()
                 {
                     self.rows.retain(|r| !r.selected);
@@ -1124,7 +1140,7 @@ impl eframe::App for RFMetricsApp {
                             ] {
                                 header.col(|ui| vline(ui, egui::Color32::from_gray(0x8A)));
                                 header.col(|ui| {
-                                    ui.checkbox(flag, name);
+                                    ui.add_enabled(!run_locked, egui::Checkbox::new(flag, name));
                                 });
                             }
                         })
