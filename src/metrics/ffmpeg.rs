@@ -6,9 +6,41 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::probe::MediaInfo;
 
+/// Filter-based metric sharing the `_compute_series` engine: identical
+/// `[main][ref]` order, trim/scale/format legs, worker, and stats.
+/// Only the filter name and the output parsers differ per kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricKind {
+    Psnr,
+    Ssim,
+}
+
+impl MetricKind {
+    /// Display name for cells, tooltips, and logs.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Psnr => "PSNR",
+            Self::Ssim => "SSIM",
+        }
+    }
+
+    /// ffmpeg filter name in the `[main][ref]<filter>=…` segment.
+    fn filter(self) -> &'static str {
+        match self {
+            Self::Psnr => "psnr",
+            Self::Ssim => "ssim",
+        }
+    }
+}
+
 fn frame_re() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| regex::Regex::new(r"psnr_avg:(\S+)").unwrap())
+}
+
+fn ssim_frame_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"All:(\S+)").unwrap())
 }
 
 fn progress_re() -> &'static regex::Regex {
@@ -21,23 +53,40 @@ fn summary_re() -> &'static regex::Regex {
     RE.get_or_init(|| regex::Regex::new(r"average:(\S+)").unwrap())
 }
 
+fn ssim_summary_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"All:(\S+)").unwrap())
+}
+
 fn err_progress_re() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| regex::Regex::new(r"frame=\s*(\d+)").unwrap())
 }
 
-/// Per-frame value from a `stats_file=-` stdout line
-/// (`n:1 ... psnr_avg:34.12 ...`), clamped to 0–100 (Python parity;
-/// `inf` clamps, `nan`/garbage lines are skipped).
-pub fn parse_frame_line(line: &str) -> Option<f64> {
+/// Per-frame value from a `stats_file=-` stdout line.
+/// PSNR (`n:1 ... psnr_avg:34.12 ...`) clamps to 0–100; SSIM
+/// (`n:1 ... All:0.985210 ...`, Y/U/V ignored) clamps to 0–1 and strips a
+/// trailing `)` (Python parity; `inf` clamps, `nan`/garbage skipped).
+pub fn parse_frame_line(line: &str, kind: MetricKind) -> Option<f64> {
     if !line.trim_start().starts_with("n:") {
         return None;
     }
-    let v: f64 = frame_re().captures(line)?.get(1)?.as_str().parse().ok()?;
+    let (raw, hi) = match kind {
+        MetricKind::Psnr => (frame_re().captures(line)?.get(1)?.as_str(), 100.0),
+        MetricKind::Ssim => (
+            ssim_frame_re()
+                .captures(line)?
+                .get(1)?
+                .as_str()
+                .trim_end_matches(')'),
+            1.0,
+        ),
+    };
+    let v: f64 = raw.parse().ok()?;
     if v.is_nan() {
         return None;
     }
-    Some(v.clamp(0.0, 100.0))
+    Some(v.clamp(0.0, hi))
 }
 
 /// Frame counter from a stats line (`n:12 ...`) for progress.
@@ -45,26 +94,44 @@ pub fn parse_progress(line: &str) -> Option<u64> {
     progress_re().captures(line)?.get(1)?.as_str().parse().ok()
 }
 
-/// Pooled average from ffmpeg's stderr summary
-/// (`... PSNR ... average:33.98 ...`), scanned bottom-up (Python parity,
+/// Pooled average from ffmpeg's stderr summary, scanned bottom-up.
+/// PSNR (`... PSNR ... average:33.98 ...`) matches `average:` on any line
+/// mentioning PSNR; SSIM (`SSIM ... All:0.99 ...`) matches `All:` on lines
+/// mentioning SSIM that are not per-frame `n:` lines (Python parity,
 /// unclamped — `inf` stays `inf`).
-pub fn parse_summary(text: &str) -> Option<f64> {
+pub fn parse_summary(text: &str, kind: MetricKind) -> Option<f64> {
     for line in text.lines().rev() {
-        if line.contains("PSNR")
-            && let Some(c) = summary_re().captures(line)
-            && let Ok(v) = c.get(1).unwrap().as_str().parse::<f64>()
-        {
-            return Some(v);
+        match kind {
+            MetricKind::Psnr => {
+                if line.contains("PSNR")
+                    && let Some(c) = summary_re().captures(line)
+                    && let Ok(v) = c.get(1).unwrap().as_str().parse::<f64>()
+                {
+                    return Some(v);
+                }
+            }
+            MetricKind::Ssim => {
+                let s = line.trim();
+                if s.contains("SSIM")
+                    && !s.starts_with("n:")
+                    && let Some(c) = ssim_summary_re().captures(s)
+                    && let Ok(v) = c.get(1).unwrap().as_str().parse::<f64>()
+                {
+                    return Some(v);
+                }
+            }
         }
     }
     None
 }
 
-/// Python `_compute_series` filtergraph for PSNR. Inputs are inverted vs.
-/// the arg order: `-i dist` is `[0:v]`/main, `-i ref` is `[1:v]`/ref, and
-/// the filter is `[main][ref]psnr=…`. The distorted leg is scaled/converted
+/// Python `_compute_series` filtergraph for filter-based metrics. Inputs are
+/// inverted vs. the arg order: `-i dist` is `[0:v]`/main, `-i ref` is
+/// `[1:v]`/ref, and the filter is `[main][ref]<filter>=…` (same order for
+/// PSNR and SSIM; only XPSNR inverts). The distorted leg is scaled/converted
 /// up to the reference when they differ; the reference leg only gets trim.
 pub fn filtergraph(
+    kind: MetricKind,
     ref_info: &MediaInfo,
     dist_info: &MediaInfo,
     skip: Option<f64>,
@@ -95,14 +162,16 @@ pub fn filtergraph(
     let mut ref_leg: Vec<String> = window;
     ref_leg.push(NORM.to_owned());
     format!(
-        "[0:v]{}[main];[1:v]{}[ref];[main][ref]psnr=eof_action=endall:stats_file=-",
+        "[0:v]{}[main];[1:v]{}[ref];[main][ref]{}=eof_action=endall:stats_file=-",
         pre.join(","),
         ref_leg.join(","),
+        kind.filter(),
     )
 }
 
-/// Full ffmpeg argv (minus the exe) for a PSNR run.
+/// Full ffmpeg argv (minus the exe) for a filter-metric run.
 pub fn build_args(
+    kind: MetricKind,
     ref_path: &str,
     dist_path: &str,
     ref_info: &MediaInfo,
@@ -124,14 +193,14 @@ pub fn build_args(
     args.push("-i".to_owned());
     args.push(ref_path.to_owned());
     args.push("-filter_complex".to_owned());
-    args.push(filtergraph(ref_info, dist_info, skip, clip_dur));
+    args.push(filtergraph(kind, ref_info, dist_info, skip, clip_dur));
     args.extend(["-f".to_owned(), "null".to_owned(), "-".to_owned()]);
     args
 }
 
-/// Everything a PSNR run needs; bundled so `run_psnr` stays lean and
-/// later metrics (SSIM/XPSNR take the same inputs) can reuse the shape.
-pub struct PsnrInputs<'a> {
+/// Everything a filter-metric run needs; bundled so `run_metric` stays lean.
+pub struct RunInputs<'a> {
+    pub kind: MetricKind,
     pub exe: &'a Path,
     pub ref_path: &'a str,
     pub dist_path: &'a str,
@@ -145,21 +214,22 @@ pub struct PsnrInputs<'a> {
     pub child_slot: &'a Mutex<Option<Child>>,
 }
 
-pub struct PsnrOutcome {
+pub struct RunOutcome {
     pub values: Vec<f64>,
     pub avg: Option<f64>,
     pub exec_s: f64,
     pub error: Option<String>,
 }
 
-/// Blocking PSNR run; call off the UI thread. Progress is monotonic-ish:
-/// only frame numbers above the shared high-water mark are reported, from
-/// both the stdout `n:` feed and the stderr `frame=` feed (Python dual-feed
-/// parity); the UI keeps the max per row.
+/// Blocking filter-metric run; call off the UI thread. Progress is
+/// monotonic-ish: only frame numbers above the shared high-water mark are
+/// reported, from both the stdout `n:` feed and the stderr `frame=` feed
+/// (Python dual-feed parity); the UI keeps the max per row.
 /// ponytail: plain wait(), no wait-timeout dep — a stuck ffmpeg only stalls
 /// this worker thread, never the UI.
-pub fn run_psnr(job: &PsnrInputs<'_>, on_progress: &(dyn Fn(u64) + Sync)) -> PsnrOutcome {
-    let PsnrInputs {
+pub fn run_metric(job: &RunInputs<'_>, on_progress: &(dyn Fn(u64) + Sync)) -> RunOutcome {
+    let RunInputs {
+        kind,
         exe,
         ref_path,
         dist_path,
@@ -170,15 +240,18 @@ pub fn run_psnr(job: &PsnrInputs<'_>, on_progress: &(dyn Fn(u64) + Sync)) -> Psn
         abort,
         child_slot,
     } = *job;
-    let fail = |msg: String| PsnrOutcome {
+    let name = kind.name();
+    let fail = |msg: String| RunOutcome {
         values: Vec::new(),
         avg: None,
         exec_s: 0.0,
         error: Some(msg),
     };
     let start = std::time::Instant::now();
-    let args = build_args(ref_path, dist_path, ref_info, dist_info, skip, clip_dur);
-    log::debug!(target: "rfmetrics::psnr", "run: \"{}\" {}", exe.display(), args.join(" "));
+    let args = build_args(
+        kind, ref_path, dist_path, ref_info, dist_info, skip, clip_dur,
+    );
+    log::debug!(target: "rfmetrics::metric", "run: \"{}\" {}", exe.display(), args.join(" "));
     let mut child = match Command::new(exe)
         .args(&args)
         .stdout(Stdio::piped())
@@ -187,7 +260,7 @@ pub fn run_psnr(job: &PsnrInputs<'_>, on_progress: &(dyn Fn(u64) + Sync)) -> Psn
     {
         Ok(c) => c,
         Err(e) => {
-            log::warn!(target: "rfmetrics::psnr", "spawn failed: {e}");
+            log::warn!(target: "rfmetrics::metric", "{name} spawn failed: {e}");
             return fail(format!("spawn failed: {e}"));
         }
     };
@@ -232,7 +305,7 @@ pub fn run_psnr(job: &PsnrInputs<'_>, on_progress: &(dyn Fn(u64) + Sync)) -> Psn
                 {
                     on_progress(f);
                 }
-                if let Some(v) = parse_frame_line(&line) {
+                if let Some(v) = parse_frame_line(&line, kind) {
                     values.push(v);
                 }
             }
@@ -251,8 +324,8 @@ pub fn run_psnr(job: &PsnrInputs<'_>, on_progress: &(dyn Fn(u64) + Sync)) -> Psn
         .map(|mut c| c.wait());
     let exec_s = start.elapsed().as_secs_f64();
     if abort.load(Ordering::SeqCst) {
-        log::info!(target: "rfmetrics::psnr", "\"{dist_path}\" aborted after {exec_s:.1}s");
-        return PsnrOutcome {
+        log::info!(target: "rfmetrics::metric", "{name} \"{dist_path}\" aborted after {exec_s:.1}s");
+        return RunOutcome {
             values: Vec::new(),
             avg: None,
             exec_s,
@@ -262,23 +335,23 @@ pub fn run_psnr(job: &PsnrInputs<'_>, on_progress: &(dyn Fn(u64) + Sync)) -> Psn
     let code = status.and_then(|s| s.ok()).and_then(|s| s.code());
     if values.is_empty() {
         let tail = err_text.lines().map(str::trim).rfind(|l| !l.is_empty());
-        let msg = tail.unwrap_or("no PSNR data").to_owned();
-        log::warn!(target: "rfmetrics::psnr", "no data for \"{dist_path}\" (exit {code:?}, {exec_s:.1}s): {msg}");
-        return PsnrOutcome {
+        let msg = tail.unwrap_or(&format!("no {name} data")).to_owned();
+        log::warn!(target: "rfmetrics::metric", "{name} no data for \"{dist_path}\" (exit {code:?}, {exec_s:.1}s): {msg}");
+        return RunOutcome {
             values,
             avg: None,
             exec_s,
             error: Some(msg),
         };
     }
-    let avg = parse_summary(&err_text);
+    let avg = parse_summary(&err_text, kind);
     let show = avg.unwrap_or_else(|| values.iter().sum::<f64>() / values.len() as f64);
     log::info!(
-        target: "rfmetrics::psnr",
-        "\"{dist_path}\" → {show:.4} ({} frames, exit {code:?}, {exec_s:.1}s)",
+        target: "rfmetrics::metric",
+        "{name} \"{dist_path}\" → {show:.4} ({} frames, exit {code:?}, {exec_s:.1}s)",
         values.len(),
     );
-    PsnrOutcome {
+    RunOutcome {
         values,
         avg,
         exec_s,
@@ -302,33 +375,79 @@ mod tests {
 
     #[test]
     fn frame_lines() {
+        use super::MetricKind::Psnr;
         assert_eq!(
-            parse_frame_line("n:1 mse_avg:12.3 psnr_avg:34.1234 mse_y:1.0"),
+            parse_frame_line("n:1 mse_avg:12.3 psnr_avg:34.1234 mse_y:1.0", Psnr),
             Some(34.1234)
         );
-        assert_eq!(parse_frame_line("frame= 12 fps=25"), None);
-        assert_eq!(parse_frame_line("n:2 no avg here"), None);
-        assert_eq!(parse_frame_line("n:3 psnr_avg:inf"), Some(100.0));
-        assert_eq!(parse_frame_line("n:3 psnr_avg:-inf"), Some(0.0));
-        assert_eq!(parse_frame_line("n:3 psnr_avg:nan"), None);
-        assert_eq!(parse_frame_line("n:3 psnr_avg:garbage"), None);
+        assert_eq!(parse_frame_line("frame= 12 fps=25", Psnr), None);
+        assert_eq!(parse_frame_line("n:2 no avg here", Psnr), None);
+        assert_eq!(parse_frame_line("n:3 psnr_avg:inf", Psnr), Some(100.0));
+        assert_eq!(parse_frame_line("n:3 psnr_avg:-inf", Psnr), Some(0.0));
+        assert_eq!(parse_frame_line("n:3 psnr_avg:nan", Psnr), None);
+        assert_eq!(parse_frame_line("n:3 psnr_avg:garbage", Psnr), None);
+    }
+
+    #[test]
+    fn ssim_frame_lines() {
+        use super::MetricKind::Ssim;
+        assert_eq!(
+            parse_frame_line(
+                "n:1 Y:0.991234 U:0.987654 V:0.976543 All:0.985210 (parsed)",
+                Ssim
+            ),
+            Some(0.98521)
+        );
+        // Trailing `)` stripped (Python `rstrip(")")` parity).
+        assert_eq!(
+            parse_frame_line("n:2 Y:1 U:1 V:1 All:1.000000)", Ssim),
+            Some(1.0)
+        );
+        assert_eq!(parse_frame_line("frame= 12 fps=25", Ssim), None);
+        assert_eq!(parse_frame_line("n:3 no All here", Ssim), None);
+        assert_eq!(parse_frame_line("n:3 All:inf", Ssim), Some(1.0));
+        assert_eq!(parse_frame_line("n:3 All:-inf", Ssim), Some(0.0));
+        assert_eq!(parse_frame_line("n:3 All:nan", Ssim), None);
+        assert_eq!(parse_frame_line("n:3 All:garbage", Ssim), None);
+        // PSNR field ignored under SSIM and vice versa.
+        assert_eq!(parse_frame_line("n:4 psnr_avg:34.1", Ssim), None);
+        assert_eq!(
+            parse_frame_line("n:4 Y:0.9 U:0.9 V:0.9 All:0.9", super::MetricKind::Psnr),
+            None
+        );
     }
 
     #[test]
     fn summary_scans_bottom_up() {
+        use super::MetricKind::Psnr;
         let err = "[Parsed_psnr_0] PSNR y:1 u:2 v:3 average:30.0 min:1 max:2\n\
                    [Parsed_psnr_0] PSNR y:1 u:2 v:3 average:33.98 min:1 max:2\n";
-        assert_eq!(parse_summary(err), Some(33.98));
-        assert_eq!(parse_summary("nothing here"), None);
+        assert_eq!(parse_summary(err, Psnr), Some(33.98));
+        assert_eq!(parse_summary("nothing here", Psnr), None);
+    }
+
+    #[test]
+    fn ssim_summary_scans_bottom_up() {
+        use super::MetricKind::Ssim;
+        let err = "[Parsed_ssim_0 @ 0x123] SSIM Y:0.97 U:0.98 V:0.99 All:0.975 (dB 16.02)\n\
+                   [Parsed_ssim_0 @ 0x123] SSIM Y:0.98 U:0.99 V:0.99 All:0.986 (dB 18.55)\n";
+        assert_eq!(parse_summary(err, Ssim), Some(0.986));
+        // Per-frame `n:` lines never count as summaries.
+        assert_eq!(
+            parse_summary("n:7 Y:0.9 U:0.9 V:0.9 All:0.9 SSIM", Ssim),
+            None
+        );
+        assert_eq!(parse_summary("nothing here", Ssim), None);
     }
 
     #[test]
     fn graph_scales_dist_to_ref() {
+        use super::MetricKind::Psnr;
         let mut dist = ref_info();
         dist.width = Some(1280);
         dist.height = Some(720);
         dist.pix_fmt = Some("yuv444p".to_owned());
-        let g = filtergraph(&ref_info(), &dist, None, None);
+        let g = filtergraph(Psnr, &ref_info(), &dist, None, None);
         assert_eq!(
             g,
             "[0:v]settb=AVTB,setpts=PTS-STARTPTS,scale=1920:1080,format=yuv420p[main];\
@@ -339,7 +458,8 @@ mod tests {
 
     #[test]
     fn graph_matching_streams_have_no_scale() {
-        let g = filtergraph(&ref_info(), &ref_info(), Some(5.0), Some(10.0));
+        use super::MetricKind::Psnr;
+        let g = filtergraph(Psnr, &ref_info(), &ref_info(), Some(5.0), Some(10.0));
         assert!(g.contains("[0:v]trim=start=5:end=15,"));
         assert!(g.contains("[1:v]trim=start=5:end=15,"));
         assert!(!g.contains("scale="));
@@ -348,25 +468,60 @@ mod tests {
 
     #[test]
     fn graph_zero_skip_and_clip_disable_trim() {
+        use super::MetricKind::Psnr;
         // Python `if skip or clip_dur:` — 0.0 is falsy, so zero values
         // measure the full video instead of an empty clip.
-        let plain = filtergraph(&ref_info(), &ref_info(), None, None);
+        let plain = filtergraph(Psnr, &ref_info(), &ref_info(), None, None);
         assert_eq!(
-            filtergraph(&ref_info(), &ref_info(), Some(0.0), Some(0.0)),
+            filtergraph(Psnr, &ref_info(), &ref_info(), Some(0.0), Some(0.0)),
             plain
         );
         assert!(!plain.contains("trim="));
         // Mixed: zero side drops out, nonzero side applies.
-        let g = filtergraph(&ref_info(), &ref_info(), Some(0.0), Some(10.0));
+        let g = filtergraph(Psnr, &ref_info(), &ref_info(), Some(0.0), Some(10.0));
         assert!(g.contains("trim=start=0:end=10"));
-        let g = filtergraph(&ref_info(), &ref_info(), Some(5.0), Some(0.0));
+        let g = filtergraph(Psnr, &ref_info(), &ref_info(), Some(5.0), Some(0.0));
         assert!(g.contains("[0:v]trim=start=5,"));
         assert!(!g.contains(":end="));
     }
 
     #[test]
+    fn ssim_graph_differs_only_by_filter_name() {
+        use super::MetricKind::{Psnr, Ssim};
+        let psnr = filtergraph(Psnr, &ref_info(), &ref_info(), Some(5.0), Some(10.0));
+        let ssim = filtergraph(Ssim, &ref_info(), &ref_info(), Some(5.0), Some(10.0));
+        // Same legs, same order — only the filter segment differs.
+        assert_eq!(
+            ssim,
+            psnr.replace(
+                "[main][ref]psnr=eof_action=endall:stats_file=-",
+                "[main][ref]ssim=eof_action=endall:stats_file=-"
+            )
+        );
+        let a = build_args(
+            Ssim,
+            "ref.mp4",
+            "dist.mp4",
+            &ref_info(),
+            &ref_info(),
+            None,
+            None,
+        );
+        assert!(a.iter().any(|x| x.contains("[main][ref]ssim=")));
+    }
+
+    #[test]
     fn args_order_is_dist_then_ref() {
-        let a = build_args("ref.mp4", "dist.mp4", &ref_info(), &ref_info(), None, None);
+        use super::MetricKind::Psnr;
+        let a = build_args(
+            Psnr,
+            "ref.mp4",
+            "dist.mp4",
+            &ref_info(),
+            &ref_info(),
+            None,
+            None,
+        );
         let i1 = a.iter().position(|x| x == "dist.mp4").unwrap();
         let i2 = a.iter().position(|x| x == "ref.mp4").unwrap();
         assert!(i1 < i2);

@@ -1,4 +1,4 @@
-pub mod psnr;
+pub mod ffmpeg;
 
 /// Per-cell lifecycle of one metric on one queue row (Python `results` dict
 /// entry + label text rolled into one).

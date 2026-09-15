@@ -4,6 +4,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
+use crate::metrics::ffmpeg::MetricKind;
+
 #[derive(Debug)]
 struct QueueRow {
     path: String,
@@ -14,6 +16,23 @@ struct QueueRow {
     media_tip: String,
     info: Option<crate::probe::MediaInfo>,
     psnr: crate::metrics::MetricCell,
+    ssim: crate::metrics::MetricCell,
+}
+
+impl QueueRow {
+    fn cell(&self, kind: MetricKind) -> &crate::metrics::MetricCell {
+        match kind {
+            MetricKind::Psnr => &self.psnr,
+            MetricKind::Ssim => &self.ssim,
+        }
+    }
+
+    fn cell_mut(&mut self, kind: MetricKind) -> &mut crate::metrics::MetricCell {
+        match kind {
+            MetricKind::Psnr => &mut self.psnr,
+            MetricKind::Ssim => &mut self.ssim,
+        }
+    }
 }
 
 /// Python `normcase(abspath)` equivalent for the same-file guard rail.
@@ -159,21 +178,19 @@ struct ThumbMsg {
 }
 
 /// Progress + results from the single sequential metric worker (Python
-/// `_worker` parity: one thread, rows in order, never on the UI thread).
-/// `generation` drops late messages after a Reset starts a new run.
+/// `_worker` parity: one thread, checked metrics in order, never on the UI
+/// thread). `generation` drops late messages after a Reset starts a new run.
 #[derive(Debug)]
-#[allow(
-    clippy::enum_variant_names,
-    reason = "per-metric Psnr/Ssim prefixes stay once more metrics land"
-)]
 enum MetricMsg {
-    PsnrProgress {
+    Progress {
         generation: u64,
+        kind: MetricKind,
         key: String,
         frame: u64,
     },
-    PsnrDone {
+    Done {
         generation: u64,
+        kind: MetricKind,
         key: String,
         values: Vec<f64>,
         avg: Option<f64>,
@@ -186,7 +203,7 @@ enum MetricMsg {
     },
     /// End of the worker loop; `aborted` settles still-Running cells to
     /// Idle while keeping finished (`Done`) results on screen.
-    PsnrFinished { generation: u64, aborted: bool },
+    Finished { generation: u64, aborted: bool },
 }
 
 pub struct RFMetricsApp {
@@ -229,9 +246,9 @@ pub struct RFMetricsApp {
     /// The live ffmpeg child, so Stop can kill the in-flight run.
     current_child: Arc<Mutex<Option<std::process::Child>>>,
     /// Jobs still Blocking; last `Done` clears `measuring`.
-    psnr_pending: usize,
+    pending: usize,
     /// Bumped per run; late worker messages after a Reset are stale.
-    psnr_generation: u64,
+    run_generation: u64,
     /// Path last handed to a probe worker (or resolved cheaply without one).
     last_spawned_ref: String,
     /// Bumped on every ref change; worker results with an older generation
@@ -288,8 +305,8 @@ impl Default for RFMetricsApp {
             measuring: false,
             abort: Arc::new(AtomicBool::new(false)),
             current_child: Arc::new(Mutex::new(None)),
-            psnr_pending: 0,
-            psnr_generation: 0,
+            pending: 0,
+            run_generation: 0,
             last_spawned_ref: String::new(),
             ref_generation: 0,
             thumb_tx,
@@ -462,6 +479,7 @@ impl RFMetricsApp {
                 media_tip: "Probing…".to_owned(),
                 info: None,
                 psnr: crate::metrics::MetricCell::Idle,
+                ssim: crate::metrics::MetricCell::Idle,
             });
             fresh.push((key, s));
         }
@@ -489,23 +507,26 @@ impl RFMetricsApp {
     fn drain_metric_results(&mut self) {
         while let Ok(msg) = self.metric_rx.try_recv() {
             match msg {
-                MetricMsg::PsnrProgress {
+                MetricMsg::Progress {
                     generation,
+                    kind,
                     key,
                     frame,
                 } => {
-                    if generation != self.psnr_generation {
+                    if generation != self.run_generation {
                         continue;
                     }
                     if let Some(row) = self.rows.iter_mut().find(|r| norm_key(&r.path) == key)
-                        && let crate::metrics::MetricCell::Running { frame: cur } = &mut row.psnr
+                        && let crate::metrics::MetricCell::Running { frame: cur } =
+                            row.cell_mut(kind)
                         && frame > *cur
                     {
                         *cur = frame;
                     }
                 }
-                MetricMsg::PsnrDone {
+                MetricMsg::Done {
                     generation,
+                    kind,
                     key,
                     values,
                     avg,
@@ -514,13 +535,13 @@ impl RFMetricsApp {
                     skip,
                     clip_dur,
                 } => {
-                    if generation != self.psnr_generation {
-                        log::debug!(target: "rfmetrics::app", "discarded stale PSNR result");
+                    if generation != self.run_generation {
+                        log::debug!(target: "rfmetrics::app", "discarded stale {} result", kind.name());
                         continue;
                     }
-                    self.psnr_pending = self.psnr_pending.saturating_sub(1);
+                    self.pending = self.pending.saturating_sub(1);
                     if let Some(row) = self.rows.iter_mut().find(|r| norm_key(&r.path) == key) {
-                        row.psnr = match error {
+                        *row.cell_mut(kind) = match error {
                             Some(msg) => crate::metrics::MetricCell::Error { msg },
                             None => crate::metrics::MetricCell::Done {
                                 avg: avg.unwrap_or_else(|| crate::metrics::mean(&values)),
@@ -531,27 +552,29 @@ impl RFMetricsApp {
                             },
                         };
                     }
-                    if self.psnr_pending == 0 {
+                    if self.pending == 0 {
                         self.measuring = false;
                     }
                 }
-                MetricMsg::PsnrFinished {
+                MetricMsg::Finished {
                     generation,
                     aborted,
                 } => {
-                    if generation != self.psnr_generation {
+                    if generation != self.run_generation {
                         continue;
                     }
                     // Aborted runs: unstarted/killed rows were left Running;
                     // settle them to Idle. Finished (`Done`) cells are kept.
                     if aborted {
                         for row in &mut self.rows {
-                            if matches!(row.psnr, crate::metrics::MetricCell::Running { .. }) {
-                                row.psnr = crate::metrics::MetricCell::Idle;
+                            for cell in [&mut row.psnr, &mut row.ssim] {
+                                if matches!(cell, crate::metrics::MetricCell::Running { .. }) {
+                                    *cell = crate::metrics::MetricCell::Idle;
+                                }
                             }
                         }
                     }
-                    self.psnr_pending = 0;
+                    self.pending = 0;
                     self.measuring = false;
                 }
             }
@@ -580,17 +603,25 @@ impl RFMetricsApp {
         }
     }
 
-    /// Start a PSNR run over included rows on one worker thread (Python
+    /// Start a run over included rows on one worker thread: each checked
+    /// metric runs sequentially in Python `METRICS` order (Python
     /// `start`/`_worker` parity). Pre-flight failures land in the cells
     /// as errors, mirroring Python's `"bad time"` / `"probe failed"` text.
-    fn start_psnr(&mut self, now: f64) {
+    fn start_run(&mut self, now: f64) {
         if self.measuring {
             return;
         }
-        if !self.m_psnr {
+        let kinds: Vec<MetricKind> = [MetricKind::Psnr, MetricKind::Ssim]
+            .into_iter()
+            .filter(|k| match k {
+                MetricKind::Psnr => self.m_psnr,
+                MetricKind::Ssim => self.m_ssim,
+            })
+            .collect();
+        if kinds.is_empty() {
             self.toast(
                 now,
-                "Tick PSNR in the table header to run it".to_owned(),
+                "Tick a metric in the table header to run it".to_owned(),
                 ToastKind::Info,
             );
             return;
@@ -612,9 +643,11 @@ impl RFMetricsApp {
         }
         if self.ref_path.trim().is_empty() || !Path::new(&self.ref_path).is_file() {
             for &i in &targets {
-                self.rows[i].psnr = crate::metrics::MetricCell::Error {
-                    msg: "no ref".to_owned(),
-                };
+                for &kind in &kinds {
+                    *self.rows[i].cell_mut(kind) = crate::metrics::MetricCell::Error {
+                        msg: "no ref".to_owned(),
+                    };
+                }
             }
             self.toast(
                 now,
@@ -628,9 +661,11 @@ impl RFMetricsApp {
             Self::trim_opt(&self.duration.clone()),
         ) else {
             for &i in &targets {
-                self.rows[i].psnr = crate::metrics::MetricCell::Error {
-                    msg: "bad time".to_owned(),
-                };
+                for &kind in &kinds {
+                    *self.rows[i].cell_mut(kind) = crate::metrics::MetricCell::Error {
+                        msg: "bad time".to_owned(),
+                    };
+                }
             }
             self.toast(
                 now,
@@ -639,43 +674,53 @@ impl RFMetricsApp {
             );
             return;
         };
-        // Rows already holding a valid value sit the rerun out — but only
-        // when the trim settings still match: a value computed under a
-        // different skip/clip is stale and must recompute. Pre-flight
-        // error cells above touch `targets` (settings uncomparable there);
-        // everything below touches `fresh` only, never valid results.
-        let mut skipped: Vec<String> = Vec::new();
-        let mut fresh: Vec<usize> = Vec::new();
-        for &i in &targets {
-            if let crate::metrics::MetricCell::Done {
-                skip: s,
-                clip_dur: c,
-                ..
-            } = &self.rows[i].psnr
-                && *s == skip
-                && *c == clip_dur
-            {
-                skipped.push(self.rows[i].display.clone());
-            } else {
-                fresh.push(i);
+        // Per metric: rows already holding a valid value sit the rerun out —
+        // but only when the trim settings still match: a value computed
+        // under a different skip/clip is stale and must recompute.
+        // Pre-flight error cells above touch `targets` (settings
+        // uncomparable there); everything below touches `fresh` only.
+        let mut work: Vec<(MetricKind, Vec<usize>, Vec<String>)> = Vec::new();
+        for &kind in &kinds {
+            let mut skipped = Vec::new();
+            let mut fresh = Vec::new();
+            for &i in &targets {
+                if let crate::metrics::MetricCell::Done {
+                    skip: s,
+                    clip_dur: c,
+                    ..
+                } = self.rows[i].cell(kind)
+                    && *s == skip
+                    && *c == clip_dur
+                {
+                    skipped.push(self.rows[i].display.clone());
+                } else {
+                    fresh.push(i);
+                }
             }
+            work.push((kind, fresh, skipped));
         }
-        if fresh.is_empty() {
-            self.toast(
-                now,
-                format!(
-                    "Skipped {} row(s) — PSNR already computed (Reset to recompute)",
-                    skipped.len()
-                ),
-                ToastKind::Info,
-            );
+        let fresh_total: usize = work.iter().map(|(_, f, _)| f.len()).sum();
+        if fresh_total == 0 {
+            for (kind, _, skipped) in &work {
+                self.toast(
+                    now,
+                    format!(
+                        "Skipped {} with existing {} (Reset to recompute)",
+                        skipped.len(),
+                        kind.name(),
+                    ),
+                    ToastKind::Info,
+                );
+            }
             return;
         }
         let Some(ffmpeg_exe) = self.ffmpeg.path.clone() else {
-            for &i in &fresh {
-                self.rows[i].psnr = crate::metrics::MetricCell::Error {
-                    msg: "ffmpeg not found".to_owned(),
-                };
+            for (kind, fresh, _) in &work {
+                for &i in fresh {
+                    *self.rows[i].cell_mut(*kind) = crate::metrics::MetricCell::Error {
+                        msg: "ffmpeg not found".to_owned(),
+                    };
+                }
             }
             self.toast(now, "ffmpeg not found".to_owned(), ToastKind::Error);
             return;
@@ -693,14 +738,18 @@ impl RFMetricsApp {
         // NOTE: `fresh`, not `targets` — Done rows were partitioned out
         // above and must never be marked Running here.
         let mut jobs = Vec::new();
-        for &i in &fresh {
-            if let Some(info) = self.rows[i].info.clone() {
-                jobs.push((
-                    norm_key(&self.rows[i].path),
-                    self.rows[i].path.clone(),
-                    info,
-                ));
-                self.rows[i].psnr = crate::metrics::MetricCell::Running { frame: 0 };
+        for (kind, fresh, _) in &work {
+            for &i in fresh {
+                if let Some(info) = self.rows[i].info.clone() {
+                    jobs.push((
+                        *kind,
+                        norm_key(&self.rows[i].path),
+                        self.rows[i].path.clone(),
+                        info,
+                    ));
+                    *self.rows[i].cell_mut(*kind) =
+                        crate::metrics::MetricCell::Running { frame: 0 };
+                }
             }
         }
         if jobs.is_empty() {
@@ -711,24 +760,25 @@ impl RFMetricsApp {
             );
             return;
         }
-        self.psnr_generation = self.psnr_generation.wrapping_add(1);
-        self.psnr_pending = jobs.len();
+        self.run_generation = self.run_generation.wrapping_add(1);
+        self.pending = jobs.len();
         self.measuring = true;
         self.abort.store(false, std::sync::atomic::Ordering::SeqCst);
         let tx = self.metric_tx.clone();
-        let generation = self.psnr_generation;
+        let generation = self.run_generation;
         let ref_path = self.ref_path.clone();
         let abort = Arc::clone(&self.abort);
         let child_slot = Arc::clone(&self.current_child);
         std::thread::spawn(move || {
             use std::sync::atomic::Ordering;
-            for (key, dist_path, dist_info) in jobs {
+            for (kind, key, dist_path, dist_info) in jobs {
                 if abort.load(Ordering::SeqCst) {
                     break;
                 }
                 let txp = tx.clone();
                 let keyp = key.clone();
-                let job = crate::metrics::psnr::PsnrInputs {
+                let job = crate::metrics::ffmpeg::RunInputs {
+                    kind,
                     exe: &ffmpeg_exe,
                     ref_path: &ref_path,
                     dist_path: &dist_path,
@@ -739,15 +789,17 @@ impl RFMetricsApp {
                     abort: &abort,
                     child_slot: &child_slot,
                 };
-                let out = crate::metrics::psnr::run_psnr(&job, &|f| {
-                    let _ = txp.send(MetricMsg::PsnrProgress {
+                let out = crate::metrics::ffmpeg::run_metric(&job, &|f| {
+                    let _ = txp.send(MetricMsg::Progress {
                         generation,
+                        kind,
                         key: keyp.clone(),
                         frame: f,
                     });
                 });
-                let _ = tx.send(MetricMsg::PsnrDone {
+                let _ = tx.send(MetricMsg::Done {
                     generation,
+                    kind,
                     key,
                     values: out.values,
                     avg: out.avg,
@@ -757,19 +809,26 @@ impl RFMetricsApp {
                     clip_dur,
                 });
             }
-            let _ = tx.send(MetricMsg::PsnrFinished {
+            let _ = tx.send(MetricMsg::Finished {
                 generation,
                 aborted: abort.load(Ordering::SeqCst),
             });
         });
-        if !skipped.is_empty() {
+        for (kind, _, skipped) in &work {
+            if skipped.is_empty() {
+                continue;
+            }
             let mut list = skipped.join(", ");
             if list.chars().count() > 80 {
                 list = format!("{}…", list.chars().take(79).collect::<String>());
             }
             self.toast(
                 now,
-                format!("Skipped {} with existing PSNR: {list}", skipped.len()),
+                format!(
+                    "Skipped {} with existing {}: {list}",
+                    skipped.len(),
+                    kind.name(),
+                ),
                 ToastKind::Info,
             );
         }
@@ -796,20 +855,21 @@ impl RFMetricsApp {
             return;
         }
         self.abort_worker();
-        log::info!(target: "rfmetrics::app", "PSNR run aborted by user");
+        log::info!(target: "rfmetrics::app", "run aborted by user");
     }
 
-    /// Clear all PSNR cells. Aborts a running worker first so Reset never
+    /// Clear all metric cells. Aborts a running worker first so Reset never
     /// leaves an orphaned ffmpeg burning CPU in the background.
     fn reset_psnr(&mut self) {
         self.abort_worker();
-        self.psnr_generation = self.psnr_generation.wrapping_add(1);
-        self.psnr_pending = 0;
+        self.run_generation = self.run_generation.wrapping_add(1);
+        self.pending = 0;
         self.measuring = false;
         for row in &mut self.rows {
             row.psnr = crate::metrics::MetricCell::Idle;
+            row.ssim = crate::metrics::MetricCell::Idle;
         }
-        log::info!(target: "rfmetrics::app", "PSNR results cleared");
+        log::info!(target: "rfmetrics::app", "metric results cleared");
     }
 }
 
@@ -852,18 +912,58 @@ fn rank_fill(rank: crate::metrics::StatRank) -> Option<egui::Color32> {
     }
 }
 
-/// PSNR Done tooltip in FFMetrics order: Avg, Exec, Frames, a blank line,
-/// the "Frames statistics" group, another blank line, then Percentiles.
-/// Each comparable value is chipped by its cross-row rank; Exec time and
-/// Frames count are display-only (no chip).
+/// Per-row (stats, ranks) for one metric column; ranks stay Plain unless
+/// 2+ rows scored (colors need a comparison).
+fn rank_details(
+    rows: &[QueueRow],
+    pick: impl Fn(&QueueRow) -> Option<crate::metrics::DoneStats>,
+) -> Vec<Option<(crate::metrics::DoneStats, [crate::metrics::StatRank; 10])>> {
+    let scored: Vec<(usize, crate::metrics::DoneStats)> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| pick(r).map(|s| (i, s)))
+        .collect();
+    let comparable = scored.len() >= 2;
+    let mut stat_lo = [f64::INFINITY; 10];
+    let mut stat_hi = [f64::NEG_INFINITY; 10];
+    for (_, s) in &scored {
+        for (k, (_, v, _)) in s.comparable().iter().enumerate() {
+            stat_lo[k] = stat_lo[k].min(*v);
+            stat_hi[k] = stat_hi[k].max(*v);
+        }
+    }
+    let mut detail = vec![None; rows.len()];
+    for (i, s) in &scored {
+        let comp = s.comparable();
+        let mut ranks = [crate::metrics::StatRank::Plain; 10];
+        if comparable {
+            for k in 0..10 {
+                let (_, v, lower_better) = comp[k];
+                ranks[k] = if lower_better {
+                    crate::metrics::rank_low(v, stat_lo[k], stat_hi[k])
+                } else {
+                    crate::metrics::rank(v, stat_lo[k], stat_hi[k])
+                };
+            }
+        }
+        detail[*i] = Some((s.clone(), ranks));
+    }
+    detail
+}
+
+/// Filter-metric Done tooltip in FFMetrics order: Avg, Exec, Frames, a blank
+/// line, Mean..StdDev, another blank line, then Percentiles. Each comparable
+/// value is chipped by its cross-row rank; Exec time and Frames count are
+/// display-only (no chip).
 /// Plain horizontal rows with content-hugging widths: grids and expanding
 /// layouts feed back into the tooltip auto-size and balloon while hovered.
-fn psnr_stat_tooltip(
+fn metric_stat_tooltip(
     ui: &mut egui::Ui,
+    title: &str,
     stats: &crate::metrics::DoneStats,
     ranks: &[crate::metrics::StatRank; 10],
 ) {
-    ui.label(egui::RichText::new("PSNR").strong());
+    ui.label(egui::RichText::new(title).strong());
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 1.0);
         let comp = stats.comparable();
@@ -1137,7 +1237,7 @@ impl eframe::App for RFMetricsApp {
                     if self.measuring {
                         self.stop_psnr();
                     } else {
-                        self.start_psnr(now);
+                        self.start_run(now);
                     }
                 }
                 if ui
@@ -1269,45 +1369,9 @@ impl eframe::App for RFMetricsApp {
                 ui.scope(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
                     // Screenshot green/red rules: per-stat column extremes
-                    // across scored rows rank every PSNR cell + tooltip chip.
-                    // Colors need something to compare against: with fewer
-                    // than 2 scored rows every rank stays Plain (no color).
-                    let scored: Vec<(usize, crate::metrics::DoneStats)> = self
-                        .rows
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, r)| r.psnr.done_stats().map(|s| (i, s)))
-                        .collect();
-                    let comparable = scored.len() >= 2;
-                    let mut stat_lo = [f64::INFINITY; 10];
-                    let mut stat_hi = [f64::NEG_INFINITY; 10];
-                    for (_, s) in &scored {
-                        for (k, (_, v, _)) in s.comparable().iter().enumerate() {
-                            stat_lo[k] = stat_lo[k].min(*v);
-                            stat_hi[k] = stat_hi[k].max(*v);
-                        }
-                    }
-                    let mut psnr_detail: Vec<
-                        Option<(
-                            crate::metrics::DoneStats,
-                            [crate::metrics::StatRank; 10],
-                        )>,
-                    > = vec![None; self.rows.len()];
-                    for (i, s) in &scored {
-                        let comp = s.comparable();
-                        let mut ranks = [crate::metrics::StatRank::Plain; 10];
-                        if comparable {
-                            for k in 0..10 {
-                                let (_, v, lower_better) = comp[k];
-                                ranks[k] = if lower_better {
-                                    crate::metrics::rank_low(v, stat_lo[k], stat_hi[k])
-                                } else {
-                                    crate::metrics::rank(v, stat_lo[k], stat_hi[k])
-                                };
-                            }
-                        }
-                        psnr_detail[*i] = Some((s.clone(), ranks));
-                    }
+                    // across scored rows rank every metric cell + tooltip chip.
+                    let psnr_detail = rank_details(&self.rows, |r| r.psnr.done_stats());
+                    let ssim_detail = rank_details(&self.rows, |r| r.ssim.done_stats());
                     let mut table = egui_extras::TableBuilder::new(ui)
                         .striped(false)
                         .resizable(false)
@@ -1429,49 +1493,59 @@ impl eframe::App for RFMetricsApp {
                                 if r.clicked() {
                                     bg_clicked = true;
                                 }
-                                // PSNR column: live state text, stats tooltip,
-                                // bold when this row holds the winning avg.
-                                let (_, r) =
-                                    row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
-                                if r.clicked() {
-                                    bg_clicked = true;
-                                }
-                                let (_, r) = row.col(|ui| {
-                                    let (text, tip, detail) = {
-                                        let cell = &self.rows[i].psnr;
-                                        (
-                                            cell.cell_text(),
-                                            cell.tooltip("PSNR"),
-                                            psnr_detail[i].clone(),
-                                        )
-                                    };
-                                    let mut cell_frame = egui::Frame::NONE;
-                                    if let Some(fill) =
-                                        detail.as_ref().and_then(|(_, r)| rank_fill(r[0]))
-                                    {
-                                        cell_frame = cell_frame.fill(fill);
+                                // Filter-metric columns: live state text on a rank
+                                // fill (best green, worst red, tie dim yellow),
+                                // per-stat chip grid tooltip for Done cells.
+                                for (kind, title, detail) in [
+                                    (MetricKind::Psnr, "PSNR", &psnr_detail),
+                                    (MetricKind::Ssim, "SSIM", &ssim_detail),
+                                ] {
+                                    let (_, r) = row.col(|ui| {
+                                        vline(ui, egui::Color32::from_gray(0x38))
+                                    });
+                                    if r.clicked() {
+                                        bg_clicked = true;
                                     }
-                                    cell_frame.show(ui, |ui| {
-                                        ui.set_width(ui.available_width());
-                                        ui.centered_and_justified(|ui| {
-                                            let resp = ui.label(&text);
-                                            match detail {
-                                                Some((stats, ranks)) => {
-                                                    resp.on_hover_ui(|ui| {
-                                                        psnr_stat_tooltip(ui, &stats, &ranks);
-                                                    });
+                                    let (_, r) = row.col(|ui| {
+                                        let (text, tip, cell_detail) = {
+                                            let cell = &self.rows[i].cell(kind);
+                                            (
+                                                cell.cell_text(),
+                                                cell.tooltip(title),
+                                                detail[i].clone(),
+                                            )
+                                        };
+                                        let mut cell_frame = egui::Frame::NONE;
+                                        if let Some(fill) = cell_detail
+                                            .as_ref()
+                                            .and_then(|(_, r)| rank_fill(r[0]))
+                                        {
+                                            cell_frame = cell_frame.fill(fill);
+                                        }
+                                        cell_frame.show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            ui.centered_and_justified(|ui| {
+                                                let resp = ui.label(&text);
+                                                match cell_detail {
+                                                    Some((stats, ranks)) => {
+                                                        resp.on_hover_ui(|ui| {
+                                                            metric_stat_tooltip(
+                                                                ui, title, &stats, &ranks,
+                                                            );
+                                                        });
+                                                    }
+                                                    None => {
+                                                        resp.on_hover_text(&tip);
+                                                    }
                                                 }
-                                                None => {
-                                                    resp.on_hover_text(&tip);
-                                                }
-                                            }
+                                            });
                                         });
                                     });
-                                });
-                                if r.clicked() {
-                                    bg_clicked = true;
+                                    if r.clicked() {
+                                        bg_clicked = true;
+                                    }
                                 }
-                                for _ in 0..6 {
+                                for _ in 0..5 {
                                     let (_, r) =
                                         row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
                                     if r.clicked() {
@@ -1676,6 +1750,7 @@ mod tests {
             media_tip: "Probing…".to_owned(),
             info: None,
             psnr: crate::metrics::MetricCell::Idle,
+            ssim: crate::metrics::MetricCell::Idle,
         });
         let key = norm_key("C:/vids/a.mp4");
         app.probe_tx
@@ -1726,6 +1801,7 @@ mod tests {
             media_tip: "tip".to_owned(),
             info: None,
             psnr: crate::metrics::MetricCell::Idle,
+            ssim: crate::metrics::MetricCell::Idle,
         }
     }
 
@@ -1734,7 +1810,7 @@ mod tests {
         let mut app = RFMetricsApp::default();
         app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
         app.m_psnr = false;
-        app.start_psnr(0.0);
+        app.start_run(0.0);
         assert!(!app.measuring);
         assert!(matches!(app.rows[0].psnr, crate::metrics::MetricCell::Idle));
         assert!(app.toast.is_some());
@@ -1748,7 +1824,7 @@ mod tests {
         };
         // Unchecked include box: the row must not be processed.
         app.rows.push(psnr_test_row("C:/vids/a.mp4", false));
-        app.start_psnr(0.0);
+        app.start_run(0.0);
         assert!(!app.measuring);
         assert!(matches!(app.rows[0].psnr, crate::metrics::MetricCell::Idle));
     }
@@ -1759,16 +1835,21 @@ mod tests {
         std::fs::write(&p, b"x").unwrap();
         let mut app = RFMetricsApp {
             m_psnr: true,
+            m_ssim: true,
             ref_path: p.to_string_lossy().into_owned(),
             skip: "abc".to_owned(),
             ..RFMetricsApp::default()
         };
         app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-        app.start_psnr(0.0);
+        app.start_run(0.0);
         std::fs::remove_file(&p).ok();
         assert!(!app.measuring);
         assert!(matches!(
             &app.rows[0].psnr,
+            crate::metrics::MetricCell::Error { msg } if msg == "bad time"
+        ));
+        assert!(matches!(
+            &app.rows[0].ssim,
             crate::metrics::MetricCell::Error { msg } if msg == "bad time"
         ));
     }
@@ -1780,21 +1861,23 @@ mod tests {
         let mut app = RFMetricsApp::default();
         app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
         app.rows[0].psnr = MetricCell::Running { frame: 10 };
-        app.psnr_generation = 1;
-        app.psnr_pending = 1;
+        app.run_generation = 1;
+        app.pending = 1;
         app.measuring = true;
         let key = norm_key("C:/vids/a.mp4");
         // Stale frame ignored, fresh frame applied.
         app.metric_tx
-            .send(MetricMsg::PsnrProgress {
+            .send(MetricMsg::Progress {
                 generation: 1,
+                kind: crate::metrics::ffmpeg::MetricKind::Psnr,
                 key: key.clone(),
                 frame: 5,
             })
             .unwrap();
         app.metric_tx
-            .send(MetricMsg::PsnrProgress {
+            .send(MetricMsg::Progress {
                 generation: 1,
+                kind: crate::metrics::ffmpeg::MetricKind::Psnr,
                 key: key.clone(),
                 frame: 25,
             })
@@ -1807,8 +1890,9 @@ mod tests {
         // No-summary avg falls back to the arithmetic mean; run ends.
         // Settings stamp through: the cell remembers this trim.
         app.metric_tx
-            .send(MetricMsg::PsnrDone {
+            .send(MetricMsg::Done {
                 generation: 1,
+                kind: crate::metrics::ffmpeg::MetricKind::Psnr,
                 key,
                 values: vec![30.0, 32.0],
                 avg: None,
@@ -1833,10 +1917,11 @@ mod tests {
         use crate::metrics::MetricCell;
         let mut app = RFMetricsApp::default();
         app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-        app.psnr_generation = 2; // run 1's messages are orphans after Reset
+        app.run_generation = 2; // run 1's messages are orphans after Reset
         app.metric_tx
-            .send(MetricMsg::PsnrDone {
+            .send(MetricMsg::Done {
                 generation: 1,
+                kind: crate::metrics::ffmpeg::MetricKind::Psnr,
                 key: norm_key("C:/vids/a.mp4"),
                 values: vec![30.0],
                 avg: Some(30.0),
@@ -1875,15 +1960,16 @@ mod tests {
             clip_dur: None,
         };
         app.rows[1].psnr = MetricCell::Running { frame: 12 };
+        app.rows[1].ssim = MetricCell::Running { frame: 3 };
         app.measuring = true;
-        app.psnr_pending = 1;
-        app.psnr_generation = 1;
+        app.pending = 1;
+        app.run_generation = 1;
 
         app.stop_psnr();
         assert!(app.abort.load(Ordering::SeqCst));
 
         app.metric_tx
-            .send(MetricMsg::PsnrFinished {
+            .send(MetricMsg::Finished {
                 generation: 1,
                 aborted: true,
             })
@@ -1895,8 +1981,9 @@ mod tests {
             MetricCell::Done { avg, .. } if (*avg - 30.0).abs() < 1e-9
         ));
         assert!(matches!(app.rows[1].psnr, MetricCell::Idle));
+        assert!(matches!(app.rows[1].ssim, MetricCell::Idle));
         assert!(!app.measuring);
-        assert_eq!(app.psnr_pending, 0);
+        assert_eq!(app.pending, 0);
     }
 
     #[test]
@@ -1905,9 +1992,9 @@ mod tests {
         let mut app = RFMetricsApp::default();
         app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
         app.measuring = true;
-        app.psnr_generation = 1;
+        app.run_generation = 1;
         app.metric_tx
-            .send(MetricMsg::PsnrFinished {
+            .send(MetricMsg::Finished {
                 generation: 1,
                 aborted: false,
             })
@@ -1923,6 +2010,7 @@ mod tests {
         std::fs::write(&p, b"x").unwrap();
         let mut app = RFMetricsApp {
             m_psnr: true,
+            m_ssim: true,
             ref_path: p.to_string_lossy().into_owned(),
             skip: "abc".to_owned(), // unparseable: settings uncomparable
             ..RFMetricsApp::default()
@@ -1936,16 +2024,17 @@ mod tests {
             skip: None,
             clip_dur: None,
         };
-        app.start_psnr(0.0);
+        app.start_run(0.0);
         std::fs::remove_file(&p).ok();
         // Garbage settings can't be compared against the stored trim, so
         // even valid rows take the error (Python writes all targets too).
         for i in 0..2 {
-            assert!(
-                matches!(&app.rows[i].psnr, MetricCell::Error { msg } if msg == "bad time"),
-                "row {i} should be bad time, got {:?}",
-                app.rows[i].psnr,
-            );
+            for cell in [&app.rows[i].psnr, &app.rows[i].ssim] {
+                assert!(
+                    matches!(cell, MetricCell::Error { msg } if msg == "bad time"),
+                    "row {i} should be bad time, got {cell:?}",
+                );
+            }
         }
         assert!(!app.measuring);
     }
@@ -1968,12 +2057,12 @@ mod tests {
             skip: None,
             clip_dur: None,
         };
-        app.start_psnr(0.0);
+        app.start_run(0.0);
         std::fs::remove_file(&p).ok();
         assert!(!app.measuring);
-        assert!(app.psnr_pending == 0);
+        assert!(app.pending == 0);
         let toast = app.toast.as_ref().expect("skip toast shown");
-        assert!(toast.text.contains("Skipped 1 row(s)"));
+        assert!(toast.text.contains("Skipped 1 with existing PSNR"));
         assert!(matches!(&app.rows[0].psnr, MetricCell::Done { .. }));
     }
 
@@ -2006,7 +2095,7 @@ mod tests {
         };
         app.rows[0].info = Some(MediaInfo::default());
         app.rows[1].info = Some(MediaInfo::default());
-        app.start_psnr(0.0);
+        app.start_run(0.0);
         std::fs::remove_file(&p).ok();
         // Sync state right after Start: Done row untouched, fresh Running.
         assert!(
@@ -2058,7 +2147,7 @@ mod tests {
             clip_dur: Some(5.0),
         };
         app.rows[0].info = Some(MediaInfo::default());
-        app.start_psnr(0.0);
+        app.start_run(0.0);
         std::fs::remove_file(&p).ok();
         // Stale trim: the row re-enters the run instead of skipping.
         assert!(
@@ -2101,7 +2190,7 @@ mod tests {
             clip_dur: Some(10.0),
         };
         app.rows[0].info = Some(MediaInfo::default());
-        app.start_psnr(0.0);
+        app.start_run(0.0);
         std::fs::remove_file(&p).ok();
         assert!(!app.measuring);
         assert!(
@@ -2110,6 +2199,85 @@ mod tests {
             app.rows[0].psnr,
         );
         let toast = app.toast.as_ref().expect("skip toast shown");
-        assert!(toast.text.contains("Skipped 1 row(s)"));
+        assert!(toast.text.contains("Skipped 1 with existing PSNR"));
+    }
+
+    /// SSIM-only run: only the SSIM cell enters the run, PSNR stays Idle.
+    #[test]
+    fn start_run_ssim_only_runs_ssim_cell() {
+        use crate::metrics::MetricCell;
+        use crate::probe::MediaInfo;
+        let p = std::env::temp_dir().join("rfmetrics-ssim-only.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            m_ssim: true,
+            ref_path: p.to_string_lossy().into_owned(),
+            ..RFMetricsApp::default()
+        };
+        // Fabricate past the pre-flights; the binary doesn't exist so the
+        // worker fails the spawn asynchronously (headless-safe).
+        app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+        app.ref_info_data = Some(MediaInfo::default());
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows[0].info = Some(MediaInfo::default());
+        app.start_run(0.0);
+        std::fs::remove_file(&p).ok();
+        assert!(app.measuring);
+        assert!(matches!(app.rows[0].psnr, MetricCell::Idle));
+        assert!(matches!(app.rows[0].ssim, MetricCell::Running { frame: 0 }));
+        for _ in 0..200 {
+            app.drain_metric_results();
+            if !app.measuring {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!app.measuring);
+        assert!(matches!(app.rows[0].psnr, MetricCell::Idle));
+        assert!(matches!(&app.rows[0].ssim, MetricCell::Error { .. }));
+    }
+
+    /// Mixed run: valid PSNR skips while fresh SSIM on the same row runs.
+    #[test]
+    fn start_run_skips_done_psnr_but_runs_fresh_ssim() {
+        use crate::metrics::MetricCell;
+        use crate::probe::MediaInfo;
+        let p = std::env::temp_dir().join("rfmetrics-ssim-mixed.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            m_psnr: true,
+            m_ssim: true,
+            ref_path: p.to_string_lossy().into_owned(),
+            ..RFMetricsApp::default()
+        };
+        app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+        app.ref_info_data = Some(MediaInfo::default());
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows[0].psnr = MetricCell::Done {
+            values: vec![30.0],
+            avg: 30.0,
+            exec_s: 1.0,
+            skip: None,
+            clip_dur: None,
+        };
+        app.rows[0].info = Some(MediaInfo::default());
+        app.start_run(0.0);
+        std::fs::remove_file(&p).ok();
+        assert!(app.measuring);
+        assert!(
+            matches!(&app.rows[0].psnr, MetricCell::Done { .. }),
+            "valid PSNR must skip, got {:?}",
+            app.rows[0].psnr,
+        );
+        assert!(matches!(app.rows[0].ssim, MetricCell::Running { frame: 0 }));
+        for _ in 0..200 {
+            app.drain_metric_results();
+            if !app.measuring {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!app.measuring);
+        assert!(matches!(&app.rows[0].psnr, MetricCell::Done { .. }));
     }
 }
