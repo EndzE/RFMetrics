@@ -65,7 +65,7 @@ fn parse_fps(rate: &str) -> Option<f64> {
     rate.parse().ok()
 }
 
-fn format_fps(fps: f64) -> String {
+pub(crate) fn format_fps(fps: f64) -> String {
     if (fps - fps.round()).abs() < 0.005 {
         format!("{}", fps.round() as i64)
     } else {
@@ -236,7 +236,7 @@ fn count_packets(exe: &Path, path: &str) -> Option<i64> {
 }
 
 /// Shared ffprobe spawn + parse; `None` = no usable video stream.
-fn probe_media(path: &str, ffprobe: Option<&Path>) -> Option<MediaInfo> {
+pub(crate) fn probe_media(path: &str, ffprobe: Option<&Path>) -> Option<MediaInfo> {
     if path.trim().is_empty() || !Path::new(path).is_file() {
         return None;
     }
@@ -404,27 +404,32 @@ pub fn table_media_tooltip(info: Option<&MediaInfo>) -> String {
     )
 }
 
-/// Single spawn returning truncated cell text + full tooltip for a queue row.
-pub fn probe_table_text(path: &str, ffprobe: Option<&Path>) -> (String, String) {
+/// Single spawn returning truncated cell text + full tooltip for a queue row,
+/// plus the raw info for metric runners (filtergraph scale/format decisions).
+pub fn probe_table_text(path: &str, ffprobe: Option<&Path>) -> (String, String, Option<MediaInfo>) {
     let info = probe_media(path, ffprobe);
     let full = table_media_text(info.as_ref());
     let cell = cell_media_text(&full, 38);
     let tip = table_media_tooltip(info.as_ref());
-    (cell, tip)
+    (cell, tip, info)
 }
 
 /// Single-line reference info, mirroring Python `reference_media_text`.
 /// Spawns ffprobe only for existing files; anything else is a cheap string.
-pub fn reference_media_text(path: &str, ffprobe: Option<&Path>) -> String {
+/// The returned info feeds metric runners (filtergraph scale/format decisions).
+pub fn reference_media_text(path: &str, ffprobe: Option<&Path>) -> (String, Option<MediaInfo>) {
     if path.trim().is_empty() {
-        return "Encoder: -unknown-, Frame: -unknown-, Bitrate: -unknown-, Duration: -unknown-"
-            .to_owned();
+        return (
+            "Encoder: -unknown-, Frame: -unknown-, Bitrate: -unknown-, Duration: -unknown-"
+                .to_owned(),
+            None,
+        );
     }
     if !Path::new(path).is_file() {
-        return "File not found".to_owned();
+        return ("File not found".to_owned(), None);
     }
     let Some(exe) = ffprobe else {
-        return "ffprobe not found".to_owned();
+        return ("ffprobe not found".to_owned(), None);
     };
     let start = std::time::Instant::now();
     log::debug!(target: "rfmetrics::probe", "probe ref: \"{}\" -show_format -show_streams \"{path}\"", exe.display());
@@ -443,14 +448,14 @@ pub fn reference_media_text(path: &str, ffprobe: Option<&Path>) -> String {
         Ok(o) => o,
         Err(e) => {
             log::warn!(target: "rfmetrics::probe", "probe ref \"{path}\" spawn failed: {e}");
-            return format!("Probe failed: {e}");
+            return (format!("Probe failed: {e}"), None);
         }
     };
     let data: ProbeOutput = match serde_json::from_slice(&out.stdout) {
         Ok(d) => d,
         Err(_) => {
             log::warn!(target: "rfmetrics::probe", "probe ref \"{path}\" invalid output ({}ms)", start.elapsed().as_millis());
-            return "Probe failed: invalid output".to_owned();
+            return ("Probe failed: invalid output".to_owned(), None);
         }
     };
     let streams = &data.streams;
@@ -460,7 +465,7 @@ pub fn reference_media_text(path: &str, ffprobe: Option<&Path>) -> String {
         .or_else(|| streams.first())
     else {
         log::warn!(target: "rfmetrics::probe", "probe ref \"{path}\" no video stream ({}ms)", start.elapsed().as_millis());
-        return "No video stream".to_owned();
+        return ("No video stream".to_owned(), None);
     };
     let mut info = parse_media(v, &data.format);
     // Same accurate-count fallback as queue rows (estimate is wrong on
@@ -508,11 +513,11 @@ pub fn reference_media_text(path: &str, ffprobe: Option<&Path>) -> String {
     }
     if parts.is_empty() {
         log::info!(target: "rfmetrics::probe", "probe ref \"{path}\" → no info ({}ms)", start.elapsed().as_millis());
-        "—".to_owned()
+        ("—".to_owned(), Some(info))
     } else {
         let text = parts.join(", ");
         log::info!(target: "rfmetrics::probe", "probe ref \"{path}\" → {text} ({}ms)", start.elapsed().as_millis());
-        text
+        (text, Some(info))
     }
 }
 
@@ -589,9 +594,11 @@ mod tests {
 
     #[test]
     fn text_edge_cases() {
-        assert!(reference_media_text("", None).contains("-unknown-"));
+        let (text, info) = reference_media_text("", None);
+        assert!(text.contains("-unknown-"));
+        assert!(info.is_none());
         assert_eq!(
-            reference_media_text("C:/no/such/file.mp4", None),
+            reference_media_text("C:/no/such/file.mp4", None).0,
             "File not found"
         );
     }
@@ -600,9 +607,10 @@ mod tests {
     fn text_needs_ffprobe() {
         let p = std::env::temp_dir().join("rfmetrics-probe-test.tmp");
         std::fs::write(&p, b"x").unwrap();
-        let s = reference_media_text(&p.to_string_lossy(), None);
+        let (s, info) = reference_media_text(&p.to_string_lossy(), None);
         std::fs::remove_file(&p).ok();
         assert_eq!(s, "ffprobe not found");
+        assert!(info.is_none());
     }
 
     #[test]

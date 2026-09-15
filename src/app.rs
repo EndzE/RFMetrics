@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 struct QueueRow {
@@ -10,6 +12,8 @@ struct QueueRow {
     selected: bool,
     media: String,
     media_tip: String,
+    info: Option<crate::probe::MediaInfo>,
+    psnr: crate::metrics::MetricCell,
 }
 
 /// Python `normcase(abspath)` equivalent for the same-file guard rail.
@@ -107,10 +111,6 @@ const TOAST_SECS: f64 = 3.0;
 /// Toast severity; drives the outline color. `Info` keeps the default
 /// popup outline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[expect(
-    dead_code,
-    reason = "Info/Error have no producer yet; kept for probe/run errors"
-)]
 enum ToastKind {
     Info,
     Warning,
@@ -141,11 +141,13 @@ enum ProbeMsg {
     Reference {
         generation: u64,
         text: String,
+        info: Option<crate::probe::MediaInfo>,
     },
     RowMedia {
         key: String,
         media: String,
         tip: String,
+        info: Option<crate::probe::MediaInfo>,
     },
 }
 
@@ -154,6 +156,33 @@ enum ProbeMsg {
 struct ThumbMsg {
     generation: u64,
     image: Option<egui::ColorImage>,
+}
+
+/// Progress + results from the single sequential metric worker (Python
+/// `_worker` parity: one thread, rows in order, never on the UI thread).
+/// `generation` drops late messages after a Reset starts a new run.
+#[derive(Debug)]
+#[allow(
+    clippy::enum_variant_names,
+    reason = "per-metric Psnr/Ssim prefixes stay once more metrics land"
+)]
+enum MetricMsg {
+    PsnrProgress {
+        generation: u64,
+        key: String,
+        frame: u64,
+    },
+    PsnrDone {
+        generation: u64,
+        key: String,
+        values: Vec<f64>,
+        avg: Option<f64>,
+        exec_s: f64,
+        error: Option<String>,
+    },
+    /// End of the worker loop; `aborted` settles still-Running cells to
+    /// Idle while keeping finished (`Done`) results on screen.
+    PsnrFinished { generation: u64, aborted: bool },
 }
 
 pub struct RFMetricsApp {
@@ -177,6 +206,8 @@ pub struct RFMetricsApp {
     ffvship: crate::binaries::BinaryInfo,
     ffprobe: Option<std::path::PathBuf>,
     ref_info: String,
+    /// Probed reference stream; feeds metric filtergraphs (scale/format).
+    ref_info_data: Option<crate::probe::MediaInfo>,
     ref_rect: Option<egui::Rect>,
     table_rect: Option<egui::Rect>,
     hover_row: Option<usize>,
@@ -185,6 +216,18 @@ pub struct RFMetricsApp {
     toast: Option<Toast>,
     probe_tx: Sender<ProbeMsg>,
     probe_rx: Receiver<ProbeMsg>,
+    metric_tx: Sender<MetricMsg>,
+    metric_rx: Receiver<MetricMsg>,
+    /// True while the metric worker runs; the button flips Start↔Stop then.
+    measuring: bool,
+    /// Stop flag shared with the worker (checked between jobs + in `run_psnr`).
+    abort: Arc<AtomicBool>,
+    /// The live ffmpeg child, so Stop can kill the in-flight run.
+    current_child: Arc<Mutex<Option<std::process::Child>>>,
+    /// Jobs still Blocking; last `Done` clears `measuring`.
+    psnr_pending: usize,
+    /// Bumped per run; late worker messages after a Reset are stale.
+    psnr_generation: u64,
     /// Path last handed to a probe worker (or resolved cheaply without one).
     last_spawned_ref: String,
     /// Bumped on every ref change; worker results with an older generation
@@ -205,6 +248,7 @@ impl Default for RFMetricsApp {
         let ffprobe = crate::binaries::ffprobe_path(ffmpeg.path.as_deref());
         let (probe_tx, probe_rx) = std::sync::mpsc::channel();
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
+        let (metric_tx, metric_rx) = std::sync::mpsc::channel();
         Self {
             ref_path: String::new(),
             duration: String::new(),
@@ -225,7 +269,8 @@ impl Default for RFMetricsApp {
             ffmpeg,
             ffvship,
             ffprobe,
-            ref_info: crate::probe::reference_media_text("", None),
+            ref_info: crate::probe::reference_media_text("", None).0,
+            ref_info_data: None,
             ref_rect: None,
             table_rect: None,
             hover_row: None,
@@ -234,6 +279,13 @@ impl Default for RFMetricsApp {
             toast: None,
             probe_tx,
             probe_rx,
+            metric_tx,
+            metric_rx,
+            measuring: false,
+            abort: Arc::new(AtomicBool::new(false)),
+            current_child: Arc::new(Mutex::new(None)),
+            psnr_pending: 0,
+            psnr_generation: 0,
             last_spawned_ref: String::new(),
             ref_generation: 0,
             thumb_tx,
@@ -253,17 +305,28 @@ impl RFMetricsApp {
     fn drain_probe_results(&mut self) {
         while let Ok(msg) = self.probe_rx.try_recv() {
             match msg {
-                ProbeMsg::Reference { generation, text } => {
+                ProbeMsg::Reference {
+                    generation,
+                    text,
+                    info,
+                } => {
                     if generation == self.ref_generation {
                         self.ref_info = text;
+                        self.ref_info_data = info;
                     } else {
                         log::debug!(target: "rfmetrics::app", "discarded stale ref probe (gen {generation})");
                     }
                 }
-                ProbeMsg::RowMedia { key, media, tip } => {
+                ProbeMsg::RowMedia {
+                    key,
+                    media,
+                    tip,
+                    info,
+                } => {
                     if let Some(row) = self.rows.iter_mut().find(|r| norm_key(&r.path) == key) {
                         row.media = media;
                         row.media_tip = tip;
+                        row.info = info;
                     }
                 }
             }
@@ -284,14 +347,17 @@ impl RFMetricsApp {
             self.ref_info =
                 "Encoder: -unknown-, Frame: -unknown-, Bitrate: -unknown-, Duration: -unknown-"
                     .to_owned();
+            self.ref_info_data = None;
             return;
         }
         if !Path::new(&self.ref_path).is_file() {
             self.ref_info = "File not found".to_owned();
+            self.ref_info_data = None;
             return;
         }
         if self.ffprobe.is_none() {
             self.ref_info = "ffprobe not found".to_owned();
+            self.ref_info_data = None;
             return;
         }
         self.ref_info = "Probing…".to_owned();
@@ -300,8 +366,12 @@ impl RFMetricsApp {
         let path = self.ref_path.clone();
         let exe = self.ffprobe.clone();
         std::thread::spawn(move || {
-            let text = crate::probe::reference_media_text(&path, exe.as_deref());
-            let _ = tx.send(ProbeMsg::Reference { generation, text });
+            let (text, info) = crate::probe::reference_media_text(&path, exe.as_deref());
+            let _ = tx.send(ProbeMsg::Reference {
+                generation,
+                text,
+                info,
+            });
         });
     }
 
@@ -386,6 +456,8 @@ impl RFMetricsApp {
                 selected: false,
                 media: "Probing…".to_owned(),
                 media_tip: "Probing…".to_owned(),
+                info: None,
+                psnr: crate::metrics::MetricCell::Idle,
             });
             fresh.push((key, s));
         }
@@ -397,10 +469,292 @@ impl RFMetricsApp {
         let exe = self.ffprobe.clone();
         std::thread::spawn(move || {
             for (key, s) in fresh {
-                let (media, tip) = crate::probe::probe_table_text(&s, exe.as_deref());
-                let _ = tx.send(ProbeMsg::RowMedia { key, media, tip });
+                let (media, tip, info) = crate::probe::probe_table_text(&s, exe.as_deref());
+                let _ = tx.send(ProbeMsg::RowMedia {
+                    key,
+                    media,
+                    tip,
+                    info,
+                });
             }
         });
+    }
+
+    /// Apply metric worker results; stale generations (post-Reset) drop.
+    /// Progress keeps the max frame per row (dual stdout/stderr feeds).
+    fn drain_metric_results(&mut self) {
+        while let Ok(msg) = self.metric_rx.try_recv() {
+            match msg {
+                MetricMsg::PsnrProgress {
+                    generation,
+                    key,
+                    frame,
+                } => {
+                    if generation != self.psnr_generation {
+                        continue;
+                    }
+                    if let Some(row) = self.rows.iter_mut().find(|r| norm_key(&r.path) == key)
+                        && let crate::metrics::MetricCell::Running { frame: cur } = &mut row.psnr
+                        && frame > *cur
+                    {
+                        *cur = frame;
+                    }
+                }
+                MetricMsg::PsnrDone {
+                    generation,
+                    key,
+                    values,
+                    avg,
+                    exec_s,
+                    error,
+                } => {
+                    if generation != self.psnr_generation {
+                        log::debug!(target: "rfmetrics::app", "discarded stale PSNR result");
+                        continue;
+                    }
+                    self.psnr_pending = self.psnr_pending.saturating_sub(1);
+                    if let Some(row) = self.rows.iter_mut().find(|r| norm_key(&r.path) == key) {
+                        row.psnr = match error {
+                            Some(msg) => crate::metrics::MetricCell::Error { msg },
+                            None => crate::metrics::MetricCell::Done {
+                                avg: avg.unwrap_or_else(|| crate::metrics::mean(&values)),
+                                values,
+                                exec_s,
+                            },
+                        };
+                    }
+                    if self.psnr_pending == 0 {
+                        self.measuring = false;
+                    }
+                }
+                MetricMsg::PsnrFinished {
+                    generation,
+                    aborted,
+                } => {
+                    if generation != self.psnr_generation {
+                        continue;
+                    }
+                    // Aborted runs: unstarted/killed rows were left Running;
+                    // settle them to Idle. Finished (`Done`) cells are kept.
+                    if aborted {
+                        for row in &mut self.rows {
+                            if matches!(row.psnr, crate::metrics::MetricCell::Running { .. }) {
+                                row.psnr = crate::metrics::MetricCell::Idle;
+                            }
+                        }
+                    }
+                    self.psnr_pending = 0;
+                    self.measuring = false;
+                }
+            }
+        }
+    }
+
+    fn toast(&mut self, now: f64, text: String, kind: ToastKind) {
+        match kind {
+            ToastKind::Info => log::info!(target: "rfmetrics::app", "toast info: {text}"),
+            ToastKind::Warning => log::warn!(target: "rfmetrics::app", "toast warning: {text}"),
+            ToastKind::Error => log::error!(target: "rfmetrics::app", "toast error: {text}"),
+        }
+        self.toast = Some(Toast {
+            text,
+            until: now + TOAST_SECS,
+            kind,
+        });
+    }
+
+    /// Parse a trim box; empty means no trim. `None` = invalid ("bad time").
+    fn trim_opt(raw: &str) -> Option<Option<f64>> {
+        if raw.trim().is_empty() {
+            Some(None)
+        } else {
+            crate::metrics::parse_time_spec(raw).map(Some)
+        }
+    }
+
+    /// Start a PSNR run over included rows on one worker thread (Python
+    /// `start`/`_worker` parity). Pre-flight failures land in the cells
+    /// as errors, mirroring Python's `"bad time"` / `"probe failed"` text.
+    fn start_psnr(&mut self, now: f64) {
+        if self.measuring {
+            return;
+        }
+        if !self.m_psnr {
+            self.toast(
+                now,
+                "Tick PSNR in the table header to run it".to_owned(),
+                ToastKind::Info,
+            );
+            return;
+        }
+        let targets: Vec<usize> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.include)
+            .map(|(i, _)| i)
+            .collect();
+        if targets.is_empty() {
+            self.toast(
+                now,
+                "Nothing to run — tick the checkbox in the first column".to_owned(),
+                ToastKind::Info,
+            );
+            return;
+        }
+        if self.ref_path.trim().is_empty() || !Path::new(&self.ref_path).is_file() {
+            for &i in &targets {
+                self.rows[i].psnr = crate::metrics::MetricCell::Error {
+                    msg: "no ref".to_owned(),
+                };
+            }
+            self.toast(
+                now,
+                "Set a reference file first".to_owned(),
+                ToastKind::Error,
+            );
+            return;
+        }
+        let (Some(skip), Some(clip_dur)) = (
+            Self::trim_opt(&self.skip.clone()),
+            Self::trim_opt(&self.duration.clone()),
+        ) else {
+            for &i in &targets {
+                self.rows[i].psnr = crate::metrics::MetricCell::Error {
+                    msg: "bad time".to_owned(),
+                };
+            }
+            self.toast(
+                now,
+                "Skip/Duration is not a valid time".to_owned(),
+                ToastKind::Error,
+            );
+            return;
+        };
+        let Some(ffmpeg_exe) = self.ffmpeg.path.clone() else {
+            for &i in &targets {
+                self.rows[i].psnr = crate::metrics::MetricCell::Error {
+                    msg: "ffmpeg not found".to_owned(),
+                };
+            }
+            self.toast(now, "ffmpeg not found".to_owned(), ToastKind::Error);
+            return;
+        };
+        let Some(ref_info) = self.ref_info_data.clone() else {
+            self.toast(
+                now,
+                "Reference is still probing — try again in a moment".to_owned(),
+                ToastKind::Info,
+            );
+            return;
+        };
+        // Rows whose probe hasn't landed yet sit this run out (cells stay
+        // as-is); running the ready ones beats failing the whole batch.
+        let mut jobs = Vec::new();
+        for &i in &targets {
+            if let Some(info) = self.rows[i].info.clone() {
+                jobs.push((
+                    norm_key(&self.rows[i].path),
+                    self.rows[i].path.clone(),
+                    info,
+                ));
+                self.rows[i].psnr = crate::metrics::MetricCell::Running { frame: 0 };
+            }
+        }
+        if jobs.is_empty() {
+            self.toast(
+                now,
+                "Files are still probing — try again in a moment".to_owned(),
+                ToastKind::Info,
+            );
+            return;
+        }
+        self.psnr_generation = self.psnr_generation.wrapping_add(1);
+        self.psnr_pending = jobs.len();
+        self.measuring = true;
+        self.abort.store(false, std::sync::atomic::Ordering::SeqCst);
+        let tx = self.metric_tx.clone();
+        let generation = self.psnr_generation;
+        let ref_path = self.ref_path.clone();
+        let abort = Arc::clone(&self.abort);
+        let child_slot = Arc::clone(&self.current_child);
+        std::thread::spawn(move || {
+            use std::sync::atomic::Ordering;
+            for (key, dist_path, dist_info) in jobs {
+                if abort.load(Ordering::SeqCst) {
+                    break;
+                }
+                let txp = tx.clone();
+                let keyp = key.clone();
+                let job = crate::metrics::psnr::PsnrInputs {
+                    exe: &ffmpeg_exe,
+                    ref_path: &ref_path,
+                    dist_path: &dist_path,
+                    ref_info: &ref_info,
+                    dist_info: &dist_info,
+                    skip,
+                    clip_dur,
+                    abort: &abort,
+                    child_slot: &child_slot,
+                };
+                let out = crate::metrics::psnr::run_psnr(&job, &|f| {
+                    let _ = txp.send(MetricMsg::PsnrProgress {
+                        generation,
+                        key: keyp.clone(),
+                        frame: f,
+                    });
+                });
+                let _ = tx.send(MetricMsg::PsnrDone {
+                    generation,
+                    key,
+                    values: out.values,
+                    avg: out.avg,
+                    exec_s: out.exec_s,
+                    error: out.error,
+                });
+            }
+            let _ = tx.send(MetricMsg::PsnrFinished {
+                generation,
+                aborted: abort.load(Ordering::SeqCst),
+            });
+        });
+    }
+
+    /// Signal the worker to stop and kill the in-flight ffmpeg, if any.
+    /// Shared with `reset_psnr` so Reset never leaves an orphaned run.
+    fn abort_worker(&self) {
+        use std::sync::atomic::Ordering;
+        self.abort.store(true, Ordering::SeqCst);
+        if let Ok(mut slot) = self.current_child.lock()
+            && let Some(mut child) = slot.take()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// Stop button: abort all runners, keep finished results on screen.
+    /// Still-Running cells settle to Idle when the worker's `Finished`
+    /// lands in `drain_metric_results`.
+    fn stop_psnr(&mut self) {
+        if !self.measuring {
+            return;
+        }
+        self.abort_worker();
+        log::info!(target: "rfmetrics::app", "PSNR run aborted by user");
+    }
+
+    /// Clear all PSNR cells. Aborts a running worker first so Reset never
+    /// leaves an orphaned ffmpeg burning CPU in the background.
+    fn reset_psnr(&mut self) {
+        self.abort_worker();
+        self.psnr_generation = self.psnr_generation.wrapping_add(1);
+        self.psnr_pending = 0;
+        self.measuring = false;
+        for row in &mut self.rows {
+            row.psnr = crate::metrics::MetricCell::Idle;
+        }
+        log::info!(target: "rfmetrics::app", "PSNR results cleared");
     }
 }
 
@@ -480,6 +834,11 @@ impl eframe::App for RFMetricsApp {
         self.refresh_ref_info();
         let ctx = ui.ctx().clone();
         self.refresh_thumbnail(&ctx);
+        self.drain_metric_results();
+        // Live `Frame: N` progress while the metric worker runs.
+        if self.measuring {
+            ui.ctx().request_repaint();
+        }
 
         let ref_hover = hovering && is_over_ref;
         let table_hover = hovering && is_over_table;
@@ -581,8 +940,23 @@ impl eframe::App for RFMetricsApp {
         // ---- Bottom action bar (bottommost) ----
         egui::Panel::bottom("actions").show(ui, |ui| {
             ui.horizontal(|ui| {
-                let _ = ui.add_sized([90.0, 24.0], egui::Button::new("Start"));
-                let _ = ui.add_sized([90.0, 24.0], egui::Button::new("Reset"));
+                let run_label = if self.measuring { "Stop" } else { "Start" };
+                if ui
+                    .add_sized([90.0, 24.0], egui::Button::new(run_label))
+                    .clicked()
+                {
+                    if self.measuring {
+                        self.stop_psnr();
+                    } else {
+                        self.start_psnr(now);
+                    }
+                }
+                if ui
+                    .add_sized([90.0, 24.0], egui::Button::new("Reset"))
+                    .clicked()
+                {
+                    self.reset_psnr();
+                }
                 let _ = ui.add_sized([90.0, 24.0], egui::Button::new("Plot"));
                 ui.label(&self.ffmpeg.short)
                     .on_hover_text(&self.ffmpeg.detail);
@@ -696,6 +1070,13 @@ impl eframe::App for RFMetricsApp {
                 }
                 ui.scope(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+                    // Max-avg wins PSNR (Python `_refresh_bold` parity;
+                    // ties all bold, unscored rows never bold).
+                    let psnr_best = self
+                        .rows
+                        .iter()
+                        .filter_map(|r| r.psnr.avg())
+                        .max_by(f64::total_cmp);
                     let mut table = egui_extras::TableBuilder::new(ui)
                         .striped(false)
                         .resizable(false)
@@ -817,7 +1198,34 @@ impl eframe::App for RFMetricsApp {
                                 if r.clicked() {
                                     bg_clicked = true;
                                 }
-                                for _ in 0..7 {
+                                // PSNR column: live state text, stats tooltip,
+                                // bold when this row holds the winning avg.
+                                let (_, r) =
+                                    row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
+                                if r.clicked() {
+                                    bg_clicked = true;
+                                }
+                                let (_, r) = row.col(|ui| {
+                                    ui.centered_and_justified(|ui| {
+                                        let (text, tip, avg) = {
+                                            let cell = &self.rows[i].psnr;
+                                            (
+                                                cell.cell_text(),
+                                                cell.tooltip("PSNR"),
+                                                cell.avg(),
+                                            )
+                                        };
+                                        let mut rich = egui::RichText::new(text);
+                                        if avg.is_some_and(|a| Some(a) == psnr_best) {
+                                            rich = rich.strong();
+                                        }
+                                        ui.label(rich).on_hover_text(tip);
+                                    });
+                                });
+                                if r.clicked() {
+                                    bg_clicked = true;
+                                }
+                                for _ in 0..6 {
                                     let (_, r) =
                                         row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
                                     if r.clicked() {
@@ -943,8 +1351,10 @@ mod tests {
 
     #[test]
     fn ref_cheap_cases_stay_synchronous() {
-        let mut app = RFMetricsApp::default();
-        app.ref_path = String::new();
+        let mut app = RFMetricsApp {
+            ref_path: String::new(),
+            ..RFMetricsApp::default()
+        };
         app.refresh_ref_info();
         assert!(app.ref_info.contains("-unknown-"));
         app.ref_path = "C:/no/such/file.mp4".to_owned();
@@ -956,12 +1366,15 @@ mod tests {
 
     #[test]
     fn stale_reference_result_discarded() {
-        let mut app = RFMetricsApp::default();
-        app.ref_info = "sentinel".to_owned();
+        let mut app = RFMetricsApp {
+            ref_info: "sentinel".to_owned(),
+            ..RFMetricsApp::default()
+        };
         app.probe_tx
             .send(ProbeMsg::Reference {
                 generation: 999,
                 text: "stale".to_owned(),
+                info: None,
             })
             .unwrap();
         app.refresh_ref_info();
@@ -970,6 +1383,7 @@ mod tests {
             .send(ProbeMsg::Reference {
                 generation: app.ref_generation,
                 text: "fresh".to_owned(),
+                info: None,
             })
             .unwrap();
         app.refresh_ref_info();
@@ -986,6 +1400,8 @@ mod tests {
             selected: false,
             media: "Probing…".to_owned(),
             media_tip: "Probing…".to_owned(),
+            info: None,
+            psnr: crate::metrics::MetricCell::Idle,
         });
         let key = norm_key("C:/vids/a.mp4");
         app.probe_tx
@@ -993,6 +1409,7 @@ mod tests {
                 key,
                 media: "h264, 1080p".to_owned(),
                 tip: "tip".to_owned(),
+                info: None,
             })
             .unwrap();
         app.probe_tx
@@ -1000,6 +1417,7 @@ mod tests {
                 key: "nope".to_owned(),
                 media: "x".to_owned(),
                 tip: "y".to_owned(),
+                info: None,
             })
             .unwrap();
         app.refresh_ref_info();
@@ -1022,5 +1440,197 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(app.rows[0].media.contains("-unknown-"));
+    }
+
+    fn psnr_test_row(path: &str, include: bool) -> QueueRow {
+        QueueRow {
+            path: path.to_owned(),
+            display: "a.mp4".to_owned(),
+            include,
+            selected: false,
+            media: "h264, 1080p".to_owned(),
+            media_tip: "tip".to_owned(),
+            info: None,
+            psnr: crate::metrics::MetricCell::Idle,
+        }
+    }
+
+    #[test]
+    fn start_psnr_gated_on_checkbox() {
+        let mut app = RFMetricsApp::default();
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.m_psnr = false;
+        app.start_psnr(0.0);
+        assert!(!app.measuring);
+        assert!(matches!(app.rows[0].psnr, crate::metrics::MetricCell::Idle));
+        assert!(app.toast.is_some());
+    }
+
+    #[test]
+    fn start_psnr_needs_included_rows() {
+        let mut app = RFMetricsApp {
+            m_psnr: true,
+            ..RFMetricsApp::default()
+        };
+        // Unchecked include box: the row must not be processed.
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", false));
+        app.start_psnr(0.0);
+        assert!(!app.measuring);
+        assert!(matches!(app.rows[0].psnr, crate::metrics::MetricCell::Idle));
+    }
+
+    #[test]
+    fn start_psnr_bad_time_marks_cells() {
+        let p = std::env::temp_dir().join("rfmetrics-psnr-ref.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            m_psnr: true,
+            ref_path: p.to_string_lossy().into_owned(),
+            skip: "abc".to_owned(),
+            ..RFMetricsApp::default()
+        };
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.start_psnr(0.0);
+        std::fs::remove_file(&p).ok();
+        assert!(!app.measuring);
+        assert!(matches!(
+            &app.rows[0].psnr,
+            crate::metrics::MetricCell::Error { msg } if msg == "bad time"
+        ));
+    }
+
+    #[test]
+    fn psnr_progress_keeps_max_and_done_clears() {
+        use super::MetricMsg;
+        use crate::metrics::MetricCell;
+        let mut app = RFMetricsApp::default();
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows[0].psnr = MetricCell::Running { frame: 10 };
+        app.psnr_generation = 1;
+        app.psnr_pending = 1;
+        app.measuring = true;
+        let key = norm_key("C:/vids/a.mp4");
+        // Stale frame ignored, fresh frame applied.
+        app.metric_tx
+            .send(MetricMsg::PsnrProgress {
+                generation: 1,
+                key: key.clone(),
+                frame: 5,
+            })
+            .unwrap();
+        app.metric_tx
+            .send(MetricMsg::PsnrProgress {
+                generation: 1,
+                key: key.clone(),
+                frame: 25,
+            })
+            .unwrap();
+        app.drain_metric_results();
+        assert!(matches!(
+            app.rows[0].psnr,
+            MetricCell::Running { frame: 25 }
+        ));
+        // No-summary avg falls back to the arithmetic mean; run ends.
+        app.metric_tx
+            .send(MetricMsg::PsnrDone {
+                generation: 1,
+                key,
+                values: vec![30.0, 32.0],
+                avg: None,
+                exec_s: 1.5,
+                error: None,
+            })
+            .unwrap();
+        app.drain_metric_results();
+        assert!(matches!(
+            &app.rows[0].psnr,
+            MetricCell::Done { avg, .. } if (*avg - 31.0).abs() < 1e-9
+        ));
+        assert!(!app.measuring);
+    }
+
+    #[test]
+    fn psnr_stale_generation_dropped() {
+        use super::MetricMsg;
+        use crate::metrics::MetricCell;
+        let mut app = RFMetricsApp::default();
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.psnr_generation = 2; // run 1's messages are orphans after Reset
+        app.metric_tx
+            .send(MetricMsg::PsnrDone {
+                generation: 1,
+                key: norm_key("C:/vids/a.mp4"),
+                values: vec![30.0],
+                avg: Some(30.0),
+                exec_s: 1.0,
+                error: None,
+            })
+            .unwrap();
+        app.drain_metric_results();
+        assert!(matches!(app.rows[0].psnr, MetricCell::Idle));
+    }
+
+    #[test]
+    fn stop_is_noop_when_idle() {
+        use std::sync::atomic::Ordering;
+        let mut app = RFMetricsApp::default();
+        app.stop_psnr();
+        assert!(!app.abort.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn stop_keeps_done_and_settles_running_to_idle() {
+        use super::MetricMsg;
+        use crate::metrics::MetricCell;
+        use std::sync::atomic::Ordering;
+        let mut app = RFMetricsApp::default();
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows.push(psnr_test_row("C:/vids/b.mp4", true));
+        // a finished before Stop, b was in flight.
+        app.rows[0].psnr = MetricCell::Done {
+            values: vec![30.0],
+            avg: 30.0,
+            exec_s: 1.0,
+        };
+        app.rows[1].psnr = MetricCell::Running { frame: 12 };
+        app.measuring = true;
+        app.psnr_pending = 1;
+        app.psnr_generation = 1;
+
+        app.stop_psnr();
+        assert!(app.abort.load(Ordering::SeqCst));
+
+        app.metric_tx
+            .send(MetricMsg::PsnrFinished {
+                generation: 1,
+                aborted: true,
+            })
+            .unwrap();
+        app.drain_metric_results();
+        // Processed result kept; unprocessed settled; button flips back.
+        assert!(matches!(
+            &app.rows[0].psnr,
+            MetricCell::Done { avg, .. } if (*avg - 30.0).abs() < 1e-9
+        ));
+        assert!(matches!(app.rows[1].psnr, MetricCell::Idle));
+        assert!(!app.measuring);
+        assert_eq!(app.psnr_pending, 0);
+    }
+
+    #[test]
+    fn clean_finish_leaves_cells_and_clears_measuring() {
+        use super::MetricMsg;
+        let mut app = RFMetricsApp::default();
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.measuring = true;
+        app.psnr_generation = 1;
+        app.metric_tx
+            .send(MetricMsg::PsnrFinished {
+                generation: 1,
+                aborted: false,
+            })
+            .unwrap();
+        app.drain_metric_results();
+        assert!(!app.measuring);
     }
 }
