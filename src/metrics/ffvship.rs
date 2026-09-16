@@ -123,6 +123,30 @@ pub fn parse_series(text: &str, expected_n: Option<i64>, kind: FfvshipKind) -> O
         .map(|rows| rows.into_iter().map(|r| r[0]).collect())
 }
 
+/// Best-effort per-line curve value for live plots: the first score of a
+/// well-formed `<idx> <scores…>` line — exactly what `parse_series`
+/// collects per row. Anything else is skipped live; the strict end-parse
+/// (arity, finiteness, duplicates, coverage) still decides `Done`, which
+/// replaces the live buffer.
+pub fn live_value(line: &str, n_scores: usize) -> Option<f64> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() != 1 + n_scores {
+        return None;
+    }
+    let _: usize = parts[0].parse().ok()?;
+    let mut scores = parts[1..].iter();
+    let first: f64 = scores.next()?.parse().ok()?;
+    if !first.is_finite() {
+        return None;
+    }
+    for p in scores {
+        if !p.parse::<f64>().map(|x| x.is_finite()).unwrap_or(false) {
+            return None;
+        }
+    }
+    Some(first)
+}
+
 /// Pooled average: last frame for CVVDP, arithmetic mean otherwise.
 fn pooled_avg(values: &[f64], kind: FfvshipKind) -> Option<f64> {
     if values.is_empty() {
@@ -162,6 +186,7 @@ pub fn run_ffvship(
     job: &RunInputs,
     kind: FfvshipKind,
     on_progress: &(dyn Fn(u64) + Sync),
+    on_series: &(dyn Fn(&[f64]) + Sync),
 ) -> RunOutcome {
     let RunInputs {
         exe,
@@ -195,6 +220,23 @@ pub fn run_ffvship(
     log::info!(target: "rfmetrics::metric", "run: \"{}\" {}", exe.display(), args.join(" "));
     let mut out_lines: Vec<String> = Vec::new();
     let mut frames = 0u64;
+    // Live-curve tap: first score per well-formed line, mirroring what
+    // the strict end-parse collects (`parse_series` takes `r[0]`).
+    // Malformed lines are skipped live; `Done` replaces the buffer with
+    // the strict result either way. Same throttle as `run_metric`.
+    let n_scores = kind.n_scores();
+    let mut pending: Vec<f64> = Vec::new();
+    let mut last_emit = std::time::Instant::now();
+    let emit = |pending: &mut Vec<f64>, last_emit: &mut std::time::Instant| {
+        if !pending.is_empty()
+            && (pending.len() >= crate::metrics::ffmpeg::SERIES_BATCH
+                || last_emit.elapsed() >= crate::metrics::ffmpeg::SERIES_THROTTLE)
+        {
+            on_series(pending);
+            pending.clear();
+            *last_emit = std::time::Instant::now();
+        }
+    };
     let pumped = match pump_process(
         exe,
         &args,
@@ -208,6 +250,10 @@ pub fn run_ffvship(
             if line.split_whitespace().count() >= 2 {
                 frames += 1;
                 on_progress(frames);
+            }
+            if let Some(v) = live_value(line, n_scores) {
+                pending.push(v);
+                emit(&mut pending, &mut last_emit);
             }
         },
         on_progress,
@@ -386,5 +432,20 @@ mod tests {
                 "100"
             ]
         );
+    }
+
+    #[test]
+    fn live_value_takes_first_score_of_clean_lines() {
+        // Single-score metric: count line and short lines skipped.
+        assert_eq!(live_value("300", 1), None);
+        assert_eq!(live_value("12 48.5", 1), Some(48.5));
+        assert_eq!(live_value("12 48.5 extra", 1), None);
+        assert_eq!(live_value("xx 48.5", 1), None);
+        assert_eq!(live_value("12 nan", 1), None);
+        assert_eq!(live_value("12 inf", 1), None);
+        // Multi-score metric: first score wins, rest must be finite.
+        assert_eq!(live_value("7 9.5 10.0 2.0", 3), Some(9.5));
+        assert_eq!(live_value("7 9.5 oops 2.0", 3), None);
+        assert_eq!(live_value("7 9.5 10.0", 3), None);
     }
 }

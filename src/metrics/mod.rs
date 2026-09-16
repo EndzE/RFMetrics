@@ -10,6 +10,10 @@ pub enum MetricCell {
     Idle,
     Running {
         frame: u64,
+        /// Per-frame values streamed so far (live plot curves); replaced
+        /// by the strict full series on `Done`, dropped on abort/Reset
+        /// with the cell itself.
+        values: Vec<f64>,
     },
     Done {
         values: Vec<f64>,
@@ -22,6 +26,10 @@ pub enum MetricCell {
         /// VMAF settings the run used (`None` for other metrics); a rerun
         /// under different VMAF options recomputes just that column.
         vmaf_cfg: Option<crate::metrics::vmaf::VmafCfg>,
+        /// Scaling method the run used; a rerun under a different method
+        /// recomputes every ffmpeg-backed column (FFVship has no scale
+        /// stage and ignores it).
+        scaler: crate::metrics::ffmpeg::ScaleMethod,
     },
     Error {
         msg: String,
@@ -33,7 +41,7 @@ impl MetricCell {
     pub fn cell_text(&self) -> String {
         match self {
             Self::Idle => "N/A".to_owned(),
-            Self::Running { frame } => format!("Frame: {frame}"),
+            Self::Running { frame, .. } => format!("Frame: {frame}"),
             Self::Done { avg, .. } => format!("{avg:.4}"),
             Self::Error { msg } => msg.clone(),
         }
@@ -366,7 +374,14 @@ mod tests {
     #[test]
     fn cell_text_and_tooltip() {
         assert_eq!(MetricCell::Idle.cell_text(), "N/A");
-        assert_eq!(MetricCell::Running { frame: 7 }.cell_text(), "Frame: 7");
+        assert_eq!(
+            MetricCell::Running {
+                frame: 7,
+                values: vec![30.0],
+            }
+            .cell_text(),
+            "Frame: 7"
+        );
         assert_eq!(
             MetricCell::Done {
                 values: vec![30.0],
@@ -375,6 +390,7 @@ mod tests {
                 skip: None,
                 clip_dur: None,
                 vmaf_cfg: None,
+                scaler: crate::metrics::ffmpeg::ScaleMethod::Bicubic,
             }
             .cell_text(),
             "30.1235"
@@ -387,6 +403,7 @@ mod tests {
                 skip: None,
                 clip_dur: None,
                 vmaf_cfg: None,
+                scaler: crate::metrics::ffmpeg::ScaleMethod::Bicubic,
             }
             .tooltip("PSNR")
             .starts_with("PSNR\nAvg: 30.000000")

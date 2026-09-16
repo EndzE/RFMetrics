@@ -88,6 +88,15 @@ pub struct VmafState {
     pub threads: Option<String>,
 }
 
+/// Global options; `None` = key absent, keep the live default.
+/// `scaling` is an rfmetrics-only UI label (no Python key).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct OptionsState {
+    pub scaling: Option<String>,
+    pub plot_at_start: Option<bool>,
+}
+
 /// The whole persisted snapshot: verbatim boxes, optional queue, and
 /// optional per-key overrides.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -103,6 +112,7 @@ pub struct AppState {
     pub files: Option<Vec<FileEntry>>,
     pub metrics: MetricsState,
     pub vmaf: VmafState,
+    pub options: OptionsState,
 }
 
 /// State file location: next to the exe (Python `app_dir` parity),
@@ -189,6 +199,10 @@ mod tests {
                 threads: Some("auto".to_owned()),
                 ..Default::default()
             },
+            options: OptionsState {
+                scaling: Some("Bicubic".to_owned()),
+                plot_at_start: Some(true),
+            },
         };
         let back: AppState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
@@ -218,6 +232,21 @@ mod tests {
         // Absent sections stay None so live defaults survive.
         assert_eq!(s.metrics, MetricsState::default());
         assert_eq!(s.vmaf, VmafState::default());
+        assert_eq!(s.options, OptionsState::default());
+    }
+
+    #[test]
+    fn options_scaling_round_trips_and_rejects_unknown() {
+        let s: AppState = serde_json::from_str(r#"{"options": {"scaling": "Lanczos"}}"#).unwrap();
+        assert_eq!(
+            s.options.scaling,
+            Some("Lanczos".to_owned()),
+            "label persists verbatim; from_label validates on apply"
+        );
+        // Unknown section keys are ignored, like Python's unknown keys.
+        let s: AppState =
+            serde_json::from_str(r#"{"options": {"scaling": "Lanczos", "other": 1}}"#).unwrap();
+        assert_eq!(s.options.scaling, Some("Lanczos".to_owned()));
     }
 
     #[test]

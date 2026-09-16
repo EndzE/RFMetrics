@@ -5,6 +5,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use crate::metrics::ffmpeg::MetricKind;
+use crate::metrics::ffmpeg::ScaleMethod;
 
 #[derive(Debug)]
 struct QueueRow {
@@ -34,10 +35,13 @@ struct QueueRow {
 /// Cached per-row stats + cross-row ranks for one metric column (H1: the
 /// values-vec clone+sort in `DoneStats::new` and the rank scan run on
 /// result arrival, not per frame; the render loop only reads).
+/// `points` is the same idea for the plot: built/extended on arrival,
+/// so the render loop never rebuilds `PlotPoints` per frame.
 #[derive(Debug, Clone, Default)]
 struct CachedStats {
     stats: Option<crate::metrics::DoneStats>,
     ranks: [crate::metrics::StatRank; 10],
+    points: Vec<egui_plot::PlotPoint>,
 }
 
 impl QueueRow {
@@ -249,6 +253,15 @@ enum MetricMsg {
         key: String,
         frame: u64,
     },
+    /// Live per-frame value deltas for the running job's plot curve
+    /// (throttled worker-side); appended to `Running.values` in arrival
+    /// order, replaced by the strict full series on `Done`.
+    Series {
+        generation: u64,
+        kind: MetricKind,
+        key: String,
+        new_values: Vec<f64>,
+    },
     Done {
         generation: u64,
         kind: MetricKind,
@@ -264,6 +277,10 @@ enum MetricMsg {
         /// VMAF settings the run used (`Some` for VMAF jobs only); stamped
         /// onto the `Done` cell so an options change recomputes VMAF alone.
         vmaf_cfg: Option<crate::metrics::vmaf::VmafCfg>,
+        /// Scaling method the run used; stamped onto the `Done` cell so a
+        /// method change recomputes every ffmpeg-backed column (FFVship
+        /// has no scale stage and ignores it at compare time).
+        scaler: ScaleMethod,
     },
     /// End of the worker loop; `aborted` settles still-Running cells to
     /// Idle while keeping finished (`Done`) results on screen.
@@ -288,6 +305,10 @@ pub struct RFMetricsApp {
     vmaf_subsample: String,
     vmaf_threads: String,
     vmaf_models: Vec<String>,
+    /// Global scaling method for every `scale=` the app emits.
+    scale_method: ScaleMethod,
+    /// Open the plot viewport when a run starts (Options checkbox).
+    plot_at_start: bool,
     rows: Vec<QueueRow>,
     ffmpeg: crate::binaries::BinaryInfo,
     ffvship: crate::binaries::BinaryInfo,
@@ -339,6 +360,15 @@ pub struct RFMetricsApp {
     /// Last measured tab-strip box width, for centering the strip
     /// (session-only; texts are static so it converges in one frame).
     plot_tabs_w: f32,
+    /// Grow-only live fit per open tab while any series is running;
+    /// cleared once all settle, so finished graphs fit exactly again.
+    plot_live_fit: Option<(MetricKind, crate::plot::FitBounds)>,
+    /// Follow poke still owed: set when a live phase starts without plot
+    /// memory present (window just opened), retried until it lands.
+    plot_follow_pending: bool,
+    /// Metric kind of the currently executing job (last kind seen on the
+    /// Progress/Series feed); drives plot tab-follow while measuring.
+    live_kind: Option<MetricKind>,
 }
 
 impl Default for RFMetricsApp {
@@ -369,6 +399,8 @@ impl Default for RFMetricsApp {
             vmaf_models: crate::metrics::vmaf::list_models(
                 &crate::metrics::vmaf::vmaf_home().join("vmaf-models"),
             ),
+            scale_method: ScaleMethod::default(),
+            plot_at_start: false,
             rows: Vec::new(),
             ffmpeg,
             ffvship,
@@ -403,6 +435,9 @@ impl Default for RFMetricsApp {
             show_plot: false,
             plot_tab: MetricKind::Psnr,
             plot_tabs_w: 0.0,
+            plot_live_fit: None,
+            plot_follow_pending: false,
+            live_kind: None,
         };
         // Hermetic tests: the developer's own state file must not leak
         // into assertions about defaults.
@@ -556,6 +591,43 @@ impl RFMetricsApp {
         self.hover_since = None;
     }
 
+    /// Re-probe everything (Options "Refresh Files Media Info"): the
+    /// reference text + thumbnail and every queue row's media text + raw
+    /// info. Same worker channels as the initial probes, so the window
+    /// never blocks; results (not reruns of finished metrics) update.
+    fn refresh_media_info(&mut self) {
+        // Forget the last-spawned markers: the per-frame refreshers see a
+        // mismatch and re-probe through the normal path (cheap inline
+        // cases resolve without a worker, as before).
+        self.last_spawned_ref.clear();
+        self.last_thumb_path.clear();
+        if self.rows.is_empty() {
+            return;
+        }
+        for row in &mut self.rows {
+            row.media = "Probing…".to_owned();
+            row.media_tip = "Probing…".to_owned();
+        }
+        let tx = self.probe_tx.clone();
+        let exe = self.ffprobe.clone();
+        let paths: Vec<(String, String)> = self
+            .rows
+            .iter()
+            .map(|r| (norm_key(&r.path), r.path.clone()))
+            .collect();
+        std::thread::spawn(move || {
+            for (key, s) in paths {
+                let (media, tip, info) = crate::probe::probe_table_text(&s, exe.as_deref());
+                let _ = tx.send(ProbeMsg::RowMedia {
+                    key,
+                    media,
+                    tip,
+                    info,
+                });
+            }
+        });
+    }
+
     /// Queue picked files, silently skipping ones already present.
     /// Media probing runs on a worker thread; rows show "Probing…"
     /// until their results arrive, so drops never freeze the window.
@@ -627,12 +699,41 @@ impl RFMetricsApp {
                     if generation != self.run_generation {
                         continue;
                     }
+                    // The job emitting progress is the live one: the plot
+                    // tab follows it while measuring.
+                    self.live_kind = Some(kind);
                     if let Some(row) = self.rows.iter_mut().find(|r| norm_key(&r.path) == key)
-                        && let crate::metrics::MetricCell::Running { frame: cur } =
+                        && let crate::metrics::MetricCell::Running { frame: cur, .. } =
                             row.cell_mut(kind)
                         && frame > *cur
                     {
                         *cur = frame;
+                    }
+                }
+                MetricMsg::Series {
+                    generation,
+                    kind,
+                    key,
+                    new_values,
+                } => {
+                    if generation != self.run_generation || new_values.is_empty() {
+                        continue;
+                    }
+                    self.live_kind = Some(kind);
+                    if let Some(row) = self.rows.iter_mut().find(|r| norm_key(&r.path) == key)
+                        && let crate::metrics::MetricCell::Running { values, .. } =
+                            row.cell_mut(kind)
+                    {
+                        // Points mirror values 1:1 (x = 1-based frame), so
+                        // the plot borrows them instead of rebuilding.
+                        let base = values.len() as f64;
+                        values.extend_from_slice(&new_values);
+                        row.cached_mut(kind).points.extend(
+                            new_values
+                                .iter()
+                                .enumerate()
+                                .map(|(i, &v)| egui_plot::PlotPoint::new(base + i as f64 + 1.0, v)),
+                        );
                     }
                 }
                 MetricMsg::Done {
@@ -646,6 +747,7 @@ impl RFMetricsApp {
                     skip,
                     clip_dur,
                     vmaf_cfg,
+                    scaler,
                 } => {
                     if generation != self.run_generation {
                         log::debug!(target: "rfmetrics::app", "discarded stale {} result", kind.name());
@@ -666,12 +768,25 @@ impl RFMetricsApp {
                                 skip,
                                 clip_dur,
                                 vmaf_cfg,
+                                scaler,
                             },
                         };
                         // Cache the stats once (clone+sort lives here, not
                         // per frame); ranks refresh below for this metric.
+                        // Points likewise: the plot borrows them instead of
+                        // rebuilding `PlotPoints` every frame. Anything but
+                        // `Done` clears (stale partials must never render).
                         let stats = row.cell(kind).done_stats();
+                        let points = match row.cell(kind) {
+                            crate::metrics::MetricCell::Done { values, .. } => values
+                                .iter()
+                                .enumerate()
+                                .map(|(i, &v)| egui_plot::PlotPoint::new(i as f64 + 1.0, v))
+                                .collect(),
+                            _ => Vec::new(),
+                        };
                         row.cached_mut(kind).stats = stats;
+                        row.cached_mut(kind).points = points;
                         scored_changed = true;
                     }
                     if self.pending == 0 {
@@ -804,6 +919,10 @@ impl RFMetricsApp {
                 subsample: Some(self.vmaf_subsample.clone()),
                 threads: Some(self.vmaf_threads.clone()),
             },
+            options: crate::state::OptionsState {
+                scaling: Some(self.scale_method.label().to_owned()),
+                plot_at_start: Some(self.plot_at_start),
+            },
         }
     }
 
@@ -883,6 +1002,14 @@ impl RFMetricsApp {
         }
         if let Some(threads) = v.threads {
             self.vmaf_threads = threads;
+        }
+        if let Some(scaling) = s.options.scaling
+            && let Some(m) = ScaleMethod::from_label(&scaling)
+        {
+            self.scale_method = m;
+        }
+        if let Some(plot_at_start) = s.options.plot_at_start {
+            self.plot_at_start = plot_at_start;
         }
     }
 
@@ -1014,8 +1141,11 @@ impl RFMetricsApp {
         // under a different skip/clip is stale and must recompute. VMAF
         // additionally compares its options stamp, so an options change
         // recomputes just the VMAF column while other metrics keep skipping.
+        // Every ffmpeg-backed column also compares the scaling stamp, so a
+        // method change recomputes them (FFVship has no scale stage).
         // Pre-flight error cells above touch `targets` (settings
         // uncomparable there); everything below touches `fresh` only.
+        let scaler = self.scale_method;
         let mut work: Vec<(MetricKind, Vec<usize>, Vec<String>)> = Vec::new();
         for &kind in &kinds {
             let mut skipped = Vec::new();
@@ -1025,11 +1155,13 @@ impl RFMetricsApp {
                     skip: s,
                     clip_dur: c,
                     vmaf_cfg: v,
+                    scaler: sc,
                     ..
                 } = self.rows[i].cell(kind)
                     && *s == skip
                     && *c == clip_dur
                     && (kind != MetricKind::Vmaf || v.as_ref() == Some(&vmaf_cfg))
+                    && (kind.is_ffvship() || *sc == scaler)
                 {
                     skipped.push(self.rows[i].display.clone());
                 } else {
@@ -1125,11 +1257,15 @@ impl RFMetricsApp {
                         info,
                         exe.clone(),
                     ));
-                    *self.rows[i].cell_mut(*kind) =
-                        crate::metrics::MetricCell::Running { frame: 0 };
+                    *self.rows[i].cell_mut(*kind) = crate::metrics::MetricCell::Running {
+                        frame: 0,
+                        values: Vec::new(),
+                    };
                     // Leaving the scored set: drop the cached stats now so
-                    // the refresh below can't rank a stale value.
+                    // the refresh below can't rank a stale value, and drop
+                    // cached points (capacity kept for the rerun).
                     self.rows[i].cached_mut(*kind).stats = None;
+                    self.rows[i].cached_mut(*kind).points.clear();
                 }
             }
         }
@@ -1151,6 +1287,11 @@ impl RFMetricsApp {
         self.run_generation = self.run_generation.wrapping_add(1);
         self.pending = jobs.len();
         self.measuring = true;
+        // Fresh run: tab-follow restarts from the first live job.
+        self.live_kind = None;
+        if self.plot_at_start {
+            self.show_plot = true;
+        }
         self.abort.store(false, std::sync::atomic::Ordering::SeqCst);
         let tx = self.metric_tx.clone();
         let generation = self.run_generation;
@@ -1165,6 +1306,8 @@ impl RFMetricsApp {
                 }
                 let txp = tx.clone();
                 let keyp = key.clone();
+                let txs = tx.clone();
+                let keys = key.clone();
                 let job = crate::metrics::ffmpeg::RunInputs {
                     kind,
                     exe: &exe,
@@ -1174,6 +1317,7 @@ impl RFMetricsApp {
                     dist_info: &dist_info,
                     skip,
                     clip_dur,
+                    scaler,
                     abort: &abort,
                     child_slot: &child_slot,
                 };
@@ -1185,12 +1329,23 @@ impl RFMetricsApp {
                         frame: f,
                     });
                 };
+                // Live-curve batches stream regardless of the plot window:
+                // rendering is gated on visibility, but opening Plot
+                // mid-run must show history, so the buffer always grows.
+                let series = |vals: &[f64]| {
+                    let _ = txs.send(MetricMsg::Series {
+                        generation,
+                        kind,
+                        key: keys.clone(),
+                        new_values: vals.to_vec(),
+                    });
+                };
                 let out = if kind == MetricKind::Vmaf {
                     crate::metrics::vmaf::run_vmaf(&job, &vmaf_cfg, &progress)
                 } else if let Some(fkind) = kind.ffvship_kind() {
-                    crate::metrics::ffvship::run_ffvship(&job, fkind, &progress)
+                    crate::metrics::ffvship::run_ffvship(&job, fkind, &progress, &series)
                 } else {
-                    crate::metrics::ffmpeg::run_metric(&job, &progress)
+                    crate::metrics::ffmpeg::run_metric(&job, &progress, &series)
                 };
                 let _ = tx.send(MetricMsg::Done {
                     generation,
@@ -1202,6 +1357,7 @@ impl RFMetricsApp {
                     error: out.error,
                     skip,
                     clip_dur,
+                    scaler,
                     vmaf_cfg: if kind == MetricKind::Vmaf {
                         Some(vmaf_cfg.clone())
                     } else {
@@ -1295,22 +1451,72 @@ impl RFMetricsApp {
             if vui.input(|i| i.viewport().close_requested()) {
                 self.show_plot = false;
             }
+            // While measuring, follow the live job's tab so its growing
+            // curve is visible; idle windows stay user-driven.
+            self.plot_tab = crate::plot::follow_live_tab(
+                self.measuring,
+                self.live_kind,
+                self.plot_tab,
+            );
             let kind = self.plot_tab;
             let def = crate::plot::plot_def(kind);
-            let done: Vec<(&str, &[f64])> = self
+            // Finished series plus live `Running` buffers, so curves grow
+            // mid-run (a cell is ever only one of the two — no dupes).
+            // Streaming runs whether the window is open or not, so a
+            // mid-run Plot click shows history; painting itself only
+            // happens here, i.e. never unseen.
+            let mut any_running = false;
+            // Names + values feed fit/hover; `points` feeds the lines
+            // directly from cache (built on arrival — zero per-frame
+            // allocs). Invariant: points mirrors values for Done/Running
+            // cells (drain maintains both; anything else is ignored).
+            let done: Vec<(&str, &[f64], &[egui_plot::PlotPoint])> = self
                 .rows
                 .iter()
                 .filter_map(|r| match r.cell(kind) {
                     crate::metrics::MetricCell::Done { values, .. }
                         if !values.is_empty() =>
                     {
-                        Some((r.display.as_str(), values.as_slice()))
+                        Some((
+                            r.display.as_str(),
+                            values.as_slice(),
+                            r.cached(kind).points.as_slice(),
+                        ))
+                    }
+                    crate::metrics::MetricCell::Running { values, .. }
+                        if !values.is_empty() =>
+                    {
+                        any_running = true;
+                        Some((
+                            r.display.as_str(),
+                            values.as_slice(),
+                            r.cached(kind).points.as_slice(),
+                        ))
                     }
                     _ => None,
                 })
                 .collect();
-            let borrowed: Vec<&[f64]> = done.iter().map(|(_, v)| *v).collect();
-            let (xlim, (ymin, ymax)) = crate::plot::fit_limits(&borrowed, def.lo, def.hi);
+            let borrowed: Vec<&[f64]> = done.iter().map(|(_, v, _)| *v).collect();
+            let fresh = crate::plot::fit_limits(&borrowed, def.lo, def.hi);
+            // Grow-only live bounds: axes expand with arriving points but
+            // never jump inward mid-run; cleared once all settle so the
+            // finished graph fits exactly again. `follow` arms the
+            // one-shot auto-follow poke below (new live phase on this tab,
+            // or a still-owed retry).
+            let (follow, (xlim, (ymin, ymax))) = if any_running {
+                let grown = match self.plot_live_fit {
+                    Some((t, prev)) if t == kind => crate::plot::union_bounds(prev, fresh),
+                    _ => fresh,
+                };
+                let follow = !matches!(self.plot_live_fit, Some((t, _)) if t == kind)
+                    || self.plot_follow_pending;
+                self.plot_live_fit = Some((kind, grown));
+                (follow, grown)
+            } else {
+                self.plot_live_fit = None;
+                self.plot_follow_pending = false;
+                (false, fresh)
+            };
             // Empty plot (no Done data): axes only, y on the metric
             // default range; x falls back to a unit span.
             let (xmin, xmax) = xlim.unwrap_or((0.0, 1.0));
@@ -1324,6 +1530,27 @@ impl RFMetricsApp {
                 );
             });
             egui::CentralPanel::default().show(vui, |ui| {
+                // FPS HUD (egui demo pattern): smoothed frame rate
+                // top-right. Full repaint rate only while measuring (live
+                // curves need it); idle repaints at ~10 Hz plus
+                // input-driven ones — a static plot at 60 fps is pure
+                // main+plot re-render cost, and immediate viewports
+                // repaint the parent together with the child.
+                if self.measuring {
+                    ui.ctx().request_repaint();
+                } else {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                let fps = 1.0 / ui.input(|i| i.stable_dt);
+                egui::Area::new(egui::Id::new("plot_fps"))
+                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 8.0))
+                    .order(egui::Order::Foreground)
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.label(format!("FPS: {fps:.0}"));
+                        });
+                    });
                 // Tab strip (Python `CTkTabview` parity): all 7 tabs
                 // always visible; empty tabs show empty axes. Compact
                 // box hugging the buttons, centered via last frame's
@@ -1359,6 +1586,31 @@ impl RFMetricsApp {
                 // Per-tab plot id: zoom state persists per metric.
                 let plot_id =
                     format!("plot-{}", crate::plot::tab_title(kind).to_lowercase());
+                // One-shot live-follow: explicit default bounds seed fresh
+                // PlotMemory with auto OFF, freezing the first-shown
+                // (often still empty) view until a double-click. Flip auto
+                // back on once per live phase so bounds track the growing
+                // fit; user pan/zoom afterwards still takes over (it flips
+                // auto off again). Retried while memory is missing: on the
+                // opening frame there is nothing to poke yet, memory
+                // appears on the next shown frame.
+                if follow {
+                    // NOTE: the id must be derived exactly like
+                    // `Plot::show` does (`new` stores `Id::new(source)`,
+                    // show hashes *that*); hashing the raw string hits a
+                    // different memory entry and the poke never lands.
+                    let pid = ui.make_persistent_id(egui::Id::new(plot_id.clone()));
+                    if let Some(mut mem) = egui_plot::PlotMemory::load(ui.ctx(), pid) {
+                        mem.auto_bounds = true.into();
+                        mem.store(ui.ctx(), pid);
+                        self.plot_follow_pending = false;
+                    } else {
+                        self.plot_follow_pending = true;
+                    }
+                }
+                // Draw budget: ~2 points per horizontal pixel (the y-axis
+                // gutter makes this a slight over-estimate, harmless).
+                let target = (ui.available_width() as usize * 2).clamp(512, 8192);
                 let plot_resp = egui_plot::Plot::new(plot_id)
                     .x_axis_label("Frames")
                     .y_axis_label(def.label)
@@ -1369,16 +1621,12 @@ impl RFMetricsApp {
                     .default_x_bounds(xmin, xmax)
                     .default_y_bounds(ymin, ymax)
                     .show(ui, |plot_ui| {
-                        for (name, values) in &done {
-                            let pts: Vec<[f64; 2]> = values
-                                .iter()
-                                .enumerate()
-                                .map(|(i, &v)| [(i + 1) as f64, v])
-                                .collect();
-                            plot_ui.line(egui_plot::Line::new(
-                                *name,
-                                egui_plot::PlotPoints::new(pts),
-                            ));
+                        // Lines borrow cached points, min-max decimated to
+                        // ~2 px buckets (values still feed fit + hover at
+                        // full resolution).
+                        for (name, _, points) in &done {
+                            let thin = crate::plot::decimate_minmax(points, target);
+                            plot_ui.line(egui_plot::Line::new(*name, thin));
                         }
                         // Hover inspect (Python `_on_hover` parity):
                         // nearest data point within 30 screen px gets a
@@ -1810,9 +2058,11 @@ impl eframe::App for RFMetricsApp {
             });
         });
 
-        // ---- VMAF options (just above bottom bar) ----
+        // ---- VMAF options + Options (just above bottom bar) ----
         egui::Panel::bottom("vmaf").show(ui, |ui| {
-            ui.add(egui::Label::new("VMAF options").selectable(false));
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.add(egui::Label::new("VMAF options").selectable(false));
             // Dim when running or when the VMAF header checkbox is off
             // (todo.txt:1 parity with the run_locked inputs above).
             let vmaf_enabled = !run_locked && self.m_vmaf;
@@ -1916,6 +2166,58 @@ impl eframe::App for RFMetricsApp {
                             })
                             .response
                             .on_hover_text("auto follows the system CPU count");
+                    });
+                });
+            });
+                });
+                // Global options box, right of VMAF options. Gated on
+                // `!run_locked` only (not on `m_vmaf`): the scaler feeds
+                // every ffmpeg-backed metric.
+                ui.vertical(|ui| {
+                    ui.add(egui::Label::new("Options").selectable(false));
+                    ui.add_enabled_ui(!run_locked, |ui| {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [70.0, 18.0],
+                                    egui::Label::new("Scaling").selectable(false),
+                                );
+                                let _ = egui::ComboBox::from_id_salt("scale_method")
+                                    .width(220.0)
+                                    .selected_text(self.scale_method.label())
+                                    .show_ui(ui, |ui| {
+                                        for m in ScaleMethod::ALL {
+                                            let _ = ui.selectable_value(
+                                                &mut self.scale_method,
+                                                m,
+                                                m.label(),
+                                            );
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(
+                                        "sws scaler for every scale filter the app emits; \
+                                         FFmpeg default omits flags (bicubic in practice)",
+                                    );
+                            });
+                            let _ = ui
+                                .add(egui::Checkbox::new(
+                                    &mut self.plot_at_start,
+                                    "Plot window at start",
+                                ))
+                                .on_hover_text(
+                                    "Open the plot window automatically when a run starts",
+                                );
+                            if ui
+                                .add(egui::Button::new("Refresh Files Media Info"))
+                                .on_hover_text(
+                                    "Re-probe the reference and every queued file (media info only)",
+                                )
+                                .clicked()
+                            {
+                                self.refresh_media_info();
+                            }
+                        });
                     });
                 });
             });
@@ -2240,6 +2542,7 @@ impl eframe::App for RFMetricsApp {
 
 #[cfg(test)]
 mod tests {
+    use super::ScaleMethod;
     use super::{
         CachedStats, DropAction, METRIC_COLUMNS, ProbeMsg, QueueRow, RFMetricsApp, display_names,
         norm_key, route_drop,
@@ -2325,6 +2628,49 @@ mod tests {
         let names = display_names(&["C:/a/x.mp4".to_owned(), "C:/b/x.mp4".to_owned()]);
         let sep = std::path::MAIN_SEPARATOR;
         assert_eq!(names, vec![format!("a{sep}x.mp4"), format!("b{sep}x.mp4")]);
+    }
+
+    /// Refresh re-probes the reference and every row through the normal
+    /// worker channels: markers clear, rows show the placeholder, and
+    /// results land via drain (missing files resolve without a process).
+    #[test]
+    fn refresh_media_info_reprobes_ref_and_rows() {
+        // Hermetic: no ffprobe, so workers resolve to text without spawning.
+        let mut app = RFMetricsApp {
+            ffprobe: None,
+            ..RFMetricsApp::default()
+        };
+        app.rows.push(psnr_test_row("C:/no/such/a.mp4", true));
+        app.rows[0].media = "old".to_owned();
+        app.last_spawned_ref = "sentinel".to_owned();
+        app.last_thumb_path = "sentinel".to_owned();
+        app.ref_path = "C:/no/such/ref.mp4".to_owned();
+        app.refresh_media_info();
+        assert!(app.last_spawned_ref.is_empty());
+        assert!(app.last_thumb_path.is_empty());
+        assert_eq!(app.rows[0].media, "Probing…");
+        for _ in 0..200 {
+            app.drain_probe_results();
+            if app.rows[0].media != "Probing…" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_ne!(app.rows[0].media, "Probing…");
+        // Reference cheap case resolves inline on the next refresh tick.
+        app.refresh_ref_info();
+        assert_eq!(app.ref_info, "File not found");
+    }
+
+    #[test]
+    fn refresh_media_info_empty_queue_only_clears_markers() {
+        let mut app = RFMetricsApp {
+            last_spawned_ref: "sentinel".to_owned(),
+            ..RFMetricsApp::default()
+        };
+        app.refresh_media_info();
+        assert!(app.last_spawned_ref.is_empty());
+        assert!(app.probe_rx.try_recv().is_err());
     }
 
     #[test]
@@ -2517,7 +2863,10 @@ mod tests {
         use crate::metrics::MetricCell;
         let mut app = RFMetricsApp::default();
         app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-        app.rows[0].psnr = MetricCell::Running { frame: 10 };
+        app.rows[0].psnr = MetricCell::Running {
+            frame: 10,
+            values: Vec::new(),
+        };
         app.run_generation = 1;
         app.pending = 1;
         app.measuring = true;
@@ -2542,7 +2891,7 @@ mod tests {
         app.drain_metric_results();
         assert!(matches!(
             app.rows[0].psnr,
-            MetricCell::Running { frame: 25 }
+            MetricCell::Running { frame: 25, .. }
         ));
         // No-summary avg falls back to the arithmetic mean; run ends.
         // Settings stamp through: the cell remembers this trim.
@@ -2558,6 +2907,7 @@ mod tests {
                 skip: None,
                 clip_dur: Some(5.0),
                 vmaf_cfg: None,
+                scaler: ScaleMethod::Bicubic,
             })
             .unwrap();
         app.drain_metric_results();
@@ -2567,6 +2917,124 @@ mod tests {
                 if (*avg - 31.0).abs() < 1e-9 && skip.is_none() && *clip_dur == Some(5.0)
         ));
         assert!(!app.measuring);
+    }
+
+    #[test]
+    fn series_appends_in_order_and_done_replaces() {
+        use super::MetricMsg;
+        use crate::metrics::MetricCell;
+        let mut app = RFMetricsApp::default();
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows[0].psnr = MetricCell::Running {
+            frame: 0,
+            values: Vec::new(),
+        };
+        app.run_generation = 1;
+        let key = norm_key("C:/vids/a.mp4");
+        let series = |generation: u64, vals: Vec<f64>| MetricMsg::Series {
+            generation,
+            kind: crate::metrics::ffmpeg::MetricKind::Psnr,
+            key: key.clone(),
+            new_values: vals,
+        };
+        // Stale generation and empty batches drop silently.
+        app.metric_tx.send(series(0, vec![99.0])).unwrap();
+        app.metric_tx.send(series(1, vec![])).unwrap();
+        app.metric_tx.send(series(1, vec![30.0, 31.0])).unwrap();
+        app.metric_tx.send(series(1, vec![32.0])).unwrap();
+        app.drain_metric_results();
+        assert!(matches!(
+            &app.rows[0].psnr,
+            MetricCell::Running { values, .. } if values == &[30.0, 31.0, 32.0]
+        ));
+        // Cached points mirror values 1:1 (plot borrows them, no rebuild).
+        let pts = &app.rows[0].psnr_cache.points;
+        assert_eq!(pts.len(), 3);
+        assert_eq!((pts[0].x, pts[0].y), (1.0, 30.0));
+        assert_eq!((pts[2].x, pts[2].y), (3.0, 32.0));
+        // Batches for a settled cell are ignored, not resurrected.
+        app.rows[0].psnr = MetricCell::Idle;
+        app.metric_tx.send(series(1, vec![33.0])).unwrap();
+        app.drain_metric_results();
+        assert!(matches!(app.rows[0].psnr, MetricCell::Idle));
+        // Done replaces the live buffer with the strict series.
+        app.rows[0].psnr = MetricCell::Running {
+            frame: 3,
+            values: vec![30.0, 31.0, 32.0],
+        };
+        app.metric_tx
+            .send(MetricMsg::Done {
+                generation: 1,
+                kind: crate::metrics::ffmpeg::MetricKind::Psnr,
+                key: key.clone(),
+                values: vec![29.0, 31.0],
+                avg: Some(30.0),
+                exec_s: 1.0,
+                error: None,
+                skip: None,
+                clip_dur: None,
+                vmaf_cfg: None,
+                scaler: ScaleMethod::Bicubic,
+            })
+            .unwrap();
+        app.drain_metric_results();
+        assert!(matches!(
+            &app.rows[0].psnr,
+            MetricCell::Done { values, .. } if values == &[29.0, 31.0]
+        ));
+        // Done rebuilds points from the strict series (not the partials).
+        let pts = &app.rows[0].psnr_cache.points;
+        assert_eq!(pts.len(), 2);
+        assert_eq!((pts[0].x, pts[0].y), (1.0, 29.0));
+        assert_eq!((pts[1].x, pts[1].y), (2.0, 31.0));
+    }
+
+    #[test]
+    fn progress_and_series_track_live_kind() {
+        use super::MetricMsg;
+        use crate::metrics::MetricCell;
+        use crate::metrics::ffmpeg::MetricKind;
+        let mut app = RFMetricsApp::default();
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows[0].psnr = MetricCell::Running {
+            frame: 0,
+            values: Vec::new(),
+        };
+        app.run_generation = 1;
+        let key = norm_key("C:/vids/a.mp4");
+        assert_eq!(app.live_kind, None);
+        // Stale generation touches nothing.
+        app.metric_tx
+            .send(MetricMsg::Progress {
+                generation: 0,
+                kind: MetricKind::Xpsnr,
+                key: key.clone(),
+                frame: 5,
+            })
+            .unwrap();
+        app.drain_metric_results();
+        assert_eq!(app.live_kind, None);
+        // Live feeds record the executing job's kind.
+        app.metric_tx
+            .send(MetricMsg::Progress {
+                generation: 1,
+                kind: MetricKind::Psnr,
+                key: key.clone(),
+                frame: 5,
+            })
+            .unwrap();
+        app.drain_metric_results();
+        assert_eq!(app.live_kind, Some(MetricKind::Psnr));
+        app.metric_tx
+            .send(MetricMsg::Series {
+                generation: 1,
+                kind: MetricKind::Ssim,
+                key,
+                new_values: vec![0.9],
+            })
+            .unwrap();
+        app.drain_metric_results();
+        assert_eq!(app.live_kind, Some(MetricKind::Ssim));
     }
 
     #[test]
@@ -2588,6 +3056,7 @@ mod tests {
                 skip: None,
                 clip_dur: None,
                 vmaf_cfg: None,
+                scaler: ScaleMethod::Bicubic,
             })
             .unwrap();
         app.drain_metric_results();
@@ -2624,6 +3093,7 @@ mod tests {
                     skip: None,
                     clip_dur: None,
                     vmaf_cfg: None,
+                    scaler: ScaleMethod::Bicubic,
                 })
                 .unwrap();
         }
@@ -2653,6 +3123,7 @@ mod tests {
             skip: None,
             clip_dur: None,
             vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
         };
         let stats = app.rows[0].psnr.done_stats();
         app.rows[0].psnr_cache.stats = stats;
@@ -2676,9 +3147,16 @@ mod tests {
             skip: None,
             clip_dur: None,
             vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
         };
-        app.rows[1].psnr = MetricCell::Running { frame: 12 };
-        app.rows[1].ssim = MetricCell::Running { frame: 3 };
+        app.rows[1].psnr = MetricCell::Running {
+            frame: 12,
+            values: Vec::new(),
+        };
+        app.rows[1].ssim = MetricCell::Running {
+            frame: 3,
+            values: Vec::new(),
+        };
         app.measuring = true;
         app.pending = 1;
         app.run_generation = 1;
@@ -2713,8 +3191,14 @@ mod tests {
         app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
         app.rows.push(psnr_test_row("C:/vids/b.mp4", true));
         // a is the killed in-flight job, b never started.
-        app.rows[0].psnr = MetricCell::Running { frame: 42 };
-        app.rows[1].psnr = MetricCell::Running { frame: 0 };
+        app.rows[0].psnr = MetricCell::Running {
+            frame: 42,
+            values: Vec::new(),
+        };
+        app.rows[1].psnr = MetricCell::Running {
+            frame: 0,
+            values: Vec::new(),
+        };
         app.measuring = true;
         app.pending = 2;
         app.run_generation = 1;
@@ -2732,6 +3216,7 @@ mod tests {
                 skip: None,
                 clip_dur: None,
                 vmaf_cfg: None,
+                scaler: ScaleMethod::Bicubic,
             })
             .unwrap();
         app.drain_metric_results();
@@ -2789,6 +3274,7 @@ mod tests {
             skip: None,
             clip_dur: None,
             vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
         };
         app.start_run(0.0);
         std::fs::remove_file(&p).ok();
@@ -2824,6 +3310,7 @@ mod tests {
             skip: None,
             clip_dur: None,
             vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
         };
         app.start_run(0.0);
         std::fs::remove_file(&p).ok();
@@ -2831,7 +3318,69 @@ mod tests {
         assert!(app.pending == 0);
         let toast = app.toast.as_ref().expect("skip toast shown");
         assert!(toast.text.contains("Skipped 1 with existing PSNR"));
-        assert!(matches!(&app.rows[0].psnr, MetricCell::Done { .. }));
+    }
+
+    /// Checked "Plot window at start" opens the plot viewport when a run
+    /// launches; unchecked (default) leaves it closed unless Plot is pressed.
+    #[test]
+    fn start_run_plot_at_start_opens_plot() {
+        use crate::probe::MediaInfo;
+        let p = std::env::temp_dir().join("rfmetrics-plot-at-start.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            m_psnr: true,
+            m_vmaf: false,
+            ref_path: p.to_string_lossy().into_owned(),
+            plot_at_start: true,
+            ..RFMetricsApp::default()
+        };
+        app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+        app.ref_info_data = Some(MediaInfo::default());
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows[0].info = Some(MediaInfo::default());
+        assert!(!app.show_plot);
+        app.start_run(0.0);
+        std::fs::remove_file(&p).ok();
+        assert!(app.measuring);
+        assert!(app.show_plot);
+        for _ in 0..200 {
+            app.drain_metric_results();
+            if !app.measuring {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!app.measuring);
+    }
+
+    #[test]
+    fn start_run_plot_stays_closed_by_default() {
+        use crate::probe::MediaInfo;
+        let p = std::env::temp_dir().join("rfmetrics-plot-default-closed.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            m_psnr: true,
+            m_vmaf: false,
+            ref_path: p.to_string_lossy().into_owned(),
+            ..RFMetricsApp::default()
+        };
+        assert!(!app.plot_at_start);
+        app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+        app.ref_info_data = Some(MediaInfo::default());
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows[0].info = Some(MediaInfo::default());
+        app.start_run(0.0);
+        std::fs::remove_file(&p).ok();
+        assert!(app.measuring);
+        assert!(!app.show_plot);
+        for _ in 0..200 {
+            app.drain_metric_results();
+            if !app.measuring {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!app.measuring);
     }
 
     /// Regression: the jobs loop must iterate `fresh`, never `targets`.
@@ -2862,6 +3411,7 @@ mod tests {
             skip: None,
             clip_dur: None,
             vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
         };
         app.rows[0].info = Some(MediaInfo::default());
         app.rows[1].info = Some(MediaInfo::default());
@@ -2873,7 +3423,10 @@ mod tests {
             "Done row must never re-enter Running, got {:?}",
             app.rows[0].psnr,
         );
-        assert!(matches!(app.rows[1].psnr, MetricCell::Running { frame: 0 }));
+        assert!(matches!(
+            app.rows[1].psnr,
+            MetricCell::Running { frame: 0, .. }
+        ));
         assert!(app.measuring);
         // Let the doomed worker land, then settle.
         for _ in 0..200 {
@@ -2917,6 +3470,7 @@ mod tests {
             skip: None,
             clip_dur: Some(5.0),
             vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
         };
         app.rows[0].info = Some(MediaInfo::default());
         app.start_run(0.0);
@@ -2962,6 +3516,7 @@ mod tests {
             skip: None,
             clip_dur: Some(10.0),
             vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
         };
         app.rows[0].info = Some(MediaInfo::default());
         app.start_run(0.0);
@@ -3006,6 +3561,7 @@ mod tests {
             skip: None,
             clip_dur: None,
             vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
         };
         app.rows[0].vmaf = MetricCell::Done {
             values: vec![90.0],
@@ -3021,6 +3577,7 @@ mod tests {
                 subsample: 5,
                 n_threads: 4,
             }),
+            scaler: ScaleMethod::Bicubic,
         };
         app.rows[0].info = Some(MediaInfo::default());
         app.start_run(0.0);
@@ -3076,6 +3633,7 @@ mod tests {
             skip: None,
             clip_dur: None,
             vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
         };
         app.rows[0].vmaf = MetricCell::Done {
             values: vec![90.0],
@@ -3091,6 +3649,7 @@ mod tests {
                 subsample: 1,
                 n_threads: 4,
             }),
+            scaler: ScaleMethod::Bicubic,
         };
         app.rows[0].info = Some(MediaInfo::default());
         app.start_run(0.0);
@@ -3103,6 +3662,99 @@ mod tests {
             toast.text,
             "Skipped 1 with existing PSNR, VMAF (Reset to recompute)"
         );
+    }
+
+    /// Scaler change recomputes ffmpeg-backed columns but leaves FFVship
+    /// ones alone (no scale stage there): a Bicubic-stamped PSNR cell
+    /// recomputes under Lanczos while a Bicubic-stamped SSIM2 cell keeps
+    /// skipping, no Reset needed.
+    #[test]
+    fn start_run_scaler_change_recomputes_ffmpeg_only() {
+        use crate::metrics::MetricCell;
+        use crate::probe::MediaInfo;
+        let p = std::env::temp_dir().join("rfmetrics-scaler-restamp.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            m_psnr: true,
+            m_vmaf: false,
+            m_ssim2: true,
+            ref_path: p.to_string_lossy().into_owned(),
+            ..RFMetricsApp::default()
+        };
+        app.scale_method = ScaleMethod::Lanczos;
+        app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+        app.ref_info_data = Some(MediaInfo::default());
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        let done = |avg: f64| MetricCell::Done {
+            values: vec![avg],
+            avg,
+            exec_s: 1.0,
+            skip: None,
+            clip_dur: None,
+            vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
+        };
+        app.rows[0].psnr = done(30.0);
+        app.rows[0].ssim2 = done(80.0);
+        app.rows[0].info = Some(MediaInfo::default());
+        app.start_run(0.0);
+        std::fs::remove_file(&p).ok();
+        assert!(app.measuring);
+        assert!(
+            matches!(&app.rows[0].psnr, MetricCell::Running { .. }),
+            "stale-stamped PSNR must recompute, got {:?}",
+            app.rows[0].psnr,
+        );
+        assert!(
+            matches!(&app.rows[0].ssim2, MetricCell::Done { .. }),
+            "FFVship SSIM2 ignores the scaler, got {:?}",
+            app.rows[0].ssim2,
+        );
+        for _ in 0..200 {
+            app.drain_metric_results();
+            if !app.measuring {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!app.measuring);
+        // Spawn fails headless (bogus binary): the cell records the error
+        // while SSIM2 still holds its skipped value.
+        assert!(matches!(&app.rows[0].psnr, MetricCell::Error { .. }));
+        assert!(matches!(&app.rows[0].ssim2, MetricCell::Done { .. }));
+    }
+
+    /// Matching scaler stamp still skips: unchanged method recomputes nothing.
+    #[test]
+    fn start_run_matching_scaler_still_skips() {
+        use crate::metrics::MetricCell;
+        use crate::probe::MediaInfo;
+        let p = std::env::temp_dir().join("rfmetrics-scaler-samestamp.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            m_psnr: true,
+            m_vmaf: false,
+            ref_path: p.to_string_lossy().into_owned(),
+            ..RFMetricsApp::default()
+        };
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows[0].psnr = MetricCell::Done {
+            values: vec![30.0],
+            avg: 30.0,
+            exec_s: 1.0,
+            skip: None,
+            clip_dur: None,
+            vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
+        };
+        app.rows[0].info = Some(MediaInfo::default());
+        app.ref_info_data = Some(MediaInfo::default());
+        app.start_run(0.0);
+        std::fs::remove_file(&p).ok();
+        assert!(!app.measuring);
+        assert!(matches!(&app.rows[0].psnr, MetricCell::Done { .. }));
+        let toast = app.toast.as_ref().expect("skip toast shown");
+        assert!(toast.text.contains("Skipped 1 with existing PSNR"));
     }
 
     /// All-metrics skip lists every metric: the single toast slot must name
@@ -3130,6 +3782,7 @@ mod tests {
             skip: None,
             clip_dur: None,
             vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
         };
         app.rows[0].psnr = done(30.0);
         app.rows[0].ssim = done(0.9);
@@ -3147,6 +3800,7 @@ mod tests {
                 subsample: 1,
                 n_threads: 4,
             }),
+            scaler: ScaleMethod::Bicubic,
         };
         app.start_run(0.0);
         std::fs::remove_file(&p).ok();
@@ -3197,6 +3851,7 @@ mod tests {
                 subsample: 5,
                 n_threads: 4,
             }),
+            scaler: ScaleMethod::Bicubic,
         };
         for i in 0..2 {
             app.rows[i].psnr = MetricCell::Done {
@@ -3206,6 +3861,7 @@ mod tests {
                 skip: None,
                 clip_dur: None,
                 vmaf_cfg: None,
+                scaler: ScaleMethod::Bicubic,
             };
             app.rows[i].ssim = MetricCell::Done {
                 values: vec![0.9],
@@ -3214,6 +3870,7 @@ mod tests {
                 skip: None,
                 clip_dur: None,
                 vmaf_cfg: None,
+                scaler: ScaleMethod::Bicubic,
             };
             app.rows[i].vmaf = stale_vmaf();
             app.rows[i].info = Some(MediaInfo::default());
@@ -3264,7 +3921,10 @@ mod tests {
         std::fs::remove_file(&p).ok();
         assert!(app.measuring);
         assert!(matches!(app.rows[0].psnr, MetricCell::Idle));
-        assert!(matches!(app.rows[0].ssim, MetricCell::Running { frame: 0 }));
+        assert!(matches!(
+            app.rows[0].ssim,
+            MetricCell::Running { frame: 0, .. }
+        ));
         for _ in 0..200 {
             app.drain_metric_results();
             if !app.measuring {
@@ -3301,6 +3961,7 @@ mod tests {
             skip: None,
             clip_dur: None,
             vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
         };
         app.rows[0].info = Some(MediaInfo::default());
         app.start_run(0.0);
@@ -3311,7 +3972,10 @@ mod tests {
             "valid PSNR must skip, got {:?}",
             app.rows[0].psnr,
         );
-        assert!(matches!(app.rows[0].ssim, MetricCell::Running { frame: 0 }));
+        assert!(matches!(
+            app.rows[0].ssim,
+            MetricCell::Running { frame: 0, .. }
+        ));
         for _ in 0..200 {
             app.drain_metric_results();
             if !app.measuring {
@@ -3349,7 +4013,7 @@ mod tests {
         assert!(matches!(app.rows[0].ssim, MetricCell::Idle));
         assert!(matches!(
             app.rows[0].xpsnr,
-            MetricCell::Running { frame: 0 }
+            MetricCell::Running { frame: 0, .. }
         ));
         for _ in 0..200 {
             app.drain_metric_results();
@@ -3387,12 +4051,16 @@ mod tests {
             skip: None,
             clip_dur: None,
             vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
         };
         app.rows[0].info = Some(MediaInfo::default());
         app.start_run(0.0);
         std::fs::remove_file(&p).ok();
         assert!(app.measuring);
-        assert!(matches!(app.rows[0].psnr, MetricCell::Running { frame: 0 }));
+        assert!(matches!(
+            app.rows[0].psnr,
+            MetricCell::Running { frame: 0, .. }
+        ));
         assert!(
             matches!(&app.rows[0].xpsnr, MetricCell::Done { .. }),
             "valid XPSNR must skip, got {:?}",
@@ -3435,7 +4103,7 @@ mod tests {
         assert!(matches!(app.rows[0].psnr, MetricCell::Idle));
         assert!(matches!(
             app.rows[0].ssim2,
-            MetricCell::Running { frame: 0 }
+            MetricCell::Running { frame: 0, .. }
         ));
         for _ in 0..200 {
             app.drain_metric_results();
@@ -3497,6 +4165,7 @@ mod tests {
                 skip: None,
                 clip_dur: None,
                 vmaf_cfg: None,
+                scaler: ScaleMethod::Bicubic,
             };
             let stats = app.rows[i].butter.done_stats();
             app.rows[i].butter_cache.stats = stats;
@@ -3523,6 +4192,8 @@ mod tests {
             vmaf_phone: true,
             vmaf_pooling: "Harmonic Mean".to_owned(),
             vmaf_threads: "4".to_owned(),
+            scale_method: ScaleMethod::Lanczos,
+            plot_at_start: true,
             ..RFMetricsApp::default()
         };
         app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
@@ -3540,6 +4211,8 @@ mod tests {
         assert!(fresh.vmaf_phone);
         assert_eq!(fresh.vmaf_pooling, "Harmonic Mean");
         assert_eq!(fresh.vmaf_threads, "4");
+        assert_eq!(fresh.scale_method, ScaleMethod::Lanczos);
+        assert!(fresh.plot_at_start);
         // psnr_test_row paths don't exist on disk: only pre-existing rows
         // could restore, so the queue stays empty here.
         assert!(fresh.rows.is_empty());

@@ -157,6 +157,16 @@ fn max_frame_in(text: &str) -> Option<u64> {
 /// `ERROR:` + stderr parity without progress-meter flooding).
 pub(crate) const STDERR_TAIL_LINES: usize = 30;
 
+/// Live-curve throttle: a Series batch ships when it holds this many
+/// values or this much time passed since the last batch — whichever
+/// first. Plot repaints ride the existing measuring-repaint driver.
+/// Live-curve throttle (shared with `run_ffvship`): a Series batch ships
+/// when it holds this many values or this much time passed since the last
+/// batch — whichever first. Plot repaints ride the existing
+/// measuring-repaint driver.
+pub(crate) const SERIES_BATCH: usize = 64;
+pub(crate) const SERIES_THROTTLE: std::time::Duration = std::time::Duration::from_millis(150);
+
 /// Last `n` non-empty stderr lines, chronological, for the log file.
 pub(crate) fn stderr_tail(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text
@@ -247,6 +257,79 @@ pub fn parse_summary(text: &str, kind: MetricKind) -> Option<f64> {
     None
 }
 
+/// Global scaling method for every `scale=` the app emits (metric
+/// upscaling legs + VMAF model-fit legs). Flag names verified against
+/// `ffmpeg -h full` (`sws_flags`); the sws default is bicubic, so an
+/// explicit `flags=bicubic` renders pixel-identical to the old flagless
+/// graphs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScaleMethod {
+    #[default]
+    Bicubic,
+    FfmpegDefault,
+    Neighbor,
+    Gauss,
+    Bilinear,
+    Lanczos,
+    Spline,
+    Sinc,
+}
+
+impl ScaleMethod {
+    /// Combo order: the default first, then the requested list order.
+    pub const ALL: [ScaleMethod; 8] = [
+        ScaleMethod::Bicubic,
+        ScaleMethod::FfmpegDefault,
+        ScaleMethod::Neighbor,
+        ScaleMethod::Gauss,
+        ScaleMethod::Bilinear,
+        ScaleMethod::Lanczos,
+        ScaleMethod::Spline,
+        ScaleMethod::Sinc,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bicubic => "Bicubic",
+            Self::FfmpegDefault => "FFmpeg default",
+            Self::Neighbor => "Nearest neighbor",
+            Self::Gauss => "Gauss",
+            Self::Bilinear => "Bilinear",
+            Self::Lanczos => "Lanczos",
+            Self::Spline => "Spline",
+            Self::Sinc => "Sinc",
+        }
+    }
+
+    /// libswscale flag, or `None` for "FFmpeg default" (omit `:flags=` —
+    /// today's exact strings).
+    pub fn flag(self) -> Option<&'static str> {
+        match self {
+            Self::Bicubic => Some("bicubic"),
+            Self::FfmpegDefault => None,
+            Self::Neighbor => Some("neighbor"),
+            Self::Gauss => Some("gauss"),
+            Self::Bilinear => Some("bilinear"),
+            Self::Lanczos => Some("lanczos"),
+            Self::Spline => Some("spline"),
+            Self::Sinc => Some("sinc"),
+        }
+    }
+
+    /// State-file validation (unknown labels keep the live default).
+    pub fn from_label(s: &str) -> Option<ScaleMethod> {
+        Self::ALL.into_iter().find(|m| m.label() == s)
+    }
+}
+
+/// `scale=w:h` with the global method (`:flags=` omitted for FFmpeg default).
+pub fn scale_filter(w: i64, h: i64, method: ScaleMethod) -> String {
+    match method.flag() {
+        Some(f) => format!("scale={w}:{h}:flags={f}"),
+        None => format!("scale={w}:{h}"),
+    }
+}
+
 /// Timestamp reset shared by every filtergraph leg.
 pub(crate) const NORM: &str = "settb=AVTB,setpts=PTS-STARTPTS";
 
@@ -301,6 +384,7 @@ pub fn filtergraph(
     dist_info: &MediaInfo,
     skip: Option<f64>,
     clip_dur: Option<f64>,
+    scaler: ScaleMethod,
 ) -> String {
     // Python `if skip or clip_dur:` — 0.0 is falsy, so a zero skip/clip
     // disables trim instead of producing an empty `trim=start=0:end=0`.
@@ -310,7 +394,7 @@ pub fn filtergraph(
     if (dist_info.width, dist_info.height) != (ref_info.width, ref_info.height)
         && let (Some(w), Some(h)) = (ref_info.width, ref_info.height)
     {
-        pre.push(format!("scale={w}:{h}"));
+        pre.push(scale_filter(w, h, scaler));
     }
     // Colour-range legs differ: tag each side with its own range (conf
     // `scale,setrange,format` order); matching/unknown ranges emit nothing.
@@ -441,6 +525,7 @@ pub fn parse_xpsnr_summary(text: &str, weights: (f64, f64, f64)) -> Option<f64> 
 }
 
 /// Full ffmpeg argv (minus the exe) for a filter-metric run.
+#[allow(clippy::too_many_arguments)]
 pub fn build_args(
     kind: MetricKind,
     ref_path: &str,
@@ -449,6 +534,7 @@ pub fn build_args(
     dist_info: &MediaInfo,
     skip: Option<f64>,
     clip_dur: Option<f64>,
+    scaler: ScaleMethod,
 ) -> Vec<String> {
     let mut args = vec![
         "-hide_banner".to_owned(),
@@ -465,7 +551,9 @@ pub fn build_args(
     args.push("-i".to_owned());
     args.push(ref_path.to_owned());
     args.push("-filter_complex".to_owned());
-    args.push(filtergraph(kind, ref_info, dist_info, skip, clip_dur));
+    args.push(filtergraph(
+        kind, ref_info, dist_info, skip, clip_dur, scaler,
+    ));
     args.extend(["-f".to_owned(), "null".to_owned(), "-".to_owned()]);
     args
 }
@@ -480,6 +568,9 @@ pub struct RunInputs<'a> {
     pub dist_info: &'a MediaInfo,
     pub skip: Option<f64>,
     pub clip_dur: Option<f64>,
+    /// Global scaling method; selects the `:flags=` on every `scale=`
+    /// this run emits (FFVship jobs ignore it — no ffmpeg stage).
+    pub scaler: ScaleMethod,
     /// Set by Stop; the run reports "aborted" and drops partial values.
     pub abort: &'a AtomicBool,
     /// Holds the live child so Stop can kill it; `None` when idle/reaped.
@@ -620,7 +711,11 @@ pub(crate) fn pump_process(
 
 /// Blocking filter-metric run; call off the UI thread. The UI keeps the max
 /// per row from the progress feed.
-pub fn run_metric(job: &RunInputs<'_>, on_progress: &(dyn Fn(u64) + Sync)) -> RunOutcome {
+pub fn run_metric(
+    job: &RunInputs<'_>,
+    on_progress: &(dyn Fn(u64) + Sync),
+    on_series: &(dyn Fn(&[f64]) + Sync),
+) -> RunOutcome {
     let RunInputs {
         kind,
         exe,
@@ -630,6 +725,7 @@ pub fn run_metric(job: &RunInputs<'_>, on_progress: &(dyn Fn(u64) + Sync)) -> Ru
         dist_info,
         skip,
         clip_dur,
+        scaler,
         abort,
         child_slot,
     } = *job;
@@ -648,12 +744,26 @@ pub fn run_metric(job: &RunInputs<'_>, on_progress: &(dyn Fn(u64) + Sync)) -> Ru
         error: Some(msg),
     };
     let args = build_args(
-        kind, ref_path, dist_path, ref_info, dist_info, skip, clip_dur,
+        kind, ref_path, dist_path, ref_info, dist_info, skip, clip_dur, scaler,
     );
     // `info`: the exact repro command is the core artifact of an issue
     // report (FFMetrics.log parity) — one line per metric job.
     log::info!(target: "rfmetrics::metric", "run: \"{}\" {}", exe.display(), args.join(" "));
     let mut values = Vec::new();
+    // Live-curve tap: per-frame values stream to the plot in throttled
+    // batches (the strict full series still lands on `Done`). No final
+    // flush: `Done` arrives right behind and replaces the buffer.
+    let mut pending: Vec<f64> = Vec::new();
+    let mut last_emit = std::time::Instant::now();
+    let emit = |pending: &mut Vec<f64>, last_emit: &mut std::time::Instant| {
+        if !pending.is_empty()
+            && (pending.len() >= SERIES_BATCH || last_emit.elapsed() >= SERIES_THROTTLE)
+        {
+            on_series(pending);
+            pending.clear();
+            *last_emit = std::time::Instant::now();
+        }
+    };
     let pumped = match pump_process(
         exe,
         &args,
@@ -666,6 +776,8 @@ pub fn run_metric(job: &RunInputs<'_>, on_progress: &(dyn Fn(u64) + Sync)) -> Ru
                 kind => parse_frame_line(line, kind),
             } {
                 values.push(v);
+                pending.push(v);
+                emit(&mut pending, &mut last_emit);
             }
         },
         on_progress,
@@ -829,10 +941,10 @@ mod tests {
         dist.width = Some(1280);
         dist.height = Some(720);
         dist.pix_fmt = Some("yuv444p".to_owned());
-        let g = filtergraph(Psnr, &ref_info(), &dist, None, None);
+        let g = filtergraph(Psnr, &ref_info(), &dist, None, None, ScaleMethod::default());
         assert_eq!(
             g,
-            "[0:v]settb=AVTB,setpts=PTS-STARTPTS,scale=1920:1080,format=yuv420p[main];\
+            "[0:v]settb=AVTB,setpts=PTS-STARTPTS,scale=1920:1080:flags=bicubic,format=yuv420p[main];\
              [1:v]settb=AVTB,setpts=PTS-STARTPTS[ref];\
              [main][ref]psnr=eof_action=endall:stats_file=-"
         );
@@ -841,7 +953,14 @@ mod tests {
     #[test]
     fn graph_matching_streams_have_no_scale() {
         use super::MetricKind::Psnr;
-        let g = filtergraph(Psnr, &ref_info(), &ref_info(), Some(5.0), Some(10.0));
+        let g = filtergraph(
+            Psnr,
+            &ref_info(),
+            &ref_info(),
+            Some(5.0),
+            Some(10.0),
+            ScaleMethod::default(),
+        );
         assert!(g.contains("[0:v]trim=start=5:end=15,"));
         assert!(g.contains("[1:v]trim=start=5:end=15,"));
         assert!(!g.contains("scale="));
@@ -853,16 +972,44 @@ mod tests {
         use super::MetricKind::Psnr;
         // Python `if skip or clip_dur:` — 0.0 is falsy, so zero values
         // measure the full video instead of an empty clip.
-        let plain = filtergraph(Psnr, &ref_info(), &ref_info(), None, None);
+        let plain = filtergraph(
+            Psnr,
+            &ref_info(),
+            &ref_info(),
+            None,
+            None,
+            ScaleMethod::default(),
+        );
         assert_eq!(
-            filtergraph(Psnr, &ref_info(), &ref_info(), Some(0.0), Some(0.0)),
+            filtergraph(
+                Psnr,
+                &ref_info(),
+                &ref_info(),
+                Some(0.0),
+                Some(0.0),
+                ScaleMethod::default()
+            ),
             plain
         );
         assert!(!plain.contains("trim="));
         // Mixed: zero side drops out, nonzero side applies.
-        let g = filtergraph(Psnr, &ref_info(), &ref_info(), Some(0.0), Some(10.0));
+        let g = filtergraph(
+            Psnr,
+            &ref_info(),
+            &ref_info(),
+            Some(0.0),
+            Some(10.0),
+            ScaleMethod::default(),
+        );
         assert!(g.contains("trim=start=0:end=10"));
-        let g = filtergraph(Psnr, &ref_info(), &ref_info(), Some(5.0), Some(0.0));
+        let g = filtergraph(
+            Psnr,
+            &ref_info(),
+            &ref_info(),
+            Some(5.0),
+            Some(0.0),
+            ScaleMethod::default(),
+        );
         assert!(g.contains("[0:v]trim=start=5,"));
         assert!(!g.contains(":end="));
     }
@@ -870,8 +1017,22 @@ mod tests {
     #[test]
     fn ssim_graph_differs_only_by_filter_name() {
         use super::MetricKind::{Psnr, Ssim};
-        let psnr = filtergraph(Psnr, &ref_info(), &ref_info(), Some(5.0), Some(10.0));
-        let ssim = filtergraph(Ssim, &ref_info(), &ref_info(), Some(5.0), Some(10.0));
+        let psnr = filtergraph(
+            Psnr,
+            &ref_info(),
+            &ref_info(),
+            Some(5.0),
+            Some(10.0),
+            ScaleMethod::default(),
+        );
+        let ssim = filtergraph(
+            Ssim,
+            &ref_info(),
+            &ref_info(),
+            Some(5.0),
+            Some(10.0),
+            ScaleMethod::default(),
+        );
         // Same legs, same order — only the filter segment differs.
         assert_eq!(
             ssim,
@@ -888,6 +1049,7 @@ mod tests {
             &ref_info(),
             None,
             None,
+            ScaleMethod::default(),
         );
         assert!(a.iter().any(|x| x.contains("[main][ref]ssim=")));
     }
@@ -903,6 +1065,7 @@ mod tests {
             &ref_info(),
             None,
             None,
+            ScaleMethod::default(),
         );
         let i1 = a.iter().position(|x| x == "dist.mp4").unwrap();
         let i2 = a.iter().position(|x| x == "ref.mp4").unwrap();
@@ -1011,8 +1174,22 @@ mod tests {
     #[test]
     fn xpsnr_graph_inverts_input_order() {
         use super::MetricKind::{Psnr, Xpsnr};
-        let psnr = filtergraph(Psnr, &ref_info(), &ref_info(), Some(5.0), Some(10.0));
-        let xpsnr = filtergraph(Xpsnr, &ref_info(), &ref_info(), Some(5.0), Some(10.0));
+        let psnr = filtergraph(
+            Psnr,
+            &ref_info(),
+            &ref_info(),
+            Some(5.0),
+            Some(10.0),
+            ScaleMethod::default(),
+        );
+        let xpsnr = filtergraph(
+            Xpsnr,
+            &ref_info(),
+            &ref_info(),
+            Some(5.0),
+            Some(10.0),
+            ScaleMethod::default(),
+        );
         // Same legs — only the order segment and filter name differ.
         assert_eq!(
             xpsnr,
@@ -1041,14 +1218,21 @@ mod tests {
     fn setrange_only_when_ranges_differ() {
         use super::MetricKind::Psnr;
         // Matching or unknown ranges: no segment (FFMetrics.log parity).
-        let g = filtergraph(Psnr, &ref_info(), &ref_info(), None, None);
+        let g = filtergraph(
+            Psnr,
+            &ref_info(),
+            &ref_info(),
+            None,
+            None,
+            ScaleMethod::default(),
+        );
         assert!(!g.contains("setrange"));
         // tv vs pc: each leg tagged with its own range.
         let mut rf = ref_info();
         rf.range_tag = Some("tv".to_owned());
         let mut dist = ref_info();
         dist.range_tag = Some("pc".to_owned());
-        let g = filtergraph(Psnr, &rf, &dist, None, None);
+        let g = filtergraph(Psnr, &rf, &dist, None, None, ScaleMethod::default());
         assert!(g.contains("[0:v]settb=AVTB,setpts=PTS-STARTPTS,setrange=range=pc[main]"));
         assert!(g.contains("[1:v]settb=AVTB,setpts=PTS-STARTPTS,setrange=range=tv[ref]"));
     }
@@ -1063,9 +1247,9 @@ mod tests {
         dist.width = Some(1280);
         dist.height = Some(720);
         dist.pix_fmt = Some("yuv444p".to_owned());
-        let g = filtergraph(Psnr, &rf, &dist, None, None);
+        let g = filtergraph(Psnr, &rf, &dist, None, None, ScaleMethod::default());
         assert!(g.contains(
-            "[0:v]settb=AVTB,setpts=PTS-STARTPTS,scale=1920:1080,setrange=range=pc,format=yuv420p[main]"
+            "[0:v]settb=AVTB,setpts=PTS-STARTPTS,scale=1920:1080:flags=bicubic,setrange=range=pc,format=yuv420p[main]"
         ));
     }
 
@@ -1080,7 +1264,58 @@ mod tests {
             &ref_info(),
             None,
             None,
+            ScaleMethod::default(),
         );
         assert_eq!(&a[..4], &["-hide_banner", "-nostdin", "-probesize", "50M"]);
+    }
+
+    #[test]
+    fn scaler_labels_flags_and_lookup() {
+        // Default is Bicubic; every UI label round-trips.
+        assert_eq!(ScaleMethod::default(), ScaleMethod::Bicubic);
+        assert_eq!(ScaleMethod::ALL.len(), 8);
+        for m in ScaleMethod::ALL {
+            assert_eq!(ScaleMethod::from_label(m.label()), Some(m));
+        }
+        assert_eq!(ScaleMethod::from_label("Nope"), None);
+        // Flag names verified against `ffmpeg -h full` (sws_flags).
+        assert_eq!(ScaleMethod::Bicubic.flag(), Some("bicubic"));
+        assert_eq!(ScaleMethod::Neighbor.flag(), Some("neighbor"));
+        assert_eq!(ScaleMethod::Gauss.flag(), Some("gauss"));
+        assert_eq!(ScaleMethod::Bilinear.flag(), Some("bilinear"));
+        assert_eq!(ScaleMethod::Lanczos.flag(), Some("lanczos"));
+        assert_eq!(ScaleMethod::Spline.flag(), Some("spline"));
+        assert_eq!(ScaleMethod::Sinc.flag(), Some("sinc"));
+        // "FFmpeg default" omits `:flags=` (today's exact strings).
+        assert_eq!(ScaleMethod::FfmpegDefault.flag(), None);
+        assert_eq!(
+            scale_filter(1920, 1080, ScaleMethod::Bicubic),
+            "scale=1920:1080:flags=bicubic"
+        );
+        assert_eq!(
+            scale_filter(1920, 1080, ScaleMethod::FfmpegDefault),
+            "scale=1920:1080"
+        );
+    }
+
+    #[test]
+    fn graph_scaler_selects_flags() {
+        use super::MetricKind::Psnr;
+        let mut dist = ref_info();
+        dist.width = Some(1280);
+        dist.height = Some(720);
+        let g = filtergraph(Psnr, &ref_info(), &dist, None, None, ScaleMethod::Lanczos);
+        assert!(g.contains("scale=1920:1080:flags=lanczos[main]"));
+        // FFmpeg default: today's flagless strings.
+        let g = filtergraph(
+            Psnr,
+            &ref_info(),
+            &dist,
+            None,
+            None,
+            ScaleMethod::FfmpegDefault,
+        );
+        assert!(g.contains("scale=1920:1080[main]"));
+        assert!(!g.contains("flags="));
     }
 }

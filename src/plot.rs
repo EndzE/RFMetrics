@@ -1,4 +1,4 @@
-//! Plot helpers: `_y_fit` / `_fit_limits` / `PLOT_DEFS` parity with
+//! Plot helpers: `_fit_limits` (+ `_y_fit` padding rule) / `PLOT_DEFS` parity with
 //! `FFMetrics-rev/main.py`.
 
 use crate::metrics::ffmpeg::MetricKind;
@@ -65,53 +65,113 @@ pub fn tab_title(kind: MetricKind) -> &'static str {
         MetricKind::Vmaf => "VMAF",
         MetricKind::Xpsnr => "XPSNR",
         MetricKind::Ssim2 => "SSIM2",
-        MetricKind::But => "BUTTER",
+        MetricKind::But => "BUTTERAUGLI",
         MetricKind::Cvvdp => "CVVDP",
     }
 }
 
-/// Python `_y_fit`: data min/max padded by 5% of the span; a flat
-/// series pads by `|max| * 2%`, falling back to `0.5` at zero.
-/// Empty input keeps the metric default `(lo, hi)`.
-pub fn y_fit(values: &[f64], lo: f64, hi: f64) -> (f64, f64) {
-    if values.is_empty() {
-        return (lo, hi);
-    }
-    let mut mn = values[0];
-    let mut mx = values[0];
-    for &v in &values[1..] {
-        mn = mn.min(v);
-        mx = mx.max(v);
-    }
+/// Python `_y_fit` padding rule for a data range (min/max known): 5% of
+/// the span; a flat series pads by `|max| * 2%`, falling back to `0.5`
+/// at zero (Python `abs(mx) * 0.02 or 0.5`).
+fn pad_for(mn: f64, mx: f64) -> f64 {
     let span = mx - mn;
-    let pad = if span > 0.0 {
+    if span > 0.0 {
         span * 0.05
     } else {
         // Python `abs(mx) * 0.02 or 0.5`: falsy (0.0) falls back to 0.5.
         let p = mx.abs() * 0.02;
         if p > 0.0 { p } else { 0.5 }
-    };
-    (mn - pad, mx + pad)
+    }
 }
 
-/// Python `_fit_limits`: x is `(1, N)` over the longest series, y is
-/// `y_fit` over all values concatenated. No values at all yields no
-/// x fit and the metric default y range (empty plot, axes only).
-pub fn fit_limits(series: &[&[f64]], lo: f64, hi: f64) -> (Option<(f64, f64)>, (f64, f64)) {
+/// Python `_fit_limits`: x is `(1, N)` over the longest series, y is the
+/// `_y_fit` rule over all values. No values at all yields no x fit and
+/// the metric default y range (empty plot, axes only).
+/// Allocation-free: scans borrowed slices, never concatenates.
+pub fn fit_limits(series: &[&[f64]], lo: f64, hi: f64) -> FitBounds {
     let mut n = 0usize;
+    let mut mn = f64::INFINITY;
+    let mut mx = f64::NEG_INFINITY;
     let mut count = 0usize;
     for s in series {
         n = n.max(s.len());
-        count += s.len();
+        for &v in *s {
+            mn = mn.min(v);
+            mx = mx.max(v);
+            count += 1;
+        }
     }
     if count == 0 {
         return (None, (lo, hi));
     }
-    let mut all = Vec::with_capacity(count);
-    for s in series {
-        all.extend_from_slice(s);
+    // egui_plot panics on degenerate `min >= max` bounds: a single point
+    // (first live batch, 1-frame run) centers in (0.5, 1.5) instead.
+    let x = Some(if n <= 1 { (0.5, 1.5) } else { (1.0, n as f64) });
+    let pad = pad_for(mn, mx);
+    (x, (mn - pad, mx + pad))
+}
+
+/// Fitted view bounds: optional x span (absent when dataless) plus y span.
+pub type FitBounds = (Option<(f64, f64)>, (f64, f64));
+
+/// Tab-follow while a run is live: switch to the metric currently being
+/// computed so its growing curve is visible; untouched otherwise (user
+/// picks freely when idle, and after the run the last tab stays put).
+pub fn follow_live_tab(
+    measuring: bool,
+    live: Option<MetricKind>,
+    current: MetricKind,
+) -> MetricKind {
+    if measuring {
+        live.unwrap_or(current)
+    } else {
+        current
     }
-    (Some((1.0, n as f64)), y_fit(&all, lo, hi))
+}
+
+/// Min-max decimation for drawing: buckets the points and keeps each
+/// bucket's min and max (in index order), so spikes survive while the
+/// tessellator sees ~`target` points instead of the full series. Returns
+/// a borrow when already small. Hover/fit keep using the full values —
+/// only the drawn line is thinned.
+pub fn decimate_minmax(
+    points: &[egui_plot::PlotPoint],
+    target: usize,
+) -> egui_plot::PlotPoints<'_> {
+    let target = target.max(4);
+    if points.len() <= target {
+        return egui_plot::PlotPoints::Borrowed(points);
+    }
+    let n = points.len();
+    let buckets = target / 2;
+    let mut out = Vec::with_capacity(target);
+    out.push(points[0]);
+    for b in 0..buckets {
+        let start = b * n / buckets;
+        let end = ((b + 1) * n / buckets).max(start + 1).min(n);
+        let (mut lo, mut hi) = (start, start);
+        for i in start + 1..end {
+            if points[i].y < points[lo].y {
+                lo = i;
+            }
+            if points[i].y > points[hi].y {
+                hi = i;
+            }
+        }
+        if lo < hi {
+            out.push(points[lo]);
+            out.push(points[hi]);
+        } else if hi < lo {
+            out.push(points[hi]);
+            out.push(points[lo]);
+        } else {
+            out.push(points[lo]);
+        }
+    }
+    if out.last() != Some(&points[n - 1]) {
+        out.push(points[n - 1]);
+    }
+    egui_plot::PlotPoints::Owned(out)
 }
 
 /// Max screen distance for a hover hit (Python `best[0] > 30` parity:
@@ -149,13 +209,28 @@ pub fn nearest_hover(
         _ => None,
     }
 }
+/// Union of two fitted ranges, per axis: bounds only ever grow. Used
+/// for live curves so axes don't jump inward as new points arrive. A
+/// side with no data (`None` x fit) contributes nothing, so an empty
+/// tab can't dilute a fitted one.
+pub fn union_bounds(a: FitBounds, b: FitBounds) -> FitBounds {
+    match (a.0, b.0) {
+        (Some((a0, a1)), Some((b0, b1))) => (
+            Some((a0.min(b0), a1.max(b1))),
+            ((a.1).0.min((b.1).0), (a.1).1.max((b.1).1)),
+        ),
+        (Some(_), None) => a,
+        (None, Some(_)) => b,
+        (None, None) => a,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn empty_keeps_metric_defaults() {
-        assert_eq!(y_fit(&[], PSNR_LO, PSNR_HI), (0.0, 100.0));
         assert_eq!(
             fit_limits(&[], PSNR_LO, PSNR_HI),
             (None, (PSNR_LO, PSNR_HI))
@@ -170,7 +245,8 @@ mod tests {
     #[test]
     fn span_gets_five_percent_pad() {
         // min 30, max 40, span 10 -> pad 0.5.
-        let (lo, hi) = y_fit(&[30.0, 40.0, 35.0], PSNR_LO, PSNR_HI);
+        let (x, (lo, hi)) = fit_limits(&[&[30.0, 40.0, 35.0]], PSNR_LO, PSNR_HI);
+        assert_eq!(x, Some((1.0, 3.0)));
         assert!((lo - 29.5).abs() < 1e-9);
         assert!((hi - 40.5).abs() < 1e-9);
     }
@@ -178,7 +254,8 @@ mod tests {
     #[test]
     fn flat_series_pads_by_magnitude() {
         // span 0, |40| * 2% = 0.8.
-        let (lo, hi) = y_fit(&[40.0, 40.0], PSNR_LO, PSNR_HI);
+        let (x, (lo, hi)) = fit_limits(&[&[40.0, 40.0]], PSNR_LO, PSNR_HI);
+        assert_eq!(x, Some((1.0, 2.0)));
         assert!((lo - 39.2).abs() < 1e-9);
         assert!((hi - 40.8).abs() < 1e-9);
     }
@@ -186,7 +263,9 @@ mod tests {
     #[test]
     fn flat_zero_series_pads_by_half() {
         // Python `0.0 or 0.5` fallback.
-        assert_eq!(y_fit(&[0.0, 0.0], PSNR_LO, PSNR_HI), (-0.5, 0.5));
+        let (x, (lo, hi)) = fit_limits(&[&[0.0, 0.0]], PSNR_LO, PSNR_HI);
+        assert_eq!(x, Some((1.0, 2.0)));
+        assert_eq!((lo, hi), (-0.5, 0.5));
     }
 
     #[test]
@@ -198,6 +277,15 @@ mod tests {
         // all values min 28, max 33, span 5 -> pad 0.25.
         assert!((lo - 27.75).abs() < 1e-9);
         assert!((hi - 33.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn single_point_centers_x_bounds() {
+        // egui_plot panics on degenerate min >= max bounds: the first live
+        // batch (or a 1-frame run) must still yield a strict span.
+        let (x, (lo, hi)) = fit_limits(&[&[42.0]], PSNR_LO, PSNR_HI);
+        assert_eq!(x, Some((0.5, 1.5)));
+        assert!(lo < hi);
     }
 
     /// Identity-ish screen map: 10 px per frame, 1 px per unit.
@@ -280,5 +368,73 @@ mod tests {
                 "CVVDP"
             ]
         );
+    }
+
+    #[test]
+    fn union_bounds_only_grows() {
+        let a = (Some((1.0, 10.0)), (20.0, 30.0));
+        let b = (Some((1.0, 20.0)), (25.0, 28.0));
+        // x max and y min expand; y max and x min hold.
+        assert_eq!(union_bounds(a, b), (Some((1.0, 20.0)), (20.0, 30.0)));
+        // Empty-vs-data either way keeps the data side whole.
+        assert_eq!(union_bounds((None, (0.0, 100.0)), a), a);
+        assert_eq!(union_bounds(a, (None, (0.0, 100.0))), a);
+    }
+
+    #[test]
+    fn follow_live_tab_switches_only_while_measuring() {
+        use crate::metrics::ffmpeg::MetricKind;
+        // Live job wins while measuring, even over another tab.
+        assert_eq!(
+            follow_live_tab(true, Some(MetricKind::Xpsnr), MetricKind::Psnr),
+            MetricKind::Xpsnr
+        );
+        // No live job yet: stays put.
+        assert_eq!(
+            follow_live_tab(true, None, MetricKind::Psnr),
+            MetricKind::Psnr
+        );
+        // Idle: user-driven, never switched.
+        assert_eq!(
+            follow_live_tab(false, Some(MetricKind::Xpsnr), MetricKind::Psnr),
+            MetricKind::Psnr
+        );
+    }
+
+    fn dec_pts(ys: &[f64]) -> Vec<egui_plot::PlotPoint> {
+        ys.iter()
+            .enumerate()
+            .map(|(i, &y)| egui_plot::PlotPoint::new(i as f64 + 1.0, y))
+            .collect()
+    }
+
+    fn ys(points: &egui_plot::PlotPoints) -> Vec<f64> {
+        points.points().iter().map(|p| p.y).collect()
+    }
+
+    #[test]
+    fn decimate_passes_through_small_series() {
+        let pts = dec_pts(&[1.0, 2.0, 3.0]);
+        assert_eq!(ys(&decimate_minmax(&pts, 512)), vec![1.0, 2.0, 3.0]);
+        assert!(decimate_minmax(&[], 512).points().is_empty());
+    }
+
+    #[test]
+    fn decimate_keeps_endpoints_and_spikes() {
+        // 1001 points with a spike and a dip: thinned to ~100.
+        let mut raw: Vec<f64> = (0..1001).map(|i| 40.0 + (i as f64 * 0.01).sin()).collect();
+        raw[500] = 90.0;
+        raw[700] = 10.0;
+        let pts = dec_pts(&raw);
+        let thin = decimate_minmax(&pts, 100);
+        let got = thin.points();
+        assert!(got.len() <= 104, "len {}", got.len());
+        // Endpoints preserved (line meets the axes where it should).
+        assert_eq!((got[0].x, got[got.len() - 1].x), (1.0, 1001.0));
+        // Envelope preserved: spike and dip survive decimation.
+        assert!(got.iter().any(|p| p.y == 90.0));
+        assert!(got.iter().any(|p| p.y == 10.0));
+        // Index order kept (valid line strip, no zigzag).
+        assert!(got.windows(2).all(|w| w[0].x <= w[1].x));
     }
 }

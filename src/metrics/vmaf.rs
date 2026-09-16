@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::metrics::ffmpeg::{
-    NORM, RunInputs, RunOutcome, pump_process, rate_args, setrange_segment, trim_window,
+    NORM, RunInputs, RunOutcome, ScaleMethod, pump_process, rate_args, scale_filter,
+    setrange_segment, trim_window,
 };
 use crate::probe::MediaInfo;
 
@@ -181,6 +182,7 @@ pub fn build_filter(
     models_dir: &Path,
     logname: &str,
     n_threads: u32,
+    scaler: ScaleMethod,
 ) -> Result<String, String> {
     let (mut model_opt, model_name) = resolve_model(&cfg.model, models_dir);
     if cfg.phone {
@@ -215,15 +217,15 @@ pub fn build_filter(
     if cfg.scale {
         let (mw, mh) = model_resolution(&model_name);
         if let Some((fw, fh)) = leg_model_scale(dist_info.width, dist_info.height, mw, mh) {
-            main_pre.push(format!("scale={fw}:{fh}:flags=bicubic"));
+            main_pre.push(scale_filter(fw, fh, scaler));
         }
         if let Some((fw, fh)) = leg_model_scale(ref_info.width, ref_info.height, mw, mh) {
-            ref_pre.push(format!("scale={fw}:{fh}:flags=bicubic"));
+            ref_pre.push(scale_filter(fw, fh, scaler));
         }
     } else if (dist_info.width, dist_info.height) != (ref_info.width, ref_info.height)
         && let (Some(w), Some(h)) = (ref_info.width, ref_info.height)
     {
-        main_pre.push(format!("scale={w}:{h}"));
+        main_pre.push(scale_filter(w, h, scaler));
     }
     // Colour-range legs differ: tag each side with its own range (conf
     // `scale,setrange,format` order); matching/unknown ranges emit nothing.
@@ -357,6 +359,7 @@ pub fn run_vmaf(job: &RunInputs, cfg: &VmafCfg, on_progress: &(dyn Fn(u64) + Syn
         dist_info,
         skip,
         clip_dur,
+        scaler,
         abort,
         child_slot,
         ..
@@ -386,6 +389,7 @@ pub fn run_vmaf(job: &RunInputs, cfg: &VmafCfg, on_progress: &(dyn Fn(u64) + Syn
         &models_dir,
         &logname,
         cfg.n_threads,
+        scaler,
     ) {
         Ok(f) => f,
         Err(e) => {
@@ -660,6 +664,7 @@ mod tests {
             &dir,
             "vmaf_log_1.json",
             8,
+            ScaleMethod::Bicubic,
         )
         .unwrap();
         assert_eq!(
@@ -684,7 +689,18 @@ mod tests {
             height: Some(2160),
             ..ref_info()
         };
-        let f = build_filter(&ref4k, &ref4k, None, None, &c, &dir, "v.json", 0).unwrap();
+        let f = build_filter(
+            &ref4k,
+            &ref4k,
+            None,
+            None,
+            &c,
+            &dir,
+            "v.json",
+            0,
+            ScaleMethod::Bicubic,
+        )
+        .unwrap();
         // Two backslashes before the colon (Python parity): the outer
         // filtergraph consumes one, libvmaf's model parser the other.
         // A single backslash would split `enable_transform` into an
@@ -701,7 +717,18 @@ mod tests {
         assert!(!f.contains("n_threads"));
         // Subsample clamps to >= 1.
         c.subsample = 0;
-        let f = build_filter(&ref_info(), &ref_info(), None, None, &c, &dir, "v.json", 4).unwrap();
+        let f = build_filter(
+            &ref_info(),
+            &ref_info(),
+            None,
+            None,
+            &c,
+            &dir,
+            "v.json",
+            4,
+            ScaleMethod::Bicubic,
+        )
+        .unwrap();
         assert!(f.contains(":n_subsample=1:n_threads=4:"));
     }
 
@@ -720,20 +747,64 @@ mod tests {
         };
         // Same height, narrower width: no scale (width alone never triggers).
         let small = at(1600, 1080);
-        let f = build_filter(&small, &small, None, None, &c, &dir, "v.json", 0).unwrap();
+        let f = build_filter(
+            &small,
+            &small,
+            None,
+            None,
+            &c,
+            &dir,
+            "v.json",
+            0,
+            ScaleMethod::Bicubic,
+        )
+        .unwrap();
         assert!(!f.contains("scale="), "must not upscale: {f}");
         assert!(f.contains("[0:v]settb=AVTB,setpts=PTS-STARTPTS[main]"));
         assert!(f.contains("[1:v]settb=AVTB,setpts=PTS-STARTPTS[ref]"));
         // Exact model resolution is a no-op too, never a scaler pass.
-        let f = build_filter(&ref_info(), &ref_info(), None, None, &c, &dir, "v.json", 0).unwrap();
+        let f = build_filter(
+            &ref_info(),
+            &ref_info(),
+            None,
+            None,
+            &c,
+            &dir,
+            "v.json",
+            0,
+            ScaleMethod::Bicubic,
+        )
+        .unwrap();
         assert!(!f.contains("scale="), "must not rescale in place: {f}");
         // 7.4% under: within threshold, no scale.
         let near = at(1920, 1000);
-        let f = build_filter(&near, &near, None, None, &c, &dir, "v.json", 0).unwrap();
+        let f = build_filter(
+            &near,
+            &near,
+            None,
+            None,
+            &c,
+            &dir,
+            "v.json",
+            0,
+            ScaleMethod::Bicubic,
+        )
+        .unwrap();
         assert!(!f.contains("scale="), "within threshold: {f}");
         // 33% under: upscale both legs to model native.
         let tiny = at(1280, 720);
-        let f = build_filter(&tiny, &tiny, None, None, &c, &dir, "v.json", 0).unwrap();
+        let f = build_filter(
+            &tiny,
+            &tiny,
+            None,
+            None,
+            &c,
+            &dir,
+            "v.json",
+            0,
+            ScaleMethod::Bicubic,
+        )
+        .unwrap();
         assert!(
             f.contains("[0:v]settb=AVTB,setpts=PTS-STARTPTS,scale=1920:1080:flags=bicubic[main]"),
             "{f}"
@@ -746,15 +817,48 @@ mod tests {
         // 1066x720 → 1599:1080, 1760x720 → 1920:785 (width 8.3% under
         // alone would not trigger; the 33% height gap does).
         let a = at(1066, 720);
-        let f = build_filter(&a, &a, None, None, &c, &dir, "v.json", 0).unwrap();
+        let f = build_filter(
+            &a,
+            &a,
+            None,
+            None,
+            &c,
+            &dir,
+            "v.json",
+            0,
+            ScaleMethod::Bicubic,
+        )
+        .unwrap();
         assert!(f.contains("scale=1599:1080:flags=bicubic"), "{f}");
         let b = at(1760, 720);
-        let f = build_filter(&b, &b, None, None, &c, &dir, "v.json", 0).unwrap();
+        let f = build_filter(
+            &b,
+            &b,
+            None,
+            None,
+            &c,
+            &dir,
+            "v.json",
+            0,
+            ScaleMethod::Bicubic,
+        )
+        .unwrap();
         assert!(f.contains("scale=1920:785:flags=bicubic"), "{f}");
         // Mixed aspects scale independently with no equalization (the
         // original emits this shape too; libvmaf then fails the pair).
         let wide = at(1600, 1080);
-        let f = build_filter(&wide, &a, None, None, &c, &dir, "v.json", 0).unwrap();
+        let f = build_filter(
+            &wide,
+            &a,
+            None,
+            None,
+            &c,
+            &dir,
+            "v.json",
+            0,
+            ScaleMethod::Bicubic,
+        )
+        .unwrap();
         assert!(
             f.contains("[0:v]settb=AVTB,setpts=PTS-STARTPTS,scale=1599:1080:flags=bicubic[main]"),
             "{f}"
@@ -772,11 +876,34 @@ mod tests {
         c.phone = true;
         c.model = "vmaf_v0.6.1neg.json".to_owned();
         assert_eq!(
-            build_filter(&ref_info(), &ref_info(), None, None, &c, &dir, "v.json", 0),
+            build_filter(
+                &ref_info(),
+                &ref_info(),
+                None,
+                None,
+                &c,
+                &dir,
+                "v.json",
+                0,
+                ScaleMethod::Bicubic
+            ),
             Err("Model 'vmaf_v0.6.1neg.json' has no Phone transform (use v0.6.1)".to_owned())
         );
         c.model = "vmaf_4k_v0.6.1.json".to_owned();
-        assert!(build_filter(&ref_info(), &ref_info(), None, None, &c, &dir, "v.json", 0).is_err());
+        assert!(
+            build_filter(
+                &ref_info(),
+                &ref_info(),
+                None,
+                None,
+                &c,
+                &dir,
+                "v.json",
+                0,
+                ScaleMethod::Bicubic
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -798,7 +925,17 @@ mod tests {
         ] {
             c.model = m.to_owned();
             assert_eq!(
-                build_filter(&ref_info(), &ref_info(), None, None, &c, &dir, "v.json", 0),
+                build_filter(
+                    &ref_info(),
+                    &ref_info(),
+                    None,
+                    None,
+                    &c,
+                    &dir,
+                    "v.json",
+                    0,
+                    ScaleMethod::Bicubic
+                ),
                 Err(format!(
                     "Model '{m}' has no Phone transform (v1 uses the separate 5d0h phone file)"
                 )),
@@ -821,10 +958,11 @@ mod tests {
             &dir,
             "v.json",
             0,
+            ScaleMethod::Bicubic,
         )
         .unwrap();
         assert!(f.contains(
-            "[0:v]trim=start=5:end=15,settb=AVTB,setpts=PTS-STARTPTS,scale=1920:1080[main]"
+            "[0:v]trim=start=5:end=15,settb=AVTB,setpts=PTS-STARTPTS,scale=1920:1080:flags=bicubic[main]"
         ));
         assert!(f.contains("[1:v]trim=start=5:end=15,settb=AVTB,setpts=PTS-STARTPTS[ref]"));
     }
@@ -890,7 +1028,18 @@ mod tests {
         dist.range_tag = Some("pc".to_owned());
         let mut rf = ref_info();
         rf.range_tag = Some("tv".to_owned());
-        let f = build_filter(&rf, &dist, None, None, &cfg(), &dir, "v.json", 0).unwrap();
+        let f = build_filter(
+            &rf,
+            &dist,
+            None,
+            None,
+            &cfg(),
+            &dir,
+            "v.json",
+            0,
+            ScaleMethod::Bicubic,
+        )
+        .unwrap();
         assert!(f.contains("[0:v]settb=AVTB,setpts=PTS-STARTPTS,setrange=range=pc[main]"));
         assert!(f.contains("[1:v]settb=AVTB,setpts=PTS-STARTPTS,setrange=range=tv[ref]"));
         // Same range: no segment (FFMetrics.log parity).
@@ -903,8 +1052,58 @@ mod tests {
             &dir,
             "v.json",
             0,
+            ScaleMethod::Bicubic,
         )
         .unwrap();
         assert!(!f.contains("setrange"));
+    }
+
+    #[test]
+    fn model_scale_legs_follow_scaler() {
+        let (_g, dir) = models_dir(&["vmaf_v0.6.1.json"]);
+        let mut c = cfg();
+        c.scale = true;
+        let tiny = MediaInfo {
+            width: Some(1280),
+            height: Some(720),
+            ..ref_info()
+        };
+        // Non-default method lands on both model-scale legs.
+        let f = build_filter(
+            &tiny,
+            &tiny,
+            None,
+            None,
+            &c,
+            &dir,
+            "v.json",
+            0,
+            ScaleMethod::Lanczos,
+        )
+        .unwrap();
+        assert!(
+            f.contains("[0:v]settb=AVTB,setpts=PTS-STARTPTS,scale=1920:1080:flags=lanczos[main]"),
+            "{f}"
+        );
+        assert!(
+            f.contains("[1:v]settb=AVTB,setpts=PTS-STARTPTS,scale=1920:1080:flags=lanczos[ref]"),
+            "{f}"
+        );
+        // FFmpeg default: flagless legs (today's exact strings).
+        let f = build_filter(
+            &tiny,
+            &tiny,
+            None,
+            None,
+            &c,
+            &dir,
+            "v.json",
+            0,
+            ScaleMethod::FfmpegDefault,
+        )
+        .unwrap();
+        assert!(f.contains("scale=1920:1080[main]"), "{f}");
+        assert!(f.contains("scale=1920:1080[ref]"), "{f}");
+        assert!(!f.contains("flags="), "{f}");
     }
 }
