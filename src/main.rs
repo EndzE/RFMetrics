@@ -2,6 +2,7 @@ mod app;
 mod binaries;
 mod logging;
 mod metrics;
+mod plot;
 mod preview;
 mod probe;
 mod state;

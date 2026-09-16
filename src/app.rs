@@ -331,6 +331,14 @@ pub struct RFMetricsApp {
     saved_snapshot: crate::state::AppState,
     /// Egui time of the first unsaved change (`None` = clean).
     pending_save_since: Option<f64>,
+    /// PSNR plot viewport open (Python `plot["win"]` parity: closing the
+    /// window withdraws it, Plot reopens it).
+    show_plot: bool,
+    /// Selected plot viewport tab (session-only, like the Python window).
+    plot_tab: MetricKind,
+    /// Last measured tab-strip box width, for centering the strip
+    /// (session-only; texts are static so it converges in one frame).
+    plot_tabs_w: f32,
 }
 
 impl Default for RFMetricsApp {
@@ -392,6 +400,9 @@ impl Default for RFMetricsApp {
             thumb_generation: 0,
             saved_snapshot: crate::state::AppState::default(),
             pending_save_since: None,
+            show_plot: false,
+            plot_tab: MetricKind::Psnr,
+            plot_tabs_w: 0.0,
         };
         // Hermetic tests: the developer's own state file must not leak
         // into assertions about defaults.
@@ -1263,6 +1274,160 @@ impl RFMetricsApp {
         }
         log::info!(target: "rfmetrics::app", "metric results cleared");
     }
+
+    /// Metric plots in their own OS window (Python `show_plot` parity,
+    /// all 7 tabs). Series are read live from `rows` every frame, so the
+    /// viewport needs no update plumbing: curves appear on Done data and
+    /// empty on Reset by themselves. Interaction stays on the stock
+    /// `egui_plot` binds (drag pan, box-zoom select, ctrl+scroll zoom,
+    /// double-click reset); the Python custom keybinds are out of scope.
+    fn show_plots(&mut self, ctx: &egui::Context) {
+        if !self.show_plot {
+            return;
+        }
+        let id = egui::ViewportId::from_hash_of("metrics_plot");
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Metrics")
+            .with_inner_size([1100.0, 700.0]);
+        ctx.show_viewport_immediate(id, builder, |vui, _class| {
+            // Window-manager close withdraws (Python `withdraw` parity);
+            // Plot reopens it.
+            if vui.input(|i| i.viewport().close_requested()) {
+                self.show_plot = false;
+            }
+            let kind = self.plot_tab;
+            let def = crate::plot::plot_def(kind);
+            let done: Vec<(&str, &[f64])> = self
+                .rows
+                .iter()
+                .filter_map(|r| match r.cell(kind) {
+                    crate::metrics::MetricCell::Done { values, .. }
+                        if !values.is_empty() =>
+                    {
+                        Some((r.display.as_str(), values.as_slice()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let borrowed: Vec<&[f64]> = done.iter().map(|(_, v)| *v).collect();
+            let (xlim, (ymin, ymax)) = crate::plot::fit_limits(&borrowed, def.lo, def.hi);
+            // Empty plot (no Done data): axes only, y on the metric
+            // default range; x falls back to a unit span.
+            let (xmin, xmax) = xlim.unwrap_or((0.0, 1.0));
+            // Help bar pinned to the bottom (Python `side="bottom"` parity).
+            egui::Panel::bottom("plot_help").show(vui, |ui| {
+                ui.add(
+                    egui::Label::new(
+                        "Drag: pan • Right-drag select: box zoom • Ctrl+scroll: zoom • Double-click: reset",
+                    )
+                    .selectable(false),
+                );
+            });
+            egui::CentralPanel::default().show(vui, |ui| {
+                // Tab strip (Python `CTkTabview` parity): all 7 tabs
+                // always visible; empty tabs show empty axes. Compact
+                // box hugging the buttons, centered via last frame's
+                // measured width: egui cannot center content of unknown
+                // width upfront (`with_layout`/`horizontal_centered`
+                // reserve the full remaining rect and starve the plot),
+                // but tab texts are static so one measured offset stays
+                // pixel-exact. First frame falls back to the left edge.
+                let pad = if self.plot_tabs_w <= 0.0 {
+                    0.0
+                } else {
+                    ((ui.available_width() - self.plot_tabs_w) / 2.0).max(0.0)
+                };
+                ui.horizontal(|ui| {
+                    if pad > 0.0 {
+                        ui.add_space(pad);
+                    }
+                    let frame_resp = egui::Frame::group(ui.style()).show(ui, |ui| {
+                        egui::Grid::new("plot_tabs").show(ui, |ui| {
+                            for tab in MetricKind::ALL {
+                                let title = crate::plot::tab_title(tab);
+                                let btn = egui::Button::new(title)
+                                    .selected(self.plot_tab == tab);
+                                if ui.add(btn).clicked() {
+                                    self.plot_tab = tab;
+                                }
+                            }
+                            ui.end_row();
+                        });
+                    });
+                    self.plot_tabs_w = frame_resp.response.rect.width();
+                });
+                // Per-tab plot id: zoom state persists per metric.
+                let plot_id =
+                    format!("plot-{}", crate::plot::tab_title(kind).to_lowercase());
+                let plot_resp = egui_plot::Plot::new(plot_id)
+                    .x_axis_label("Frames")
+                    .y_axis_label(def.label)
+                    .legend(
+                        egui_plot::Legend::default()
+                            .position(egui_plot::Corner::RightBottom),
+                    )
+                    .default_x_bounds(xmin, xmax)
+                    .default_y_bounds(ymin, ymax)
+                    .show(ui, |plot_ui| {
+                        for (name, values) in &done {
+                            let pts: Vec<[f64; 2]> = values
+                                .iter()
+                                .enumerate()
+                                .map(|(i, &v)| [(i + 1) as f64, v])
+                                .collect();
+                            plot_ui.line(egui_plot::Line::new(
+                                *name,
+                                egui_plot::PlotPoints::new(pts),
+                            ));
+                        }
+                        // Hover inspect (Python `_on_hover` parity):
+                        // nearest data point within 30 screen px gets a
+                        // crosshair; the `{name}\nFrame=N, Metric=V.4f`
+                        // text returns to the caller, which draws it as a
+                        // native tooltip (plot-canvas text is tiny and has
+                        // no background). Suppressed while
+                        // panning/zooming, like the ref.
+                        let hovering = plot_ui.response().hovered()
+                            && !plot_ui.response().dragged();
+                        let hover_pos = plot_ui.response().hover_pos();
+                        let ptr = plot_ui.pointer_coordinate();
+                        if let (true, Some(mouse), Some(p)) = (hovering, hover_pos, ptr) {
+                            let to_screen = |fx: f64, fy: f64| {
+                                let sp = plot_ui.screen_from_plot(
+                                    egui_plot::PlotPoint::new(fx, fy),
+                                );
+                                (sp.x, sp.y)
+                            };
+                            if let Some((si, frame, value)) = crate::plot::nearest_hover(
+                                &borrowed,
+                                p.x,
+                                to_screen,
+                                (mouse.x, mouse.y),
+                            ) {
+                                let fx = frame as f64;
+                                plot_ui.vline(egui_plot::VLine::new("", fx));
+                                plot_ui.hline(egui_plot::HLine::new("", value));
+                                return Some(format!(
+                                    "{}\nFrame={frame}, Metric={value:.4}",
+                                    done[si].0
+                                ));
+                            }
+                        }
+                        None
+                    });
+                // Native tooltip at the pointer: readable body text on a
+                // theme background (Python yellow annotation-box parity).
+                if let Some(text) = plot_resp.inner {
+                    egui::Tooltip::for_widget(&plot_resp.response)
+                        .at_pointer()
+                        .gap(12.0)
+                        .show(|ui| {
+                            ui.label(text);
+                        });
+                }
+            });
+        });
+    }
 }
 
 /// Kinds sharing an identical skip set merge into one toast line
@@ -1631,7 +1796,12 @@ impl eframe::App for RFMetricsApp {
                 {
                     self.reset_psnr();
                 }
-                let _ = ui.add_sized([90.0, 24.0], egui::Button::new("Plot"));
+                if ui
+                    .add_sized([90.0, 24.0], egui::Button::new("Plot"))
+                    .clicked()
+                {
+                    self.show_plot = true;
+                }
                 ui.label(&self.ffmpeg.short)
                     .on_hover_text(&self.ffmpeg.detail);
                 ui.add(egui::Label::new("|").selectable(false));
@@ -2062,6 +2232,9 @@ impl eframe::App for RFMetricsApp {
                 self.toast = None;
             }
         }
+
+        // Metric plot viewport (own OS window while `show_plot` holds).
+        self.show_plots(ui.ctx());
     }
 }
 
