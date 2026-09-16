@@ -174,6 +174,26 @@ pub fn decimate_minmax(
     egui_plot::PlotPoints::Owned(out)
 }
 
+/// Clamp a view range into hard limits (snap-to-data lock): the view
+/// keeps its span and is shifted inside; a wider-than-limits (or
+/// degenerate) view snaps exactly to the limits; degenerate limits
+/// disable clamping on that axis.
+pub fn clamp_range(view: (f64, f64), lim: (f64, f64)) -> (f64, f64) {
+    let (v0, v1) = view;
+    let (l0, l1) = lim;
+    // Degenerate (or NaN) limits: no clamping on this axis.
+    if l0.is_nan() || l1.is_nan() || l1 <= l0 {
+        return view;
+    }
+    let span = v1 - v0;
+    // Degenerate, NaN, or wider-than-limits view: snap exactly.
+    if v0.is_nan() || v1.is_nan() || span <= 0.0 || span >= l1 - l0 {
+        return lim;
+    }
+    let s0 = v0.clamp(l0, l1 - span);
+    (s0, s0 + span)
+}
+
 /// Max screen distance for a hover hit (Python `best[0] > 30` parity:
 /// anything farther hides the crosshair).
 pub const HOVER_MAX_PX: f32 = 30.0;
@@ -223,6 +243,157 @@ pub fn union_bounds(a: FitBounds, b: FitBounds) -> FitBounds {
         (None, Some(_)) => b,
         (None, None) => a,
     }
+}
+
+/// egui_plot line auto-color, same hue ladder as `PlotUi::auto_color`
+/// (`Hsva::new(i * (φ-1), …)`), but brightened for export contrast: the
+/// verbatim value (v=0.5) renders nearly invisible dark red on a dark
+/// canvas in stills.
+pub fn egui_auto_color(i: usize) -> plotters::style::RGBColor {
+    use std::f32::consts::GOLDEN_RATIO;
+    let h = (i as f32 * (GOLDEN_RATIO - 1.0)) % 1.0;
+    let (r, g, b) = hsv_to_rgb(h, 0.9, 0.85);
+    plotters::style::RGBColor(r, g, b)
+}
+
+/// `h` in [0, 1): standard HSV→RGB, full opacity.
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+    let c = v * s;
+    let x = c * (1.0 - ((h * 6.0) % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = match (h * 6.0) as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    (
+        ((r + m) * 255.0).round() as u8,
+        ((g + m) * 255.0).round() as u8,
+        ((b + m) * 255.0).round() as u8,
+    )
+}
+
+/// Indices of `values` (1-based frame x) overlapping `[x0, x1]`, widened
+/// by one point on each side so edge-crossing segments still render.
+/// Points outside would otherwise pile onto the plot-area edge (plotters
+/// clamps out-of-range coordinates), drawing the "waterfall" streaks.
+fn view_window(n: usize, x0: f64, x1: f64) -> (usize, usize) {
+    let mut start = 0usize;
+    while start < n && ((start + 1) as f64) < x0 {
+        start += 1;
+    }
+    let start = start.saturating_sub(1);
+    let mut end = start;
+    while end < n && ((end + 1) as f64) <= x1 {
+        end += 1;
+    }
+    (start, (end + 1).min(n))
+}
+
+/// Render the current tab to a PNG file in egui-plot style (dark canvas,
+/// white axes, same auto-colors and lower-right legend). `view` is the
+/// on-screen range (pan/zoom respected); degenerate spans fall back to a
+/// unit span instead of erroring. Empty series still produce axes.
+///
+/// Anti-aliasing: plotters' bitmap backend draws aliased strokes, so the
+/// chart renders at 2x and Lanczos-downscales (real supersampled edges).
+pub fn export_png(
+    path: &std::path::Path,
+    title: &str,
+    y_label: &str,
+    series: &[(&str, &[f64])],
+    view: ((f64, f64), (f64, f64)),
+    size: (u32, u32),
+) -> Result<(), String> {
+    use plotters::prelude::*;
+    let ((x0, x1), (y0, y1)) = view;
+    // Degenerate spans fall back instead of erroring (plotters requires
+    // strict ranges); a finite point expands around itself.
+    fn strict_span(v: (f64, f64)) -> (f64, f64) {
+        let (a, b) = v;
+        if !a.is_nan() && !b.is_nan() && b > a {
+            (a, b)
+        } else if a.is_finite() {
+            (a, a + 1.0)
+        } else {
+            (0.0, 1.0)
+        }
+    }
+    let (x0, x1) = strict_span((x0, x1));
+    let (y0, y1) = strict_span((y0, y1));
+    // Supersample 2x, then Lanczos-downscale (plotters draws aliased
+    // strokes): real anti-aliased edges like matplotlib's. All pixel
+    // sizes below are pre-scale.
+    const SSAA: u32 = 2;
+    let (bw, bh) = (size.0 * SSAA, size.1 * SSAA);
+    let mut buf = vec![0u8; (bw * bh * 3) as usize];
+    {
+        let root = BitMapBackend::with_buffer(&mut buf, (bw, bh)).into_drawing_area();
+        root.fill(&RGBColor(20, 20, 20))
+            .map_err(|e| e.to_string())?;
+        let mut chart = ChartBuilder::on(&root)
+            .caption(title, ("sans-serif", 40 * SSAA).into_font().color(&WHITE))
+            .margin(12 * SSAA)
+            .x_label_area_size(48 * SSAA)
+            .y_label_area_size(100 * SSAA)
+            .build_cartesian_2d(x0..x1, y0..y1)
+            .map_err(|e| e.to_string())?;
+        chart
+            .configure_mesh()
+            .x_desc("Frames")
+            .y_desc(y_label)
+            .x_labels(16)
+            .y_labels(8)
+            .axis_style(WHITE)
+            .label_style(("sans-serif", 24 * SSAA).into_font().color(&WHITE))
+            .light_line_style(RGBColor(42, 42, 42))
+            .draw()
+            .map_err(|e| e.to_string())?;
+        for (i, (name, values)) in series.iter().enumerate() {
+            let color = egui_auto_color(i);
+            // Draw only the visible window (±1 point for clean edge
+            // crossings): out-of-range points pile onto the plot-area edge.
+            let (lo, hi) = view_window(values.len(), x0, x1);
+            let slice = &values[lo..hi];
+            // Thin to ~1 point per pixel like the live view: a dense spiky
+            // series at full resolution overpaints every column into a
+            // solid band. Hover/fit are unaffected.
+            let pts: Vec<egui_plot::PlotPoint> = slice
+                .iter()
+                .enumerate()
+                .map(|(j, &v)| egui_plot::PlotPoint::new(lo as f64 + j as f64 + 1.0, v))
+                .collect();
+            let thin = decimate_minmax(&pts, size.0 as usize);
+            chart
+                .draw_series(LineSeries::new(
+                    thin.points().iter().map(|p| (p.x, p.y)),
+                    color.stroke_width(2 * SSAA),
+                ))
+                .map_err(|e| e.to_string())?
+                .label(*name)
+                .legend(move |(x, y)| {
+                    PathElement::new(vec![(x, y), (x + 30 * SSAA as i32, y)], color)
+                });
+        }
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::LowerRight)
+            .background_style(RGBColor(30, 30, 30).mix(0.85))
+            .border_style(WHITE)
+            .label_font(("sans-serif", 24 * SSAA).into_font().color(&WHITE))
+            .draw()
+            .map_err(|e| e.to_string())?;
+        root.present().map_err(|e| e.to_string())?;
+    }
+    let img = image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(bw, bh, buf)
+        .ok_or_else(|| "supersample buffer mismatch".to_owned())?;
+    let small =
+        image::imageops::resize(&img, size.0, size.1, image::imageops::FilterType::Lanczos3);
+    small.save(path).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -436,5 +607,215 @@ mod tests {
         assert!(got.iter().any(|p| p.y == 10.0));
         // Index order kept (valid line strip, no zigzag).
         assert!(got.windows(2).all(|w| w[0].x <= w[1].x));
+    }
+
+    #[test]
+    fn clamp_range_keeps_span_inside_limits() {
+        // Inside: untouched. Past either edge: shifted, span kept.
+        assert_eq!(clamp_range((2.0, 5.0), (1.0, 10.0)), (2.0, 5.0));
+        assert_eq!(clamp_range((-3.0, 2.0), (1.0, 10.0)), (1.0, 6.0));
+        assert_eq!(clamp_range((8.0, 15.0), (1.0, 10.0)), (3.0, 10.0));
+        // Wider than limits (zoomed out): snap exactly to limits.
+        assert_eq!(clamp_range((0.0, 100.0), (1.0, 10.0)), (1.0, 10.0));
+        // Degenerate view or limits: snap / disable respectively.
+        assert_eq!(clamp_range((5.0, 5.0), (1.0, 10.0)), (1.0, 10.0));
+        assert_eq!(clamp_range((2.0, 5.0), (7.0, 7.0)), (2.0, 5.0));
+    }
+
+    #[test]
+    fn auto_colors_follow_egui_hue_ladder() {
+        use plotters::style::RGBColor;
+        // i=0: hue 0 (red); i=1: hue φ-1 ≈ 0.618 (blue). Brightened for
+        // export contrast, hue order kept.
+        assert_eq!(egui_auto_color(0), RGBColor(217, 22, 22));
+        let RGBColor(r1, g1, b1) = egui_auto_color(1);
+        assert!(b1 > r1 && b1 > g1, "second curve is blue-ish");
+        // Deterministic per index.
+        assert_eq!(egui_auto_color(3), egui_auto_color(3));
+        assert_ne!(egui_auto_color(0), egui_auto_color(1));
+    }
+
+    fn png_bytes(path: &std::path::Path) -> Vec<u8> {
+        let bytes = std::fs::read(path).unwrap();
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "PNG magic");
+        assert!(bytes.len() > 1024, "non-trivial image");
+        bytes
+    }
+
+    #[test]
+    fn export_png_writes_valid_image() {
+        let dir = std::env::temp_dir().join(format!("rfmetrics-png-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("PSNR.png");
+        let a = [46.0, 48.5, 47.0, 49.0];
+        let b = [44.0, 45.0, 46.5, 45.5];
+        export_png(
+            &path,
+            "PSNR",
+            "PSNR (higher is better, min 0, max 100)",
+            &[("a.mkv", &a[..]), ("b.mkv", &b[..])],
+            ((1.0, 4.0), (44.0, 49.0)),
+            (400, 300),
+        )
+        .unwrap();
+        png_bytes(&path);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn export_png_tolerates_empty_and_degenerate() {
+        let dir = std::env::temp_dir().join(format!("rfmetrics-png-edge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // No series: axes only. Degenerate view: sanitized, no panic.
+        let empty: &[(&str, &[f64])] = &[];
+        export_png(
+            &dir.join("empty.png"),
+            "SSIM",
+            "SSIM",
+            empty,
+            ((0.0, 1.0), (0.0, 1.0)),
+            (400, 300),
+        )
+        .unwrap();
+        let one = [0.9];
+        export_png(
+            &dir.join("one.png"),
+            "SSIM",
+            "SSIM",
+            &[("a.mkv", &one[..])],
+            ((1.0, 1.0), (0.9, 0.9)),
+            (400, 300),
+        )
+        .unwrap();
+        png_bytes(&dir.join("empty.png"));
+        png_bytes(&dir.join("one.png"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn view_window_widens_by_one_point() {
+        // (start, end) as slice bounds over 1-based frame x.
+        assert_eq!(view_window(10, 1.0, 10.0), (0, 10)); // full range
+        assert_eq!(view_window(10, 3.0, 5.0), (1, 6)); // ±1 margin
+        assert_eq!(view_window(10, 9.0, 20.0), (7, 10)); // past the end
+        assert_eq!(view_window(10, -5.0, 2.0), (0, 3)); // before the start
+        assert_eq!(view_window(0, 1.0, 5.0), (0, 0)); // empty
+        assert_eq!(view_window(1, 5.0, 6.0), (0, 1)); // single point
+    }
+
+    #[test]
+    fn export_aa_blends_line_edges() {
+        let dir = std::env::temp_dir().join(format!("rfmetrics-png-aa-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Diagonal-heavy series: long slanted segments show AA blends.
+        let vals: Vec<f64> = (0..500).map(|i| 45.0 + i as f64 * 0.008).collect();
+        let path = dir.join("aa.png");
+        export_png(
+            &path,
+            "PSNR",
+            "PSNR",
+            &[("a.mkv", &vals[..])],
+            ((1.0, 500.0), (44.0, 50.0)),
+            (800, 400),
+        )
+        .unwrap();
+        let img = image::open(&path).unwrap().to_rgb8();
+        let (w, h) = img.dimensions();
+        // Mid-tone reds: neither bg (20s), grid (42s), line core (217,22,22)
+        // nor white text — only anti-aliased edge blends land here.
+        let mut blends = 0u64;
+        for x in 100..w - 40 {
+            for y in 40..h - 40 {
+                let p = &img[(x, y)];
+                if (60..190).contains(&p[0]) && p[1] < 60 && p[2] < 60 {
+                    blends += 1;
+                }
+            }
+        }
+        assert!(blends > 300, "supersampled edges expected");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fullrange_export_stays_readable_when_dense() {
+        let dir = std::env::temp_dir().join(format!("rfmetrics-png-blob-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Dense spiky full-range series like a zoomed-out PSNR run.
+        let n = 5550usize;
+        let vals: Vec<f64> = (0..n)
+            .map(|i| 47.0 + ((i as f64 * 0.13).sin() * 1.8 + (i % 29) as f64 * 0.03))
+            .collect();
+        let path = dir.join("full.png");
+        export_png(
+            &path,
+            "PSNR",
+            "PSNR",
+            &[("a.mkv", &vals[..])],
+            ((1.0, n as f64), (44.0, 51.0)),
+            (1600, 400),
+        )
+        .unwrap();
+        let img = image::open(&path).unwrap().to_rgb8();
+        let (w, h) = img.dimensions();
+        let is_red = |p: &image::Rgb<u8>| p[0] > 150 && p[1] < 80 && p[2] < 80;
+        // Interior plot columns only (skip y-label gutter + legend corner).
+        let mut red = 0u64;
+        let mut tot = 0u64;
+        for x in 150..w - 60 {
+            for y in 60..h - 60 {
+                tot += 1;
+                if is_red(&img[(x, y)]) {
+                    red += 1;
+                }
+            }
+        }
+        let frac = red as f64 / tot as f64;
+        // Thinned width-2 strokes stay readable; full-res width-3 hit ~0.28.
+        assert!(frac < 0.25, "dense full-range export overpaints: {frac:.3}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn zoomed_export_has_no_edge_waterfalls() {
+        let dir = std::env::temp_dir().join(format!("rfmetrics-png-zoom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Spiky series like PSNR, zoomed into the middle third: out-of-view
+        // points must not pile onto the plot-area edges.
+        let n = 2000usize;
+        let vals: Vec<f64> = (0..n)
+            .map(|i| 47.0 + ((i as f64 * 0.11).sin() * 1.5 + (i % 37) as f64 * 0.02))
+            .collect();
+        let path = dir.join("zoom.png");
+        export_png(
+            &path,
+            "PSNR",
+            "PSNR",
+            &[("a.mkv", &vals[..])],
+            ((700.0, 1300.0), (44.0, 51.0)),
+            (800, 400),
+        )
+        .unwrap();
+        let img = image::open(&path).unwrap().to_rgb8();
+        let (w, h) = img.dimensions();
+        let is_red = |p: &image::Rgb<u8>| p[0] > 150 && p[1] < 80 && p[2] < 80;
+        let mut max_col = 0u32;
+        let mut mid = 0u32;
+        for x in 0..w {
+            let mut c = 0u32;
+            for y in 0..h {
+                if is_red(&img[(x, y)]) {
+                    c += 1;
+                }
+            }
+            max_col = max_col.max(c);
+            if (w / 2..w / 2 + 30).contains(&x) {
+                mid += c;
+            }
+        }
+        // Curve is really drawn, but no column carries a streak (the bug
+        // stacked ~100+ red px on the edge columns).
+        assert!(mid > 100, "curve drawn, mid30={mid}");
+        assert!(max_col <= 80, "no waterfall column, max={max_col}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

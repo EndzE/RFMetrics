@@ -1,11 +1,10 @@
+use crate::metrics::ffmpeg::MetricKind;
+use crate::metrics::ffmpeg::ScaleMethod;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
-
-use crate::metrics::ffmpeg::MetricKind;
-use crate::metrics::ffmpeg::ScaleMethod;
 
 #[derive(Debug)]
 struct QueueRow {
@@ -352,6 +351,9 @@ pub struct RFMetricsApp {
     saved_snapshot: crate::state::AppState,
     /// Egui time of the first unsaved change (`None` = clean).
     pending_save_since: Option<f64>,
+    /// Metric kind of the currently executing job (last kind seen on the
+    /// Progress/Series feed); drives plot tab-follow while measuring.
+    live_kind: Option<MetricKind>,
     /// PSNR plot viewport open (Python `plot["win"]` parity: closing the
     /// window withdraws it, Plot reopens it).
     show_plot: bool,
@@ -366,9 +368,13 @@ pub struct RFMetricsApp {
     /// Follow poke still owed: set when a live phase starts without plot
     /// memory present (window just opened), retried until it lands.
     plot_follow_pending: bool,
-    /// Metric kind of the currently executing job (last kind seen on the
-    /// Progress/Series feed); drives plot tab-follow while measuring.
-    live_kind: Option<MetricKind>,
+    /// Snap-to-data lock (plot window checkbox, session-only): panning is
+    /// clamped to the first/last frame on x and the plotted min/max on y;
+    /// zooming and in-limits panning stay free.
+    plot_snap: bool,
+    /// Pending PNG export filename (`{Metric}.png` at click time),
+    /// executed in the central panel where the plot id scope lives.
+    plot_save_pending: Option<String>,
 }
 
 impl Default for RFMetricsApp {
@@ -432,12 +438,14 @@ impl Default for RFMetricsApp {
             thumb_generation: 0,
             saved_snapshot: crate::state::AppState::default(),
             pending_save_since: None,
+            live_kind: None,
             show_plot: false,
             plot_tab: MetricKind::Psnr,
             plot_tabs_w: 0.0,
             plot_live_fit: None,
             plot_follow_pending: false,
-            live_kind: None,
+            plot_snap: false,
+            plot_save_pending: None,
         };
         // Hermetic tests: the developer's own state file must not leak
         // into assertions about defaults.
@@ -1522,12 +1530,30 @@ impl RFMetricsApp {
             let (xmin, xmax) = xlim.unwrap_or((0.0, 1.0));
             // Help bar pinned to the bottom (Python `side="bottom"` parity).
             egui::Panel::bottom("plot_help").show(vui, |ui| {
-                ui.add(
-                    egui::Label::new(
-                        "Drag: pan • Right-drag select: box zoom • Ctrl+scroll: zoom • Double-click: reset",
-                    )
-                    .selectable(false),
-                );
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Label::new(
+                            "Drag: pan • Right-drag select: box zoom • Ctrl+scroll: zoom • Double-click: reset",
+                        )
+                        .selectable(false),
+                    );
+                    ui.checkbox(&mut self.plot_snap, "Snap to data").on_hover_text(
+                        "Lock panning to the first/last frame and the plotted min/max; zoom and pan inside freely",
+                    );
+                    if ui
+                        .button("Save PNG")
+                        .on_hover_text("Save the current view as a PNG file (legend and axes included)")
+                        .clicked()
+                    {
+                        // Filename captured now; the export itself runs in
+                        // the central panel below, where the plot id scope
+                        // (for the current view bounds) lives.
+                        self.plot_save_pending = Some(format!(
+                            "{}.png",
+                            crate::plot::tab_title(self.plot_tab)
+                        ));
+                    }
+                });
             });
             egui::CentralPanel::default().show(vui, |ui| {
                 // FPS HUD (egui demo pattern): smoothed frame rate
@@ -1548,6 +1574,8 @@ impl RFMetricsApp {
                     .order(egui::Order::Foreground)
                     .show(ui.ctx(), |ui| {
                         egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            // Single-line HUD: never wrap the counter.
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                             ui.label(format!("FPS: {fps:.0}"));
                         });
                     });
@@ -1572,8 +1600,8 @@ impl RFMetricsApp {
                         egui::Grid::new("plot_tabs").show(ui, |ui| {
                             for tab in MetricKind::ALL {
                                 let title = crate::plot::tab_title(tab);
-                                let btn = egui::Button::new(title)
-                                    .selected(self.plot_tab == tab);
+                                let btn =
+                                    egui::Button::new(title).selected(self.plot_tab == tab);
                                 if ui.add(btn).clicked() {
                                     self.plot_tab = tab;
                                 }
@@ -1608,9 +1636,95 @@ impl RFMetricsApp {
                         self.plot_follow_pending = true;
                     }
                 }
+                // Snap-to-data lock: clamp the stored view into the data
+                // extent ([1, N] frames, fit min/max) before show, so the
+                // user cannot pan past the first/last frame or leave the
+                // plotted min/max — zooming and in-limits panning stay
+                // free. Done on the stored bounds (not via
+                // `set_plot_bounds`) so auto-follow keeps working.
+                if self.plot_snap && !borrowed.is_empty() {
+                    let n = borrowed.iter().map(|s| s.len()).max().unwrap_or(0);
+                    let pid = ui.make_persistent_id(egui::Id::new(plot_id.clone()));
+                    if let Some(mut mem) = egui_plot::PlotMemory::load(ui.ctx(), pid) {
+                        let b = mem.bounds();
+                        let (cx0, cx1) = if n >= 2 {
+                            crate::plot::clamp_range((b.min()[0], b.max()[0]), (1.0, n as f64))
+                        } else {
+                            (b.min()[0], b.max()[0])
+                        };
+                        let (cy0, cy1) = crate::plot::clamp_range(
+                            (b.min()[1], b.max()[1]),
+                            (ymin, ymax),
+                        );
+                        mem.set_bounds(egui_plot::PlotBounds::from_min_max(
+                            [cx0, cy0],
+                            [cx1, cy1],
+                        ));
+                        mem.store(ui.ctx(), pid);
+                    }
+                }
                 // Draw budget: ~2 points per horizontal pixel (the y-axis
                 // gutter makes this a slight over-estimate, harmless).
                 let target = (ui.available_width() as usize * 2).clamp(512, 8192);
+                // Pending PNG export (Save PNG button): render the CURRENT
+                // view (stored bounds when strict, else the fit) with
+                // legend and axis labels. Crosshair/tooltip never enter:
+                // this is a fresh render, not a screenshot.
+                if let Some(name) = self.plot_save_pending.take() {
+                    let pid = ui.make_persistent_id(egui::Id::new(plot_id.clone()));
+                    let ((vx0, vx1), (vy0, vy1)) =
+                        match egui_plot::PlotMemory::load(ui.ctx(), pid) {
+                            Some(mem) => {
+                                let b = mem.bounds();
+                                let (a0, a1) = (b.min()[0], b.max()[0]);
+                                let (c0, c1) = (b.min()[1], b.max()[1]);
+                                (
+                                    if a1 > a0 { (a0, a1) } else { (xmin, xmax) },
+                                    if c1 > c0 { (c0, c1) } else { (ymin, ymax) },
+                                )
+                            }
+                            None => ((xmin, xmax), (ymin, ymax)),
+                        };
+                    let series: Vec<(&str, &[f64])> =
+                        done.iter().map(|(n, v, _)| (*n, *v)).collect();
+                    let now = ui.input(|i| i.time);
+                    // Picker cancelled: silent no-op.
+                    if let Some(mut path) = rfd::FileDialog::new()
+                        .set_title("Save plot as PNG")
+                        .set_file_name(&name)
+                        .add_filter("PNG image", &["png"])
+                        .save_file()
+                    {
+                        path.set_extension("png");
+                        match crate::plot::export_png(
+                            &path,
+                            crate::plot::tab_title(kind),
+                            def.label,
+                            &series,
+                            ((vx0, vx1), (vy0, vy1)),
+                            (3200, 800),
+                        ) {
+                            Ok(()) => {
+                                log::info!(target: "rfmetrics::plot", "plot saved to {}", path.display());
+                                // Direct field write (not `self.toast()`):
+                                // `done` still borrows rows here.
+                                self.toast = Some(Toast {
+                                    text: format!("Plot saved to {}", path.display()),
+                                    until: now + TOAST_SECS,
+                                    kind: ToastKind::Info,
+                                });
+                            }
+                            Err(e) => {
+                                log::warn!(target: "rfmetrics::plot", "plot save failed: {e}");
+                                self.toast = Some(Toast {
+                                    text: format!("Could not save plot: {e}"),
+                                    until: now + TOAST_SECS,
+                                    kind: ToastKind::Error,
+                                });
+                            }
+                        }
+                    }
+                }
                 let plot_resp = egui_plot::Plot::new(plot_id)
                     .x_axis_label("Frames")
                     .y_axis_label(def.label)
@@ -1677,7 +1791,6 @@ impl RFMetricsApp {
         });
     }
 }
-
 /// Kinds sharing an identical skip set merge into one toast line
 /// ("Skipped 2 with existing PSNR, SSIM: a, b") so filenames print once
 /// instead of repeating per metric. First-seen kind order is kept.
@@ -2535,7 +2648,7 @@ impl eframe::App for RFMetricsApp {
             }
         }
 
-        // Metric plot viewport (own OS window while `show_plot` holds).
+        // Metric plot viewport (own OS window while open).
         self.show_plots(ui.ctx());
     }
 }
