@@ -241,6 +241,26 @@ struct ThumbMsg {
     image: Option<egui::ColorImage>,
 }
 
+/// PNG export result from the one-shot saver thread. The supersampled
+/// render + Lanczos3 downscale blocks for seconds, so it never runs on the
+/// UI thread; the worker sends the outcome back here for a toast. Copy jobs
+/// send pixels back because `ctx.copy_image()` must run on the UI thread
+/// (winit executes it as a frame-end `OutputCommand`).
+enum PngSaveMsg {
+    Saved { path: std::path::PathBuf },
+    CopyReady { w: u32, h: u32, rgba: Vec<u8> },
+    SaveFailed { err: String },
+    CopyFailed { err: String },
+}
+
+/// Pending plot export: file save (filename captured at click time) or
+/// clipboard copy. Executed in the central panel where the plot id scope
+/// (for the current view bounds) lives.
+enum PlotExport {
+    Save { name: String },
+    Copy,
+}
+
 /// Progress + results from the single sequential metric worker (Python
 /// `_worker` parity: one thread, checked metrics in order, never on the UI
 /// thread). `generation` drops late messages after a Reset starts a new run.
@@ -308,6 +328,8 @@ pub struct RFMetricsApp {
     scale_method: ScaleMethod,
     /// Open the plot viewport when a run starts (Options checkbox).
     plot_at_start: bool,
+    /// Save PNG / Copy image size preset (Options combobox).
+    plot_size: crate::plot::PlotSize,
     rows: Vec<QueueRow>,
     ffmpeg: crate::binaries::BinaryInfo,
     ffvship: crate::binaries::BinaryInfo,
@@ -372,9 +394,14 @@ pub struct RFMetricsApp {
     /// clamped to the first/last frame on x and the plotted min/max on y;
     /// zooming and in-limits panning stay free.
     plot_snap: bool,
-    /// Pending PNG export filename (`{Metric}.png` at click time),
-    /// executed in the central panel where the plot id scope lives.
-    plot_save_pending: Option<String>,
+    /// Pending plot export (Save PNG / Copy button), executed in the
+    /// central panel where the plot id scope lives.
+    plot_save_pending: Option<PlotExport>,
+    /// Plot export worker channel + busy flag: while `png_saving` both the
+    /// Save PNG and Copy buttons are disabled so 5 s renders can't overlap.
+    png_tx: Sender<PngSaveMsg>,
+    png_rx: Receiver<PngSaveMsg>,
+    png_saving: bool,
 }
 
 impl Default for RFMetricsApp {
@@ -385,6 +412,7 @@ impl Default for RFMetricsApp {
         let (probe_tx, probe_rx) = std::sync::mpsc::channel();
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
         let (metric_tx, metric_rx) = std::sync::mpsc::channel();
+        let (png_tx, png_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             ref_path: String::new(),
             duration: String::new(),
@@ -407,6 +435,7 @@ impl Default for RFMetricsApp {
             ),
             scale_method: ScaleMethod::default(),
             plot_at_start: false,
+            plot_size: crate::plot::PlotSize::default(),
             rows: Vec::new(),
             ffmpeg,
             ffvship,
@@ -446,6 +475,9 @@ impl Default for RFMetricsApp {
             plot_follow_pending: false,
             plot_snap: false,
             plot_save_pending: None,
+            png_tx,
+            png_rx,
+            png_saving: false,
         };
         // Hermetic tests: the developer's own state file must not leak
         // into assertions about defaults.
@@ -873,6 +905,38 @@ impl RFMetricsApp {
         }
     }
 
+    /// Apply plot export thread results; clears the Saving…/Copying…
+    /// lock so the buttons re-arm. Copy pixels land here because
+    /// `ctx.copy_image()` must run on the UI thread. Runs on the main
+    /// viewport each frame.
+    fn drain_png_results(&mut self, ctx: &egui::Context, now: f64) {
+        while let Ok(msg) = self.png_rx.try_recv() {
+            self.png_saving = false;
+            match msg {
+                PngSaveMsg::Saved { path } => {
+                    self.toast(
+                        now,
+                        format!("Plot saved to {}", path.display()),
+                        ToastKind::Info,
+                    );
+                }
+                PngSaveMsg::CopyReady { w, h, rgba } => {
+                    ctx.copy_image(egui::ColorImage::from_rgba_unmultiplied(
+                        [w as usize, h as usize],
+                        &rgba,
+                    ));
+                    self.toast(now, "Plot copied to clipboard".to_owned(), ToastKind::Info);
+                }
+                PngSaveMsg::SaveFailed { err } => {
+                    self.toast(now, format!("Could not save plot: {err}"), ToastKind::Error);
+                }
+                PngSaveMsg::CopyFailed { err } => {
+                    self.toast(now, format!("Could not copy plot: {err}"), ToastKind::Error);
+                }
+            }
+        }
+    }
+
     fn toast(&mut self, now: f64, text: String, kind: ToastKind) {
         match kind {
             ToastKind::Info => log::info!(target: "rfmetrics::app", "toast info: {text}"),
@@ -930,6 +994,7 @@ impl RFMetricsApp {
             options: crate::state::OptionsState {
                 scaling: Some(self.scale_method.label().to_owned()),
                 plot_at_start: Some(self.plot_at_start),
+                plot_size: Some(self.plot_size.label().to_owned()),
             },
         }
     }
@@ -1018,6 +1083,11 @@ impl RFMetricsApp {
         }
         if let Some(plot_at_start) = s.options.plot_at_start {
             self.plot_at_start = plot_at_start;
+        }
+        if let Some(plot_size) = s.options.plot_size
+            && let Some(m) = crate::plot::PlotSize::from_label(&plot_size)
+        {
+            self.plot_size = m;
         }
     }
 
@@ -1540,18 +1610,34 @@ impl RFMetricsApp {
                     ui.checkbox(&mut self.plot_snap, "Snap to data").on_hover_text(
                         "Lock panning to the first/last frame and the plotted min/max; zoom and pan inside freely",
                     );
-                    if ui
-                        .button("Save PNG")
-                        .on_hover_text("Save the current view as a PNG file (legend and axes included)")
-                        .clicked()
-                    {
+                    let save_label = if self.png_saving { "Saving…" } else { "Save PNG" };
+                    let save_hover = if self.png_saving {
+                        "Writing PNG in the background…"
+                    } else {
+                        "Save the current view as a PNG file (legend and axes included)"
+                    };
+                    let save_btn = ui
+                        .add_enabled(!self.png_saving, egui::Button::new(save_label))
+                        .on_hover_text(save_hover);
+                    if save_btn.clicked() && !self.png_saving {
                         // Filename captured now; the export itself runs in
                         // the central panel below, where the plot id scope
                         // (for the current view bounds) lives.
-                        self.plot_save_pending = Some(format!(
-                            "{}.png",
-                            crate::plot::tab_title(self.plot_tab)
-                        ));
+                        self.plot_save_pending = Some(PlotExport::Save {
+                            name: format!("{}.png", crate::plot::tab_title(self.plot_tab)),
+                        });
+                    }
+                    let copy_label = if self.png_saving { "Copying…" } else { "Copy" };
+                    let copy_hover = if self.png_saving {
+                        "Rendering plot in the background…"
+                    } else {
+                        "Copy the current view as an image to the clipboard (legend and axes included)"
+                    };
+                    let copy_btn = ui
+                        .add_enabled(!self.png_saving, egui::Button::new(copy_label))
+                        .on_hover_text(copy_hover);
+                    if copy_btn.clicked() && !self.png_saving {
+                        self.plot_save_pending = Some(PlotExport::Copy);
                     }
                 });
             });
@@ -1666,60 +1752,107 @@ impl RFMetricsApp {
                 // Draw budget: ~2 points per horizontal pixel (the y-axis
                 // gutter makes this a slight over-estimate, harmless).
                 let target = (ui.available_width() as usize * 2).clamp(512, 8192);
-                // Pending PNG export (Save PNG button): render the CURRENT
-                // view (stored bounds when strict, else the fit) with
-                // legend and axis labels. Crosshair/tooltip never enter:
-                // this is a fresh render, not a screenshot.
-                if let Some(name) = self.plot_save_pending.take() {
-                    let pid = ui.make_persistent_id(egui::Id::new(plot_id.clone()));
-                    let ((vx0, vx1), (vy0, vy1)) =
-                        match egui_plot::PlotMemory::load(ui.ctx(), pid) {
-                            Some(mem) => {
-                                let b = mem.bounds();
-                                let (a0, a1) = (b.min()[0], b.max()[0]);
-                                let (c0, c1) = (b.min()[1], b.max()[1]);
-                                (
-                                    if a1 > a0 { (a0, a1) } else { (xmin, xmax) },
-                                    if c1 > c0 { (c0, c1) } else { (ymin, ymax) },
-                                )
+                // Pending plot export (Save PNG / Copy button): snapshot
+                // the CURRENT view (stored bounds when strict, else the
+                // fit) plus owned series data, then render on a one-shot
+                // worker thread. Crosshair/tooltip never enter: this is a
+                // fresh render, not a screenshot. Direct field writes below
+                // (not `self.toast()`): `done` still borrows rows here.
+                if let Some(job) = self.plot_save_pending.take() {
+                    // Re-entrant click while an export is in flight: drop
+                    // it (both buttons are disabled, so this is a guard).
+                    if !self.png_saving {
+                        let pid = ui.make_persistent_id(egui::Id::new(plot_id.clone()));
+                        let ((vx0, vx1), (vy0, vy1)) =
+                            match egui_plot::PlotMemory::load(ui.ctx(), pid) {
+                                Some(mem) => {
+                                    let b = mem.bounds();
+                                    let (a0, a1) = (b.min()[0], b.max()[0]);
+                                    let (c0, c1) = (b.min()[1], b.max()[1]);
+                                    (
+                                        if a1 > a0 { (a0, a1) } else { (xmin, xmax) },
+                                        if c1 > c0 { (c0, c1) } else { (ymin, ymax) },
+                                    )
+                                }
+                                None => ((xmin, xmax), (ymin, ymax)),
+                            };
+                        // Owned snapshot: the worker outlives this frame and
+                        // cannot borrow `done`/`self.rows`.
+                        let owned: Vec<(String, Vec<f64>)> = done
+                            .iter()
+                            .map(|(n, v, _)| ((*n).to_owned(), (*v).to_vec()))
+                            .collect();
+                        let title = crate::plot::tab_title(kind).to_owned();
+                        let y_label = def.label.to_owned();
+                        let view = ((vx0, vx1), (vy0, vy1));
+                        // Size preset snapshot: a mid-render combobox change
+                        // only affects the next export.
+                        let size = self.plot_size.dims();
+                        match job {
+                            PlotExport::Save { name } => {
+                                // Picker cancelled: silent no-op. Runs on
+                                // the UI thread (native modal); only the
+                                // render moves off.
+                                if let Some(mut path) = rfd::FileDialog::new()
+                                    .set_title("Save plot as PNG")
+                                    .set_file_name(&name)
+                                    .add_filter("PNG image", &["png"])
+                                    .save_file()
+                                {
+                                    path.set_extension("png");
+                                    self.png_saving = true;
+                                    let tx = self.png_tx.clone();
+                                    let ctx = ui.ctx().clone();
+                                    std::thread::spawn(move || {
+                                        let series: Vec<(&str, &[f64])> = owned
+                                            .iter()
+                                            .map(|(n, v)| (n.as_str(), v.as_slice()))
+                                            .collect();
+                                        let msg = match crate::plot::export_png(
+                                            &path,
+                                            &title,
+                                            &y_label,
+                                            &series,
+                                            view,
+                                            size,
+                                        ) {
+                                            Ok(()) => {
+                                                log::info!(target: "rfmetrics::plot", "plot saved to {}", path.display());
+                                                PngSaveMsg::Saved { path }
+                                            }
+                                            Err(e) => {
+                                                log::warn!(target: "rfmetrics::plot", "plot save failed: {e}");
+                                                PngSaveMsg::SaveFailed { err: e }
+                                            }
+                                        };
+                                        let _ = tx.send(msg);
+                                        ctx.request_repaint();
+                                    });
+                                }
                             }
-                            None => ((xmin, xmax), (ymin, ymax)),
-                        };
-                    let series: Vec<(&str, &[f64])> =
-                        done.iter().map(|(n, v, _)| (*n, *v)).collect();
-                    let now = ui.input(|i| i.time);
-                    // Picker cancelled: silent no-op.
-                    if let Some(mut path) = rfd::FileDialog::new()
-                        .set_title("Save plot as PNG")
-                        .set_file_name(&name)
-                        .add_filter("PNG image", &["png"])
-                        .save_file()
-                    {
-                        path.set_extension("png");
-                        match crate::plot::export_png(
-                            &path,
-                            crate::plot::tab_title(kind),
-                            def.label,
-                            &series,
-                            ((vx0, vx1), (vy0, vy1)),
-                            (3200, 800),
-                        ) {
-                            Ok(()) => {
-                                log::info!(target: "rfmetrics::plot", "plot saved to {}", path.display());
-                                // Direct field write (not `self.toast()`):
-                                // `done` still borrows rows here.
-                                self.toast = Some(Toast {
-                                    text: format!("Plot saved to {}", path.display()),
-                                    until: now + TOAST_SECS,
-                                    kind: ToastKind::Info,
-                                });
-                            }
-                            Err(e) => {
-                                log::warn!(target: "rfmetrics::plot", "plot save failed: {e}");
-                                self.toast = Some(Toast {
-                                    text: format!("Could not save plot: {e}"),
-                                    until: now + TOAST_SECS,
-                                    kind: ToastKind::Error,
+                            PlotExport::Copy => {
+                                self.png_saving = true;
+                                let tx = self.png_tx.clone();
+                                let ctx = ui.ctx().clone();
+                                std::thread::spawn(move || {
+                                    let series: Vec<(&str, &[f64])> = owned
+                                        .iter()
+                                        .map(|(n, v)| (n.as_str(), v.as_slice()))
+                                        .collect();
+                                    let msg = match crate::plot::render_rgba(
+                                        &title, &y_label, &series, view, size,
+                                    ) {
+                                        Ok((w, h, rgba)) => {
+                                            log::info!(target: "rfmetrics::plot", "plot rendered for clipboard ({w}x{h})");
+                                            PngSaveMsg::CopyReady { w, h, rgba }
+                                        }
+                                        Err(e) => {
+                                            log::warn!(target: "rfmetrics::plot", "plot copy failed: {e}");
+                                            PngSaveMsg::CopyFailed { err: e }
+                                        }
+                                    };
+                                    let _ = tx.send(msg);
+                                    ctx.request_repaint();
                                 });
                             }
                         }
@@ -1785,6 +1918,27 @@ impl RFMetricsApp {
                         .gap(12.0)
                         .show(|ui| {
                             ui.label(text);
+                        });
+                }
+                // Mirror the main-window toast here (PNG saver results land
+                // while this OS window has focus; the main toast behind it
+                // is invisible). Expiry is owned by the main viewport.
+                if let Some(toast) = self.toast.clone()
+                    && ui.input(|i| i.time) < toast.until
+                {
+                    let corner = ui.max_rect().right_bottom();
+                    let mut frame = egui::Frame::popup(ui.style());
+                    if let Some(outline) = toast.kind.outline() {
+                        frame = frame.stroke(egui::Stroke::new(1.5, outline));
+                    }
+                    egui::Area::new(egui::Id::new("plot_toast"))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(corner + egui::vec2(-10.0, -10.0))
+                        .pivot(egui::Align2::RIGHT_BOTTOM)
+                        .show(ui.ctx(), |ui| {
+                            frame.show(ui, |ui| {
+                                ui.label(&toast.text);
+                            });
                         });
                 }
             });
@@ -2026,6 +2180,7 @@ impl eframe::App for RFMetricsApp {
         let ctx = ui.ctx().clone();
         self.refresh_thumbnail(&ctx);
         self.drain_metric_results();
+        self.drain_png_results(&ctx, now);
         // Live `Frame: N` progress while the metric worker runs.
         if self.measuring {
             ui.ctx().request_repaint();
@@ -2311,6 +2466,28 @@ impl eframe::App for RFMetricsApp {
                                     .on_hover_text(
                                         "sws scaler for every scale filter the app emits; \
                                          FFmpeg default omits flags (bicubic in practice)",
+                                    );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [70.0, 18.0],
+                                    egui::Label::new("Plot size").selectable(false),
+                                );
+                                let _ = egui::ComboBox::from_id_salt("plot_size")
+                                    .width(220.0)
+                                    .selected_text(self.plot_size.label())
+                                    .show_ui(ui, |ui| {
+                                        for m in crate::plot::PlotSize::ALL {
+                                            let _ = ui.selectable_value(
+                                                &mut self.plot_size,
+                                                m,
+                                                m.label(),
+                                            );
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(
+                                        "Image dimensions for Save PNG and Copy (current plot view)",
                                     );
                             });
                             let _ = ui
@@ -4307,6 +4484,7 @@ mod tests {
             vmaf_threads: "4".to_owned(),
             scale_method: ScaleMethod::Lanczos,
             plot_at_start: true,
+            plot_size: crate::plot::PlotSize::S1600,
             ..RFMetricsApp::default()
         };
         app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
@@ -4326,6 +4504,7 @@ mod tests {
         assert_eq!(fresh.vmaf_threads, "4");
         assert_eq!(fresh.scale_method, ScaleMethod::Lanczos);
         assert!(fresh.plot_at_start);
+        assert_eq!(fresh.plot_size, crate::plot::PlotSize::S1600);
         // psnr_test_row paths don't exist on disk: only pre-existing rows
         // could restore, so the queue stays empty here.
         assert!(fresh.rows.is_empty());

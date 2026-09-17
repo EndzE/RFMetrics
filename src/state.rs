@@ -89,12 +89,13 @@ pub struct VmafState {
 }
 
 /// Global options; `None` = key absent, keep the live default.
-/// `scaling` is an rfmetrics-only UI label (no Python key).
+/// `scaling`/`plot_size` are rfmetrics-only UI labels (no Python keys).
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct OptionsState {
     pub scaling: Option<String>,
     pub plot_at_start: Option<bool>,
+    pub plot_size: Option<String>,
 }
 
 /// The whole persisted snapshot: verbatim boxes, optional queue, and
@@ -202,6 +203,7 @@ mod tests {
             options: OptionsState {
                 scaling: Some("Bicubic".to_owned()),
                 plot_at_start: Some(true),
+                plot_size: Some("3200×800".to_owned()),
             },
         };
         let back: AppState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();

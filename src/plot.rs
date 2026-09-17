@@ -293,13 +293,58 @@ fn view_window(n: usize, x0: f64, x1: f64) -> (usize, usize) {
     (start, (end + 1).min(n))
 }
 
+/// Export image size presets for Save PNG / Copy (Options combobox).
+/// All wide 4:1 — plots are frames-wide, so height stays small.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlotSize {
+    S1280,
+    S1600,
+    S2400,
+    #[default]
+    S3200,
+}
+
+impl PlotSize {
+    /// Combo order: smallest first, current default last.
+    pub const ALL: [PlotSize; 4] = [
+        PlotSize::S1280,
+        PlotSize::S1600,
+        PlotSize::S2400,
+        PlotSize::S3200,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::S1280 => "1280×320",
+            Self::S1600 => "1600×400",
+            Self::S2400 => "2400×600",
+            Self::S3200 => "3200×800",
+        }
+    }
+
+    pub fn dims(self) -> (u32, u32) {
+        match self {
+            Self::S1280 => (1280, 320),
+            Self::S1600 => (1600, 400),
+            Self::S2400 => (2400, 600),
+            Self::S3200 => (3200, 800),
+        }
+    }
+
+    /// State-file validation (unknown labels keep the live default).
+    pub fn from_label(s: &str) -> Option<PlotSize> {
+        Self::ALL.into_iter().find(|m| m.label() == s)
+    }
+}
+
 /// Render the current tab to a PNG file in egui-plot style (dark canvas,
 /// white axes, same auto-colors and lower-right legend). `view` is the
 /// on-screen range (pan/zoom respected); degenerate spans fall back to a
 /// unit span instead of erroring. Empty series still produce axes.
 ///
 /// Anti-aliasing: plotters' bitmap backend draws aliased strokes, so the
-/// chart renders at 2x and Lanczos-downscales (real supersampled edges).
+/// chart renders supersampled (2x at default size, more when small) and
+/// Lanczos-downscales (real supersampled edges).
 pub fn export_png(
     path: &std::path::Path,
     title: &str,
@@ -308,6 +353,23 @@ pub fn export_png(
     view: ((f64, f64), (f64, f64)),
     size: (u32, u32),
 ) -> Result<(), String> {
+    let (w, h, rgba) = render_rgba(title, y_label, series, view, size)?;
+    let img = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(w, h, rgba)
+        .ok_or_else(|| "render buffer mismatch".to_owned())?;
+    img.save(path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Same render as [`export_png`], but returns raw RGBA pixels at `size`
+/// instead of writing a file — feeds `ctx.copy_image()` without touching
+/// disk. Returns `(width, height, rgba_bytes)` with opaque alpha.
+pub fn render_rgba(
+    title: &str,
+    y_label: &str,
+    series: &[(&str, &[f64])],
+    view: ((f64, f64), (f64, f64)),
+    size: (u32, u32),
+) -> Result<(u32, u32, Vec<u8>), String> {
     use plotters::prelude::*;
     let ((x0, x1), (y0, y1)) = view;
     // Degenerate spans fall back instead of erroring (plotters requires
@@ -324,21 +386,34 @@ pub fn export_png(
     }
     let (x0, x1) = strict_span((x0, x1));
     let (y0, y1) = strict_span((y0, y1));
-    // Supersample 2x, then Lanczos-downscale (plotters draws aliased
+    // Supersample, then Lanczos-downscale (plotters draws aliased
     // strokes): real anti-aliased edges like matplotlib's. All pixel
     // sizes below are pre-scale.
-    const SSAA: u32 = 2;
-    let (bw, bh) = (size.0 * SSAA, size.1 * SSAA);
+    //
+    // Adaptive factor: small presets supersample more (4x at 1280-wide)
+    // so downscaled small text stays crisp instead of pixelated. Capped
+    // so the buffer never exceeds the 3200-wide default's (~10M px):
+    // smaller exports stay faster than the default while matching its
+    // per-pixel sample count.
+    let ssaa: u32 = (5120 / size.0.max(1)).clamp(2, 4);
+    // Layout scale: font/margin sizes are tuned for the 3200-wide
+    // default; smaller presets shrink them proportionally so axis labels
+    // and the legend fit instead of overflowing. All presets share the
+    // 4:1 aspect, so width alone sets the factor (1.0 at default keeps
+    // the old pixels exactly).
+    let layout = size.0 as f32 / 3200.0;
+    let fp = |n: u32| ((n as f32 * layout).round() as u32).max(1) * ssaa;
+    let (bw, bh) = (size.0 * ssaa, size.1 * ssaa);
     let mut buf = vec![0u8; (bw * bh * 3) as usize];
     {
         let root = BitMapBackend::with_buffer(&mut buf, (bw, bh)).into_drawing_area();
         root.fill(&RGBColor(20, 20, 20))
             .map_err(|e| e.to_string())?;
         let mut chart = ChartBuilder::on(&root)
-            .caption(title, ("sans-serif", 40 * SSAA).into_font().color(&WHITE))
-            .margin(12 * SSAA)
-            .x_label_area_size(48 * SSAA)
-            .y_label_area_size(100 * SSAA)
+            .caption(title, ("sans-serif", fp(40)).into_font().color(&WHITE))
+            .margin(fp(12))
+            .x_label_area_size(fp(48))
+            .y_label_area_size(fp(100))
             .build_cartesian_2d(x0..x1, y0..y1)
             .map_err(|e| e.to_string())?;
         chart
@@ -348,7 +423,7 @@ pub fn export_png(
             .x_labels(16)
             .y_labels(8)
             .axis_style(WHITE)
-            .label_style(("sans-serif", 24 * SSAA).into_font().color(&WHITE))
+            .label_style(("sans-serif", fp(24)).into_font().color(&WHITE))
             .light_line_style(RGBColor(42, 42, 42))
             .draw()
             .map_err(|e| e.to_string())?;
@@ -370,12 +445,12 @@ pub fn export_png(
             chart
                 .draw_series(LineSeries::new(
                     thin.points().iter().map(|p| (p.x, p.y)),
-                    color.stroke_width(2 * SSAA),
+                    color.stroke_width(fp(2)),
                 ))
                 .map_err(|e| e.to_string())?
                 .label(*name)
                 .legend(move |(x, y)| {
-                    PathElement::new(vec![(x, y), (x + 30 * SSAA as i32, y)], color)
+                    PathElement::new(vec![(x, y), (x + fp(30) as i32, y)], color)
                 });
         }
         chart
@@ -383,7 +458,7 @@ pub fn export_png(
             .position(SeriesLabelPosition::LowerRight)
             .background_style(RGBColor(30, 30, 30).mix(0.85))
             .border_style(WHITE)
-            .label_font(("sans-serif", 24 * SSAA).into_font().color(&WHITE))
+            .label_font(("sans-serif", fp(24)).into_font().color(&WHITE))
             .draw()
             .map_err(|e| e.to_string())?;
         root.present().map_err(|e| e.to_string())?;
@@ -392,13 +467,26 @@ pub fn export_png(
         .ok_or_else(|| "supersample buffer mismatch".to_owned())?;
     let small =
         image::imageops::resize(&img, size.0, size.1, image::imageops::FilterType::Lanczos3);
-    small.save(path).map_err(|e| e.to_string())?;
-    Ok(())
+    // Opaque alpha: the plot canvas has no transparency.
+    let mut rgba = Vec::with_capacity((size.0 * size.1 * 4) as usize);
+    for p in small.pixels() {
+        rgba.extend_from_slice(&[p[0], p[1], p[2], 0xFF]);
+    }
+    Ok((size.0, size.1, rgba))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plot_size_labels_round_trip() {
+        for m in PlotSize::ALL {
+            assert_eq!(PlotSize::from_label(m.label()), Some(m));
+        }
+        assert_eq!(PlotSize::from_label("Nope"), None);
+        assert_eq!(PlotSize::default().dims(), (3200, 800));
+    }
 
     #[test]
     fn empty_keeps_metric_defaults() {
@@ -660,6 +748,28 @@ mod tests {
         .unwrap();
         png_bytes(&path);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn smallest_preset_renders_exact_dims() {
+        // 1280x320 exercises the scaled-down fonts/margins/legend (would
+        // panic on zero-size text); long series name stresses the legend.
+        let vals: Vec<f64> = (0..300)
+            .map(|i| 45.0 + (i as f64 * 0.37).sin() * 2.0)
+            .collect();
+        let (w, h, rgba) = render_rgba(
+            "PSNR",
+            "PSNR (higher is better, min 0, max 100)",
+            &[(
+                "output-[2026-08-28] Sample_Encode_Test q70.mkv",
+                &vals[..],
+            )],
+            ((1.0, 300.0), (43.0, 49.0)),
+            PlotSize::S1280.dims(),
+        )
+        .unwrap();
+        assert_eq!((w, h), (1280, 320));
+        assert_eq!(rgba.len(), 1280 * 320 * 4);
     }
 
     #[test]
