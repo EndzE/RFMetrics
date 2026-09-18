@@ -245,15 +245,24 @@ pub fn union_bounds(a: FitBounds, b: FitBounds) -> FitBounds {
     }
 }
 
-/// egui_plot line auto-color, same hue ladder as `PlotUi::auto_color`
-/// (`Hsva::new(i * (φ-1), …)`), but brightened for export contrast: the
-/// verbatim value (v=0.5) renders nearly invisible dark red on a dark
-/// canvas in stills.
-pub fn egui_auto_color(i: usize) -> plotters::style::RGBColor {
+/// Stable per-file color from a permanent queue slot (assigned at insert,
+/// never reused): hiding or removing one curve never recolors the rest.
+/// Hue walks the golden-ratio ladder — the same sequence as egui_plot's
+/// `auto_color` — so neighbors stay maximally distinct even with ~20
+/// series. Same saturation/brightness as before for export contrast.
+pub fn series_plot_color(slot: usize) -> plotters::style::RGBColor {
     use std::f32::consts::GOLDEN_RATIO;
-    let h = (i as f32 * (GOLDEN_RATIO - 1.0)) % 1.0;
+    let h = (slot as f32 * (GOLDEN_RATIO - 1.0)) % 1.0;
     let (r, g, b) = hsv_to_rgb(h, 0.9, 0.85);
     plotters::style::RGBColor(r, g, b)
+}
+
+/// egui twin of `series_plot_color` (same hue): live lines match exports.
+pub fn series_egui_color(slot: usize) -> egui::Color32 {
+    use std::f32::consts::GOLDEN_RATIO;
+    let h = (slot as f32 * (GOLDEN_RATIO - 1.0)) % 1.0;
+    let (r, g, b) = hsv_to_rgb(h, 0.9, 0.85);
+    egui::Color32::from_rgb(r, g, b)
 }
 
 /// `h` in [0, 1): standard HSV→RGB, full opacity.
@@ -338,9 +347,14 @@ impl PlotSize {
 }
 
 /// Render the current tab to a PNG file in egui-plot style (dark canvas,
-/// white axes, same auto-colors and lower-right legend). `view` is the
-/// on-screen range (pan/zoom respected); degenerate spans fall back to a
-/// unit span instead of erroring. Empty series still produce axes.
+/// white axes, same stable per-file colors as the live view, lower-right
+/// legend). `view` is the on-screen range (pan/zoom respected); degenerate
+/// spans fall back to a unit span instead of erroring. Empty series still
+/// produce axes.
+///
+/// `series` is `(legend name, color slot, values)`: the slot (queue
+/// `color_idx`) picks the color so exports match the live lines even when
+/// some rows are hidden; the name is display-only.
 ///
 /// Anti-aliasing: plotters' bitmap backend draws aliased strokes, so the
 /// chart renders supersampled (2x at default size, more when small) and
@@ -349,7 +363,7 @@ pub fn export_png(
     path: &std::path::Path,
     title: &str,
     y_label: &str,
-    series: &[(&str, &[f64])],
+    series: &[(&str, usize, &[f64])],
     view: ((f64, f64), (f64, f64)),
     size: (u32, u32),
 ) -> Result<(), String> {
@@ -366,7 +380,7 @@ pub fn export_png(
 pub fn render_rgba(
     title: &str,
     y_label: &str,
-    series: &[(&str, &[f64])],
+    series: &[(&str, usize, &[f64])],
     view: ((f64, f64), (f64, f64)),
     size: (u32, u32),
 ) -> Result<(u32, u32, Vec<u8>), String> {
@@ -427,8 +441,8 @@ pub fn render_rgba(
             .light_line_style(RGBColor(42, 42, 42))
             .draw()
             .map_err(|e| e.to_string())?;
-        for (i, (name, values)) in series.iter().enumerate() {
-            let color = egui_auto_color(i);
+        for (name, slot, values) in series.iter() {
+            let color = series_plot_color(*slot);
             // Draw only the visible window (±1 point for clean edge
             // crossings): out-of-range points pile onto the plot-area edge.
             let (lo, hi) = view_window(values.len(), x0, x1);

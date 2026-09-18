@@ -178,6 +178,7 @@ fn row_media_applies_by_key() {
         key: norm_key("C:/vids/a.mp4"),
         display: "a.mp4".to_owned(),
         include: true,
+        color_idx: 0,
         selected: false,
         media: "Probing…".to_owned(),
         media_tip: "Probing…".to_owned(),
@@ -220,6 +221,29 @@ fn row_media_applies_by_key() {
 }
 
 #[test]
+fn plot_color_slots_survive_removal() {
+    // Slots are assigned once at insert and never reused: removing a row
+    // must not recolor the survivors, and a later insert takes a fresh
+    // slot instead of filling the gap.
+    let mut app = RFMetricsApp::default();
+    app.add_queue_files(vec![
+        std::path::PathBuf::from("C:/no/such/c1.mp4"),
+        std::path::PathBuf::from("C:/no/such/c2.mp4"),
+        std::path::PathBuf::from("C:/no/such/c3.mp4"),
+    ]);
+    assert_eq!(
+        app.rows.iter().map(|r| r.color_idx).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    app.rows.remove(1);
+    app.add_queue_files(vec![std::path::PathBuf::from("C:/no/such/c4.mp4")]);
+    assert_eq!(
+        app.rows.iter().map(|r| r.color_idx).collect::<Vec<_>>(),
+        vec![0, 2, 3]
+    );
+}
+
+#[test]
 fn queue_shows_probing_placeholder() {
     let mut app = RFMetricsApp::default();
     app.add_queue_files(vec![std::path::PathBuf::from("C:/no/such/file.mp4")]);
@@ -242,6 +266,7 @@ fn psnr_test_row(path: &str, include: bool) -> QueueRow {
         key: norm_key(path),
         display: "a.mp4".to_owned(),
         include,
+        color_idx: 0,
         selected: false,
         media: "h264, 1080p".to_owned(),
         media_tip: "tip".to_owned(),

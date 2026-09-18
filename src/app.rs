@@ -15,6 +15,10 @@ struct QueueRow {
     key: String,
     display: String,
     include: bool,
+    /// Permanent plot-color slot, assigned from `next_color_idx` at insert
+    /// and never reused: hiding or removing one row never recolors the
+    /// survivors. Session-only (reassigned 0..n in file order on load).
+    color_idx: usize,
     selected: bool,
     media: String,
     media_tip: String,
@@ -424,6 +428,8 @@ pub struct RFMetricsApp {
     current_child: Arc<Mutex<Option<std::process::Child>>>,
     /// Jobs still Blocking; last `Done` clears `measuring`.
     pending: usize,
+    /// Next plot-color slot; bumped per queued file, never reused.
+    next_color_idx: usize,
     /// Bumped per run; late worker messages after a Reset are stale.
     run_generation: u64,
     /// Path last handed to a probe worker (or resolved cheaply without one).
@@ -541,6 +547,7 @@ impl Default for RFMetricsApp {
             abort: Arc::new(AtomicBool::new(false)),
             current_child: Arc::new(Mutex::new(None)),
             pending: 0,
+            next_color_idx: 0,
             run_generation: 0,
             last_spawned_ref: String::new(),
             ref_info_path: String::new(),
@@ -793,11 +800,14 @@ impl RFMetricsApp {
             if !seen.insert(key.clone()) {
                 continue; // guard rail: same file already queued
             }
+            let color_idx = self.next_color_idx;
+            self.next_color_idx += 1;
             self.rows.push(QueueRow {
                 path: s.clone(),
                 key: key.clone(),
                 display: String::new(),
                 include: true,
+                color_idx,
                 selected: false,
                 media: "Probing…".to_owned(),
                 media_tip: "Probing…".to_owned(),
@@ -1955,15 +1965,25 @@ impl RFMetricsApp {
             // directly from cache (built on arrival — zero per-frame
             // allocs). Invariant: points mirrors values for Done/Running
             // cells (drain maintains both; anything else is ignored).
-            let done: Vec<(&str, &[f64], &[egui_plot::PlotPoint])> = self
+            // First-column `include` doubles as plot visibility (#3):
+            // unchecked rows are excluded from runs (start_run) and hidden
+            // here, so fit/hover/export below re-fit to visible only.
+            // Data keeps streaming in the background, so re-checking shows
+            // history instantly, including mid-run Running curves.
+            // `done` carries the row's permanent color slot alongside the
+            // display name so lines/export use the stable per-file color
+            // (hiding or removing one curve never recolors the rest).
+            let done: Vec<(&str, usize, &[f64], &[egui_plot::PlotPoint])> = self
                 .rows
                 .iter()
+                .filter(|r| r.include)
                 .filter_map(|r| match r.cell(kind) {
                     crate::metrics::MetricCell::Done { values, .. }
                         if !values.is_empty() =>
                     {
                         Some((
                             r.display.as_str(),
+                            r.color_idx,
                             values.as_slice(),
                             r.cached(kind).points.as_slice(),
                         ))
@@ -1974,6 +1994,7 @@ impl RFMetricsApp {
                         any_running = true;
                         Some((
                             r.display.as_str(),
+                            r.color_idx,
                             values.as_slice(),
                             r.cached(kind).points.as_slice(),
                         ))
@@ -1981,7 +2002,7 @@ impl RFMetricsApp {
                     _ => None,
                 })
                 .collect();
-            let borrowed: Vec<&[f64]> = done.iter().map(|(_, v, _)| *v).collect();
+            let borrowed: Vec<&[f64]> = done.iter().map(|(_, _, v, _)| *v).collect();
             let fresh = crate::plot::fit_limits(&borrowed, def.lo, def.hi);
             // Grow-only live bounds: axes expand with arriving points but
             // never jump inward mid-run; cleared once all settle so the
@@ -2223,9 +2244,9 @@ impl RFMetricsApp {
                             };
                         // Owned snapshot: the worker outlives this frame and
                         // cannot borrow `done`/`self.rows`.
-                        let owned: Vec<(String, Vec<f64>)> = done
+                        let owned: Vec<(String, usize, Vec<f64>)> = done
                             .iter()
-                            .map(|(n, v, _)| ((*n).to_owned(), (*v).to_vec()))
+                            .map(|(n, s, v, _)| ((*n).to_owned(), *s, (*v).to_vec()))
                             .collect();
                         let title = crate::plot::tab_title(kind).to_owned();
                         let y_label = def.label.to_owned();
@@ -2249,9 +2270,9 @@ impl RFMetricsApp {
                                     let tx = self.png_tx.clone();
                                     let ctx = ui.ctx().clone();
                                     std::thread::spawn(move || {
-                                        let series: Vec<(&str, &[f64])> = owned
+                                        let series: Vec<(&str, usize, &[f64])> = owned
                                             .iter()
-                                            .map(|(n, v)| (n.as_str(), v.as_slice()))
+                                            .map(|(n, s, v)| (n.as_str(), *s, v.as_slice()))
                                             .collect();
                                         let msg = match crate::plot::export_png(
                                             &path,
@@ -2280,9 +2301,9 @@ impl RFMetricsApp {
                                 let tx = self.png_tx.clone();
                                 let ctx = ui.ctx().clone();
                                 std::thread::spawn(move || {
-                                    let series: Vec<(&str, &[f64])> = owned
+                                    let series: Vec<(&str, usize, &[f64])> = owned
                                         .iter()
-                                        .map(|(n, v)| (n.as_str(), v.as_slice()))
+                                        .map(|(n, s, v)| (n.as_str(), *s, v.as_slice()))
                                         .collect();
                                     let msg = match crate::plot::render_rgba(
                                         &title, &y_label, &series, view, size,
@@ -2316,9 +2337,15 @@ impl RFMetricsApp {
                         // Lines borrow cached points, min-max decimated to
                         // ~2 px buckets (values still feed fit + hover at
                         // full resolution).
-                        for (name, _, points) in &done {
+                        // Stable per-file colors: keyed by permanent queue
+                        // slot, so hiding/removing one curve never recolors
+                        // the rest.
+                        for (name, slot, _, points) in &done {
                             let thin = crate::plot::decimate_minmax(points, target);
-                            plot_ui.line(egui_plot::Line::new(*name, thin));
+                            plot_ui.line(
+                                egui_plot::Line::new(*name, thin)
+                                    .color(crate::plot::series_egui_color(*slot)),
+                            );
                         }
                         // Hover inspect (Python `_on_hover` parity):
                         // nearest data point within 30 screen px gets a
@@ -3271,7 +3298,8 @@ impl eframe::App for RFMetricsApp {
                                 // (checkbox, play, text drag-select) must not.
                                 // (`toggle_row` etc. are set here, applied below.)
                                 row.col(|ui| {
-                                    ui.checkbox(&mut self.rows[i].include, "");
+                                    ui.checkbox(&mut self.rows[i].include, "")
+                                        .on_hover_text("Include in run and plot");
                                 });
                                 let (_, r) =
                                     row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));

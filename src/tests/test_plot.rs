@@ -278,16 +278,23 @@ fn clamp_range_keeps_span_inside_limits() {
 }
 
 #[test]
-fn auto_colors_follow_egui_hue_ladder() {
-    use plotters::style::RGBColor;
-    // i=0: hue 0 (red); i=1: hue φ-1 ≈ 0.618 (blue). Brightened for
-    // export contrast, hue order kept.
-    assert_eq!(egui_auto_color(0), RGBColor(217, 22, 22));
-    let RGBColor(r1, g1, b1) = egui_auto_color(1);
-    assert!(b1 > r1 && b1 > g1, "second curve is blue-ish");
-    // Deterministic per index.
-    assert_eq!(egui_auto_color(3), egui_auto_color(3));
-    assert_ne!(egui_auto_color(0), egui_auto_color(1));
+fn series_colors_are_stable_slots_not_positions() {
+    // Removing/hiding the first curve must not recolor the rest: the
+    // color derives from the permanent queue slot, never the visible
+    // index. Slot 0 is the old red, slot 1 the old blue.
+    assert_eq!(series_egui_color(1), series_egui_color(1));
+    assert_eq!(series_plot_color(1), series_plot_color(1));
+    // Live and export twins agree (same hue).
+    let egui = series_egui_color(1);
+    let plotters::style::RGBColor(r, g, b) = series_plot_color(1);
+    assert_eq!((egui.r(), egui.g(), egui.b()), (r, g, b));
+    // Golden-ratio neighbors stay distinct even with ~20 series.
+    let slots: Vec<_> = (0..20).map(series_egui_color).collect();
+    for i in 0..slots.len() {
+        for j in (i + 1)..slots.len() {
+            assert_ne!(slots[i], slots[j], "slots {i} and {j} collide");
+        }
+    }
 }
 
 fn png_bytes(path: &std::path::Path) -> Vec<u8> {
@@ -308,7 +315,7 @@ fn export_png_writes_valid_image() {
         &path,
         "PSNR",
         "PSNR (higher is better, min 0, max 100)",
-        &[("a.mkv", &a[..]), ("b.mkv", &b[..])],
+        &[("a.mkv", 0, &a[..]), ("b.mkv", 1, &b[..])],
         ((1.0, 4.0), (44.0, 49.0)),
         (400, 300),
     )
@@ -329,6 +336,7 @@ fn smallest_preset_renders_exact_dims() {
         "PSNR (higher is better, min 0, max 100)",
         &[(
             "output-[2026-08-28] Sample_Encode_Test q70.mkv",
+            0,
             &vals[..],
         )],
         ((1.0, 300.0), (43.0, 49.0)),
@@ -344,7 +352,7 @@ fn export_png_tolerates_empty_and_degenerate() {
     let dir = std::env::temp_dir().join(format!("rfmetrics-png-edge-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     // No series: axes only. Degenerate view: sanitized, no panic.
-    let empty: &[(&str, &[f64])] = &[];
+    let empty: &[(&str, usize, &[f64])] = &[];
     export_png(
         &dir.join("empty.png"),
         "SSIM",
@@ -359,7 +367,7 @@ fn export_png_tolerates_empty_and_degenerate() {
         &dir.join("one.png"),
         "SSIM",
         "SSIM",
-        &[("a.mkv", &one[..])],
+        &[("a.mkv", 0, &one[..])],
         ((1.0, 1.0), (0.9, 0.9)),
         (400, 300),
     )
@@ -380,6 +388,24 @@ fn view_window_widens_by_one_point() {
     assert_eq!(view_window(1, 5.0, 6.0), (0, 1)); // single point
 }
 
+/// Stable export line color for the `"a.mkv"` series used below.
+fn line_rgb() -> (f32, f32, f32) {
+    let plotters::style::RGBColor(r, g, b) = series_plot_color(0);
+    (r as f32, g as f32, b as f32)
+}
+
+/// `(dist², t)` from a pixel to the bg→line segment: anti-aliased edge
+/// blends sit near this segment with `0 < t < 1`; bg, grid, line core
+/// and white text do not.
+fn seg_dt2(p: &image::Rgb<u8>, bg: (f32, f32, f32), line: (f32, f32, f32)) -> (f32, f32) {
+    let ab = (line.0 - bg.0, line.1 - bg.1, line.2 - bg.2);
+    let ap = (p[0] as f32 - bg.0, p[1] as f32 - bg.1, p[2] as f32 - bg.2);
+    let len2 = ab.0 * ab.0 + ab.1 * ab.1 + ab.2 * ab.2;
+    let t = ((ap.0 * ab.0 + ap.1 * ab.1 + ap.2 * ab.2) / len2).clamp(0.0, 1.0);
+    let d2 = (ap.0 - t * ab.0).powi(2) + (ap.1 - t * ab.1).powi(2) + (ap.2 - t * ab.2).powi(2);
+    (d2, t)
+}
+
 #[test]
 fn export_aa_blends_line_edges() {
     let dir = std::env::temp_dir().join(format!("rfmetrics-png-aa-{}", std::process::id()));
@@ -391,20 +417,21 @@ fn export_aa_blends_line_edges() {
         &path,
         "PSNR",
         "PSNR",
-        &[("a.mkv", &vals[..])],
+        &[("a.mkv", 0, &vals[..])],
         ((1.0, 500.0), (44.0, 50.0)),
         (800, 400),
     )
     .unwrap();
     let img = image::open(&path).unwrap().to_rgb8();
     let (w, h) = img.dimensions();
-    // Mid-tone reds: neither bg (20s), grid (42s), line core (217,22,22)
-    // nor white text — only anti-aliased edge blends land here.
+    // Edge blends: near the bg→line segment but strictly between the
+    // endpoints — neither bg (20s), grid (42s), line core nor white text.
+    let (bg, line) = ((20.0, 20.0, 20.0), line_rgb());
     let mut blends = 0u64;
     for x in 100..w - 40 {
         for y in 40..h - 40 {
-            let p = &img[(x, y)];
-            if (60..190).contains(&p[0]) && p[1] < 60 && p[2] < 60 {
+            let (d2, t) = seg_dt2(&img[(x, y)], bg, line);
+            if d2 < 25.0 * 25.0 && (0.05..0.95).contains(&t) {
                 blends += 1;
             }
         }
@@ -427,21 +454,27 @@ fn fullrange_export_stays_readable_when_dense() {
         &path,
         "PSNR",
         "PSNR",
-        &[("a.mkv", &vals[..])],
+        &[("a.mkv", 0, &vals[..])],
         ((1.0, n as f64), (44.0, 51.0)),
         (1600, 400),
     )
     .unwrap();
     let img = image::open(&path).unwrap().to_rgb8();
     let (w, h) = img.dimensions();
-    let is_red = |p: &image::Rgb<u8>| p[0] > 150 && p[1] < 80 && p[2] < 80;
+    let line = line_rgb();
+    let is_line = |p: &image::Rgb<u8>| {
+        let d2 = (p[0] as f32 - line.0).powi(2)
+            + (p[1] as f32 - line.1).powi(2)
+            + (p[2] as f32 - line.2).powi(2);
+        d2 < 60.0 * 60.0
+    };
     // Interior plot columns only (skip y-label gutter + legend corner).
     let mut red = 0u64;
     let mut tot = 0u64;
     for x in 150..w - 60 {
         for y in 60..h - 60 {
             tot += 1;
-            if is_red(&img[(x, y)]) {
+            if is_line(&img[(x, y)]) {
                 red += 1;
             }
         }
@@ -467,20 +500,26 @@ fn zoomed_export_has_no_edge_waterfalls() {
         &path,
         "PSNR",
         "PSNR",
-        &[("a.mkv", &vals[..])],
+        &[("a.mkv", 0, &vals[..])],
         ((700.0, 1300.0), (44.0, 51.0)),
         (800, 400),
     )
     .unwrap();
     let img = image::open(&path).unwrap().to_rgb8();
     let (w, h) = img.dimensions();
-    let is_red = |p: &image::Rgb<u8>| p[0] > 150 && p[1] < 80 && p[2] < 80;
+    let line = line_rgb();
+    let is_line = |p: &image::Rgb<u8>| {
+        let d2 = (p[0] as f32 - line.0).powi(2)
+            + (p[1] as f32 - line.1).powi(2)
+            + (p[2] as f32 - line.2).powi(2);
+        d2 < 60.0 * 60.0
+    };
     let mut max_col = 0u32;
     let mut mid = 0u32;
     for x in 0..w {
         let mut c = 0u32;
         for y in 0..h {
-            if is_red(&img[(x, y)]) {
+            if is_line(&img[(x, y)]) {
                 c += 1;
             }
         }
