@@ -1085,10 +1085,32 @@ impl RFMetricsApp {
         }
     }
 
+    /// Issue #7: force off restored/default ticks for filters this ffmpeg
+    /// build lacks (their header checkboxes are disabled, so they were
+    /// never ticked live). Session-only capability, never persisted.
+    /// Idempotent: safe to run for both the no-file and restored paths.
+    fn untick_unsupported_metrics(&mut self) {
+        let supported = &self.ffmpeg.supported_metrics;
+        if !supported.contains(&MetricKind::Psnr) {
+            self.m_psnr = false;
+        }
+        if !supported.contains(&MetricKind::Ssim) {
+            self.m_ssim = false;
+        }
+        if !supported.contains(&MetricKind::Vmaf) {
+            self.m_vmaf = false;
+        }
+        if !supported.contains(&MetricKind::Xpsnr) {
+            self.m_xpsnr = false;
+        }
+    }
+
     /// Apply a loaded state file (tolerant per-key; absent keys keep live
     /// defaults, saved models must still be on disk, queue entries must
     /// still be files). Restored rows probe through the normal path.
     fn apply_state(&mut self, loaded: Option<crate::state::AppState>) {
+        // Defaults (VMAF-on) obey capability even with no state file.
+        self.untick_unsupported_metrics();
         let Some(s) = loaded else {
             return;
         };
@@ -1172,6 +1194,8 @@ impl RFMetricsApp {
         {
             self.plot_size = m;
         }
+        // Restored ticks obey capability (see helper docs).
+        self.untick_unsupported_metrics();
     }
 
     /// Allocation-free dirty check mirroring `snapshot() != saved_snapshot`
@@ -1267,10 +1291,13 @@ impl RFMetricsApp {
         let kinds: Vec<MetricKind> = MetricKind::ALL
             .into_iter()
             .filter(|k| match k {
-                MetricKind::Psnr => self.m_psnr,
-                MetricKind::Ssim => self.m_ssim,
-                MetricKind::Vmaf => self.m_vmaf,
-                MetricKind::Xpsnr => self.m_xpsnr,
+                // Issue #7 backstop: restored/default ticks for missing
+                // filters are forced off at startup, but a ticked-yet-
+                // unsupported metric must never reach the worker either.
+                MetricKind::Psnr => self.m_psnr && self.ffmpeg.supported_metrics.contains(k),
+                MetricKind::Ssim => self.m_ssim && self.ffmpeg.supported_metrics.contains(k),
+                MetricKind::Vmaf => self.m_vmaf && self.ffmpeg.supported_metrics.contains(k),
+                MetricKind::Xpsnr => self.m_xpsnr && self.ffmpeg.supported_metrics.contains(k),
                 MetricKind::Ssim2 => self.m_ssim2,
                 MetricKind::But => self.m_but,
                 MetricKind::Cvvdp => self.m_cvvdp,
@@ -2759,18 +2786,39 @@ impl eframe::App for RFMetricsApp {
                                         .selectable(false),
                                 );
                             });
-                            for (flag, name) in [
-                                (&mut self.m_psnr, "PSNR"),
-                                (&mut self.m_ssim, "SSIM"),
-                                (&mut self.m_vmaf, "VMAF"),
-                                (&mut self.m_xpsnr, "XPSNR"),
-                                (&mut self.m_ssim2, "SSIM2"),
-                                (&mut self.m_but, "BUTTER"),
-                                (&mut self.m_cvvdp, "CVVDP"),
+                            // Issue #7: copy support out first — the loop takes
+                            // `&mut` flag borrows, so no shared `self` borrow
+                            // may live across it. FFVship metrics ride the
+                            // binary-level `usable` gate instead (start_run).
+                            let (psnr_ok, ssim_ok, vmaf_ok, xpsnr_ok) = {
+                                let sup = &self.ffmpeg.supported_metrics;
+                                (
+                                    sup.contains(&MetricKind::Psnr),
+                                    sup.contains(&MetricKind::Ssim),
+                                    sup.contains(&MetricKind::Vmaf),
+                                    sup.contains(&MetricKind::Xpsnr),
+                                )
+                            };
+                            for (flag, name, ok) in [
+                                (&mut self.m_psnr, "PSNR", psnr_ok),
+                                (&mut self.m_ssim, "SSIM", ssim_ok),
+                                (&mut self.m_vmaf, "VMAF", vmaf_ok),
+                                (&mut self.m_xpsnr, "XPSNR", xpsnr_ok),
+                                (&mut self.m_ssim2, "SSIM2", true),
+                                (&mut self.m_but, "BUTTER", true),
+                                (&mut self.m_cvvdp, "CVVDP", true),
                             ] {
                                 header.col(|ui| vline(ui, egui::Color32::from_gray(0x8A)));
                                 header.col(|ui| {
-                                    ui.add_enabled(!run_locked, egui::Checkbox::new(flag, name));
+                                    let resp = ui.add_enabled(
+                                        ok && !run_locked,
+                                        egui::Checkbox::new(flag, name),
+                                    );
+                                    if !ok {
+                                        resp.on_hover_text(format!(
+                                            "{name} filter not supported by this ffmpeg build"
+                                        ));
+                                    }
                                 });
                             }
                         })
@@ -4779,6 +4827,53 @@ mod tests {
         assert_eq!(app.vmaf_pooling, "Mean");
         assert_eq!(app.vmaf_subsample, "1");
         assert!(app.vmaf_phone);
+    }
+
+    /// Issue #7: restored ticks for filters this ffmpeg build lacks are
+    /// forced off (their header checkboxes render disabled).
+    #[test]
+    fn state_apply_unticks_unsupported_filters() {
+        use crate::metrics::ffmpeg::MetricKind;
+        let mut app = RFMetricsApp::default();
+        // Simulate a w32threads-style build: everything but libvmaf.
+        app.ffmpeg.supported_metrics = vec![MetricKind::Psnr, MetricKind::Ssim, MetricKind::Xpsnr];
+        let state = crate::state::AppState {
+            metrics: crate::state::MetricsState {
+                psnr: Some(true),
+                ssim: Some(true),
+                vmaf: Some(true),
+                xpsnr: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        app.apply_state(Some(state));
+        assert!(app.m_psnr && app.m_ssim && app.m_xpsnr);
+        assert!(!app.m_vmaf);
+    }
+
+    /// Issue #7 backstop: a ticked-but-unsupported metric never reaches
+    /// the worker — with nothing runnable Start is a no-op toast.
+    #[test]
+    fn start_run_unsupported_vmaf_is_noop() {
+        use crate::metrics::ffmpeg::MetricKind;
+        use crate::probe::MediaInfo;
+        let p = std::env::temp_dir().join("rfmetrics-unsupported-vmaf.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            m_psnr: false,
+            m_ssim: false,
+            m_vmaf: true,
+            ref_path: p.to_string_lossy().into_owned(),
+            ..RFMetricsApp::default()
+        };
+        app.ffmpeg.supported_metrics = vec![MetricKind::Psnr, MetricKind::Ssim, MetricKind::Xpsnr];
+        app.ref_info_data = Some(MediaInfo::default());
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.start_run(0.0);
+        std::fs::remove_file(&p).ok();
+        assert!(!app.measuring);
+        assert!(matches!(app.rows[0].vmaf, crate::metrics::MetricCell::Idle));
     }
 
     /// `is_state_dirty` must agree with `snapshot() != saved_snapshot` for

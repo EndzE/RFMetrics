@@ -4,17 +4,38 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
+use crate::metrics::ffmpeg::MetricKind;
+
 /// Compiled once (startup/version probes), not per call — same `OnceLock`
 /// pattern as the metric parsers in `metrics/ffmpeg.rs`. Literals below
 /// are proven-valid (they compile on every current call), hence `unwrap`.
 fn ffmpeg_ver_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)ffmpeg version (\d+(?:\.\d+)*)").unwrap())
+    // First whitespace-delimited token after `ffmpeg version`: dotted
+    // releases (`7.1.1`), git snapshots (`git-2020-08-31-4a11a6f`) and
+    // nightly builds (`N-126626-g7070fe638e-20260917`).
+    RE.get_or_init(|| Regex::new(r"(?i)ffmpeg version (\S+)").unwrap())
 }
 
 fn copyright_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?i)\s*copyright.*$").unwrap())
+}
+
+/// Bottom-bar label from a copyright-stripped first `-version` line:
+/// `FFmpeg: <first version token>`. Unknown shapes fall back to the whole
+/// line (already stripped, so the copyright tail can never leak in).
+fn short_ffmpeg_version(first_line: &str) -> String {
+    ffmpeg_ver_re()
+        .captures(first_line)
+        .map(|c| {
+            // Vendor build-domain suffix (`9.0.1-full_build-www.gyan.dev`):
+            // drop the domain, keep the variant (`9.0.1-full`).
+            let raw = &c[1];
+            let ver = raw.split_once("_build-www.").map_or(raw, |(head, _)| head);
+            format!("FFmpeg: {ver}")
+        })
+        .unwrap_or_else(|| first_line.to_owned())
 }
 
 fn ffvship_ver_re() -> &'static Regex {
@@ -38,6 +59,10 @@ pub struct BinaryInfo {
     /// parseable (e.g. wrong-GPU FFVship build). Measure step gates on this.
     #[allow(dead_code)]
     pub usable: bool,
+    /// ffmpeg filter-backed metrics this build can run (`-filters` probe).
+    /// Meaningless for FFVship (always empty); fail-open to all four when
+    /// the probe itself won't run (see `ffmpeg_supported_filters`).
+    pub supported_metrics: Vec<MetricKind>,
 }
 
 /// Directory holding the running executable (Rust analog of Python's script dir).
@@ -52,10 +77,21 @@ fn nearby(name: &str) -> Option<PathBuf> {
     if cand.is_file() { Some(cand) } else { None }
 }
 
+/// Bundled-suite layout (`<exe_dir>/ffmpeg/ffmpeg.exe`, …): keeps a full
+/// extracted ffmpeg release next to the app without cluttering its folder
+/// (mirrors the `FFVship/` subfolder convention below).
+fn nearby_in(dir: &str, name: &str) -> Option<PathBuf> {
+    let cand = exe_dir()?.join(dir).join(name);
+    if cand.is_file() { Some(cand) } else { None }
+}
+
 fn find_ffmpeg() -> (Option<PathBuf>, &'static str) {
     // ponytail: near-exe preferred over PATH per user requirement
     if let Some(p) = nearby("ffmpeg.exe") {
         return (Some(p), "next to app");
+    }
+    if let Some(p) = nearby_in("ffmpeg", "ffmpeg.exe") {
+        return (Some(p), "in ffmpeg folder");
     }
     if let Ok(p) = which::which("ffmpeg") {
         return (Some(p), "in PATH");
@@ -82,6 +118,9 @@ fn find_ffvship() -> (Option<PathBuf>, &'static str) {
 fn find_ffprobe(ffmpeg_path: Option<&Path>) -> (Option<PathBuf>, &'static str) {
     if let Some(p) = nearby("ffprobe.exe") {
         return (Some(p), "next to app");
+    }
+    if let Some(p) = nearby_in("ffmpeg", "ffprobe.exe") {
+        return (Some(p), "in ffmpeg folder");
     }
     if let Some(dir) = ffmpeg_path.and_then(|p| p.parent()) {
         let cand = dir.join("ffprobe.exe");
@@ -158,6 +197,55 @@ fn stderr_snippet(stderr: &str) -> String {
     format!("\nstderr: {snippet}")
 }
 
+/// ffmpeg-backed metric kinds, in `MetricKind::ALL` order (FFVship kinds
+/// have no ffmpeg filter and never appear here).
+fn ffmpeg_kinds() -> impl Iterator<Item = MetricKind> {
+    MetricKind::ALL.into_iter().filter(|k| !k.is_ffvship())
+}
+
+/// Pure `ffmpeg -filters` listing parser: a filter counts only as the exact
+/// second whitespace token (` TSC libvmaf …`), so `--enable-libvmaf`
+/// configure lines never false-positive.
+fn parse_filters_list(text: &str) -> Vec<MetricKind> {
+    use std::collections::HashSet;
+    let present: HashSet<&str> = text
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .collect();
+    ffmpeg_kinds()
+        .filter(|k| present.contains(k.filter()))
+        .collect()
+}
+
+/// Bottom-bar hover line for the ffmpeg tooltip (`Supported: …`).
+fn supported_line(kinds: &[MetricKind]) -> String {
+    if kinds.is_empty() {
+        return "Supported: none".to_owned();
+    }
+    let names: Vec<&str> = kinds.iter().map(|k| k.name()).collect();
+    format!("Supported: {}", names.join(", "))
+}
+
+/// Startup capability probe: which metric filters this ffmpeg build has
+/// (issue #7: w32threads builds report `--enable-libvmaf` yet ship no
+/// `libvmaf` filter). Fail-open to all four + warn when the probe itself
+/// won't run, so a transient spawn failure can't brick the checkboxes;
+/// genuine absences list honestly.
+pub fn ffmpeg_supported_filters(exe: &Path) -> Vec<MetricKind> {
+    let all: Vec<MetricKind> = ffmpeg_kinds().collect();
+    // Hermetic tests: host ffmpeg capability must not leak into
+    // assertions (same rationale as the state-load skip in `Default`).
+    // Gating tests pin `supported_metrics` explicitly instead.
+    if cfg!(test) {
+        return all;
+    }
+    let Some(v) = run_version(exe, "-filters") else {
+        log::warn!(target: "rfmetrics::binaries", "filter probe failed, assuming all filters present");
+        return all;
+    };
+    parse_filters_list(&v.stdout)
+}
+
 pub fn ffmpeg_info() -> BinaryInfo {
     let (path, origin) = find_ffmpeg();
     let Some(exe) = path.clone() else {
@@ -168,6 +256,7 @@ pub fn ffmpeg_info() -> BinaryInfo {
             short: "ffmpeg not found in PATH".to_owned(),
             detail: "Checked next to app and in PATH, none found".to_owned(),
             usable: false,
+            supported_metrics: Vec::new(),
         };
     };
     let missing = |msg: String| BinaryInfo {
@@ -176,6 +265,7 @@ pub fn ffmpeg_info() -> BinaryInfo {
         short: "ffmpeg not found in PATH".to_owned(),
         detail: msg,
         usable: false,
+        supported_metrics: Vec::new(),
     };
     let Some(v) = run_version(&exe, "-version") else {
         log::warn!(target: "rfmetrics::binaries", "ffmpeg at {} ({origin}) failed to run", exe.display());
@@ -199,20 +289,23 @@ pub fn ffmpeg_info() -> BinaryInfo {
             stderr_snippet(&v.stderr),
         ));
     }
-    let short = ffmpeg_ver_re()
-        .captures(full)
-        .map(|c| format!("FFmpeg: {}", &c[1]))
-        .unwrap_or_else(|| full.to_owned());
     // `ffmpeg -version` puts "Copyright (c) ..." on the same first line;
-    // strip it so the hover tooltip stays to version + path.
+    // strip it BEFORE the short label: nightly `N-…` tokens previously
+    // missed the release-only regex and the fallback leaked the whole
+    // copyright tail into the bottom bar.
     let full = copyright_re().replace(full, "").trim_end().to_owned();
+    let short = short_ffmpeg_version(&full);
     log::info!(target: "rfmetrics::binaries", "ffmpeg: {short} at {} ({origin})", exe.display());
+    let supported = ffmpeg_supported_filters(&exe);
+    let line = supported_line(&supported);
+    log::info!(target: "rfmetrics::binaries", "ffmpeg filters: {line}");
     BinaryInfo {
         path: Some(exe.clone()),
         origin,
         short,
-        detail: format!("{full}\n{} ({origin})", exe.display()),
+        detail: format!("{full}\n{} ({origin})\n{line}", exe.display()),
         usable: true,
+        supported_metrics: supported,
     }
 }
 
@@ -254,6 +347,8 @@ pub fn ffvship_info() -> BinaryInfo {
             short: "FFVship: not found".to_owned(),
             detail: "Checked next to app, FFVship folder, and in PATH, none found".to_owned(),
             usable: false,
+            // Filter support is an ffmpeg concept; always empty here.
+            supported_metrics: Vec::new(),
         };
     };
     let missing = |msg: String| BinaryInfo {
@@ -262,6 +357,7 @@ pub fn ffvship_info() -> BinaryInfo {
         short: "FFVship: not found".to_owned(),
         detail: msg,
         usable: false,
+        supported_metrics: Vec::new(),
     };
     let Some(v) = run_version(&exe, "--version") else {
         log::warn!(target: "rfmetrics::binaries", "FFVship at {} ({origin}) failed to run", exe.display());
@@ -279,6 +375,7 @@ pub fn ffvship_info() -> BinaryInfo {
             short: format!("FFVship: {vs}"),
             detail: format!("{raw}\n{} ({origin})", exe.display()),
             usable: true,
+            supported_metrics: Vec::new(),
         };
     }
     // Guard rail: binary persists but reports no version (e.g. AMD build on
@@ -304,6 +401,7 @@ pub fn ffvship_info() -> BinaryInfo {
         short: "FFVship: found (version unknown)".to_owned(),
         detail,
         usable: false,
+        supported_metrics: Vec::new(),
     }
 }
 
@@ -322,6 +420,8 @@ pub fn ffprobe_path(ffmpeg_path: Option<&Path>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::parse_ffvship_version;
+    use super::{copyright_re, parse_filters_list, short_ffmpeg_version, supported_line};
+    use crate::metrics::ffmpeg::MetricKind;
 
     #[test]
     fn silent_exit_is_unknown() {
@@ -366,5 +466,90 @@ mod tests {
             parse_ffvship_version("", "FFVship 5.1.1-a_cuda\n"),
             Some("5.1.1-a_cuda".to_owned())
         );
+    }
+
+    const FILTERS_FULL: &str = "Filters:\n \
+         TSC psnr V->V : Compute the peak signal-to-noise.\n \
+         TSC ssim V->V : Compute SSIM.\n \
+         TSC libvmaf V->V : Apply VMAF.\n \
+         TSC xpsnr V->V : Compute XPSNR.\n";
+
+    #[test]
+    fn filters_parse_finds_all_four() {
+        assert_eq!(
+            parse_filters_list(FILTERS_FULL),
+            vec![
+                MetricKind::Psnr,
+                MetricKind::Ssim,
+                MetricKind::Vmaf,
+                MetricKind::Xpsnr
+            ]
+        );
+    }
+
+    #[test]
+    fn filters_parse_missing_libvmaf() {
+        // w32threads-style build: everything but the VMAF filter.
+        let text = "Filters:\n \
+             TSC psnr V->V : Compute the peak signal-to-noise.\n \
+             TSC ssim V->V : Compute SSIM.\n \
+             TSC xpsnr V->V : Compute XPSNR.\n";
+        assert_eq!(
+            parse_filters_list(text),
+            vec![MetricKind::Psnr, MetricKind::Ssim, MetricKind::Xpsnr]
+        );
+    }
+
+    #[test]
+    fn filters_parse_ignores_config_line() {
+        // `--enable-libvmaf` is the second token here but not a filter row.
+        let text = "configuration: --enable-libvmaf --enable-gpl\n";
+        assert!(parse_filters_list(text).is_empty());
+        assert!(parse_filters_list("").is_empty());
+    }
+
+    #[test]
+    fn supported_line_shapes() {
+        assert_eq!(
+            supported_line(&[
+                MetricKind::Psnr,
+                MetricKind::Ssim,
+                MetricKind::Vmaf,
+                MetricKind::Xpsnr
+            ]),
+            "Supported: PSNR, SSIM, VMAF, XPSNR"
+        );
+        assert_eq!(supported_line(&[MetricKind::Psnr]), "Supported: PSNR");
+        assert_eq!(supported_line(&[]), "Supported: none");
+    }
+
+    #[test]
+    fn short_version_release_and_git() {
+        assert_eq!(
+            short_ffmpeg_version("ffmpeg version 7.1.1"),
+            "FFmpeg: 7.1.1"
+        );
+        assert_eq!(
+            short_ffmpeg_version("ffmpeg version 9.0.1-full_build-www.gyan.dev"),
+            "FFmpeg: 9.0.1-full"
+        );
+        assert_eq!(
+            short_ffmpeg_version("ffmpeg version git-2020-08-31-4a11a6f"),
+            "FFmpeg: git-2020-08-31-4a11a6f"
+        );
+        // Unknown shape falls back to the (already stripped) whole line.
+        assert_eq!(short_ffmpeg_version("some weird build"), "some weird build");
+    }
+
+    #[test]
+    fn short_version_nightly_strips_copyright() {
+        // Exact line shape from a nightly `-version` first line.
+        let line = "ffmpeg version N-126626-g7070fe638e-20260917 Copyright (c) 2000-2026 the FFmpeg developers";
+        let full = copyright_re().replace(line, "").trim_end().to_owned();
+        assert_eq!(
+            short_ffmpeg_version(&full),
+            "FFmpeg: N-126626-g7070fe638e-20260917"
+        );
+        assert!(!short_ffmpeg_version(&full).contains("Copyright"));
     }
 }

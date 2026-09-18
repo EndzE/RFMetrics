@@ -64,10 +64,11 @@ impl MetricKind {
         }
     }
 
-    /// ffmpeg filter name in the `<order><filter>=…` segment.
+    /// ffmpeg filter name in the `<order><filter>=…` segment, also used
+    /// for the startup `-filters` capability probe in `binaries.rs`.
     /// Unreachable for FFVship metrics (no filtergraph); the worker
     /// dispatches on `is_ffvship()` first.
-    fn filter(self) -> &'static str {
+    pub(crate) fn filter(self) -> &'static str {
         match self {
             Self::Psnr => "psnr",
             Self::Ssim => "ssim",
