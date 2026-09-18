@@ -43,12 +43,6 @@ pub fn init_logging() {
         }
     });
 }
-
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn init_is_idempotent() {
-        super::init_logging();
-        super::init_logging();
-    }
-}
+#[path = "tests/test_logging.rs"]
+mod tests;
