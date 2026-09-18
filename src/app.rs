@@ -2800,7 +2800,20 @@ impl eframe::App for RFMetricsApp {
                                 }
                                 let (_, r) = row.col(|ui| {
                                     let row_data = &self.rows[i];
-                                    ui.label(&row_data.media).on_hover_text(&row_data.media_tip);
+                                    ui.add(egui::Label::new(&row_data.media).selectable(false))
+                                        .on_hover_text(&row_data.media_tip);
+                                });
+                                r.context_menu(|ui| {
+                                    if ui.button("Copy summary").clicked() {
+                                        ui.ctx().copy_text(crate::probe::table_media_text(
+                                            self.rows[i].info.as_ref(),
+                                        ));
+                                        ui.close();
+                                    }
+                                    if ui.button("Copy details").clicked() {
+                                        ui.ctx().copy_text(self.rows[i].media_tip.clone());
+                                        ui.close();
+                                    }
                                 });
                                 if r.clicked() {
                                     toggle_row = Some(i);
