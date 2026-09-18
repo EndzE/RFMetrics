@@ -382,11 +382,12 @@ pub fn cell_media_text(text: &str, limit: usize) -> String {
     }
 }
 
-/// Python `table_media_tooltip`: 8-line hover detail (note `Colour` spelling).
+/// Python `table_media_tooltip`: 9-line hover detail (note `Colour` spelling).
 pub fn table_media_tooltip(info: Option<&MediaInfo>) -> String {
     let u = "-unknown-";
-    let (size_s, rate_s, field_s, pix_s, range_s, bit_s, dur_s, frames_s) = match info {
+    let (enc_s, size_s, rate_s, field_s, pix_s, range_s, bit_s, dur_s, frames_s) = match info {
         None => (
+            u.to_owned(),
             u.to_owned(),
             u.to_owned(),
             "Progressive".to_owned(),
@@ -397,6 +398,12 @@ pub fn table_media_tooltip(info: Option<&MediaInfo>) -> String {
             u.to_owned(),
         ),
         Some(info) => {
+            let enc_s = info
+                .encoder
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(u)
+                .to_owned();
             let size_s = match (info.width, info.height) {
                 (Some(w), Some(h)) => format!("{w}x{h}"),
                 _ => u.to_owned(),
@@ -433,12 +440,12 @@ pub fn table_media_tooltip(info: Option<&MediaInfo>) -> String {
                 None => u.to_owned(),
             };
             (
-                size_s, rate_s, field_s, pix_s, range_s, bit_s, dur_s, frames_s,
+                enc_s, size_s, rate_s, field_s, pix_s, range_s, bit_s, dur_s, frames_s,
             )
         }
     };
     format!(
-        "Frame size: {size_s}\nFrame Rate: {rate_s}\nField Type: {field_s}\n\
+        "Encoder: {enc_s}\nFrame size: {size_s}\nFrame Rate: {rate_s}\nField Type: {field_s}\n\
          Pixel Format: {pix_s}\nColour Range: {range_s}\nBitrate: {bit_s}\nDuration: {dur_s}\nTotal Frames: {frames_s}"
     )
 }
@@ -703,9 +710,10 @@ mod tests {
         // 63.04s × 29.97fps ≈ 1889 frames (computed fallback, no nb_frames)
         assert_eq!(
             table_media_tooltip(Some(&m)),
-            "Frame size: 1920x1080\nFrame Rate: 29.97 fps\nField Type: Progressive\n\
+            "Encoder: h264\nFrame size: 1920x1080\nFrame Rate: 29.97 fps\nField Type: Progressive\n\
              Pixel Format: yuv420p\nColour Range: TV\nBitrate: 5000 kb/s\nDuration: 00:01:03.04\nTotal Frames: 1889"
         );
+        assert!(table_media_tooltip(None).contains("Encoder: -unknown-"));
         assert!(table_media_tooltip(None).contains("Field Type: Progressive"));
         assert!(table_media_tooltip(None).contains("Total Frames: -unknown-"));
     }
