@@ -346,6 +346,13 @@ enum MetricMsg {
     /// End of the worker loop; `aborted` settles still-Running cells to
     /// Idle while keeping finished (`Done`) results on screen.
     Finished { generation: u64, aborted: bool },
+    /// CSV export summary from the worker (sent once before `Finished`
+    /// when export was enabled): files written vs. error strings.
+    CsvReport {
+        generation: u64,
+        ok: usize,
+        errors: Vec<String>,
+    },
 }
 
 pub struct RFMetricsApp {
@@ -370,6 +377,10 @@ pub struct RFMetricsApp {
     scale_method: ScaleMethod,
     /// Open the plot viewport when a run starts (Options checkbox).
     plot_at_start: bool,
+    /// Save per-frame metric CSVs on Done (Options checkbox).
+    csv_export: bool,
+    /// CSV output folder; empty = beside the distorted file (Options).
+    csv_dir: String,
     /// Save PNG / Copy image size preset (Options combobox).
     plot_size: crate::plot::PlotSize,
     rows: Vec<QueueRow>,
@@ -385,6 +396,10 @@ pub struct RFMetricsApp {
     hover_since: Option<f64>,
     hovered_now: Option<usize>,
     toast: Option<Toast>,
+    /// Pending CSV summary, set by the CsvReport drain arm and toasted
+    /// with a real timestamp at the next UI frame (drain has none).
+    /// `(files_written, error_strings)`.
+    csv_report: Option<(usize, Vec<String>)>,
     probe_tx: Sender<ProbeMsg>,
     probe_rx: Receiver<ProbeMsg>,
     metric_tx: Sender<MetricMsg>,
@@ -482,6 +497,8 @@ impl Default for RFMetricsApp {
             ),
             scale_method: ScaleMethod::default(),
             plot_at_start: false,
+            csv_export: false,
+            csv_dir: String::new(),
             plot_size: crate::plot::PlotSize::default(),
             rows: Vec::new(),
             ffmpeg,
@@ -495,6 +512,7 @@ impl Default for RFMetricsApp {
             hover_since: None,
             hovered_now: None,
             toast: None,
+            csv_report: None,
             probe_tx,
             probe_rx,
             metric_tx,
@@ -937,6 +955,20 @@ impl RFMetricsApp {
                     self.pending = 0;
                     self.measuring = false;
                 }
+                MetricMsg::CsvReport {
+                    generation,
+                    ok,
+                    errors,
+                } => {
+                    if generation != self.run_generation {
+                        continue;
+                    }
+                    // Toasted with a timestamp at the next UI frame below;
+                    // all-quiet reports (aborted run, nothing written) stay silent.
+                    if ok > 0 || !errors.is_empty() {
+                        self.csv_report = Some((ok, errors));
+                    }
+                }
             }
         }
         // Ranks depend on the whole scored set, so refresh after applying
@@ -1081,6 +1113,8 @@ impl RFMetricsApp {
                 scaling: Some(self.scale_method.label().to_owned()),
                 plot_at_start: Some(self.plot_at_start),
                 plot_size: Some(self.plot_size.label().to_owned()),
+                csv_export: Some(self.csv_export),
+                csv_dir: Some(self.csv_dir.clone()),
             },
         }
     }
@@ -1194,6 +1228,12 @@ impl RFMetricsApp {
         {
             self.plot_size = m;
         }
+        if let Some(csv_export) = s.options.csv_export {
+            self.csv_export = csv_export;
+        }
+        if let Some(csv_dir) = s.options.csv_dir {
+            self.csv_dir = csv_dir;
+        }
         // Restored ticks obey capability (see helper docs).
         self.untick_unsupported_metrics();
     }
@@ -1247,6 +1287,8 @@ impl RFMetricsApp {
         if o.scaling.as_deref() != Some(self.scale_method.label())
             || o.plot_at_start != Some(self.plot_at_start)
             || o.plot_size.as_deref() != Some(self.plot_size.label())
+            || o.csv_export != Some(self.csv_export)
+            || o.csv_dir.as_deref() != Some(self.csv_dir.as_str())
         {
             return true;
         }
@@ -1540,10 +1582,17 @@ impl RFMetricsApp {
         let tx = self.metric_tx.clone();
         let generation = self.run_generation;
         let ref_path = self.ref_path.clone();
+        // CSV setting frozen for the run (mid-run toggles must not half-apply).
+        let csv_cfg = crate::metrics::csv::CsvCfg {
+            enabled: self.csv_export,
+            dir: self.csv_dir.clone(),
+        };
         let abort = Arc::clone(&self.abort);
         let child_slot = Arc::clone(&self.current_child);
         std::thread::spawn(move || {
             use std::sync::atomic::Ordering;
+            let mut csv_ok = 0usize;
+            let mut csv_errors: Vec<String> = Vec::new();
             for (kind, key, dist_path, dist_info, exe) in jobs {
                 if abort.load(Ordering::SeqCst) {
                     break;
@@ -1591,6 +1640,20 @@ impl RFMetricsApp {
                 } else {
                     crate::metrics::ffmpeg::run_metric(&job, &progress, &series)
                 };
+                // CSV export rides the worker (never the UI thread); the
+                // one-line summary lands before Finished.
+                if csv_cfg.enabled && out.error.is_none() && !out.values.is_empty() {
+                    match crate::metrics::csv::write_metric_csv(&csv_cfg, kind, &dist_path, &out) {
+                        Ok(path) => {
+                            csv_ok += 1;
+                            log::info!(target: "rfmetrics::csv", "wrote {}", path.display());
+                        }
+                        Err(e) => {
+                            log::warn!(target: "rfmetrics::csv", "export failed: {e}");
+                            csv_errors.push(e);
+                        }
+                    }
+                }
                 let _ = tx.send(MetricMsg::Done {
                     generation,
                     kind,
@@ -1613,6 +1676,13 @@ impl RFMetricsApp {
                 generation,
                 aborted: abort.load(Ordering::SeqCst),
             });
+            if csv_cfg.enabled {
+                let _ = tx.send(MetricMsg::CsvReport {
+                    generation,
+                    ok: csv_ok,
+                    errors: csv_errors,
+                });
+            }
         });
         // One combined toast (see above), with identical skip sets merged so
         // shared filenames print once instead of repeating per metric.
@@ -2352,6 +2422,23 @@ impl eframe::App for RFMetricsApp {
         let ctx = ui.ctx().clone();
         let live = self.refresh_thumbnail(&ctx) | live;
         let live = self.drain_metric_results() | live;
+        if let Some((ok, errors)) = self.csv_report.take() {
+            if errors.is_empty() {
+                let s = if ok == 1 { "" } else { "s" };
+                self.toast(now, format!("Saved {ok} CSV file{s}"), ToastKind::Info);
+            } else {
+                let mut first = errors[0].clone();
+                if first.chars().count() > 80 {
+                    first = format!("{}…", first.chars().take(79).collect::<String>());
+                }
+                let s = if errors.len() == 1 { "" } else { "s" };
+                self.toast(
+                    now,
+                    format!("CSV export failed for {} file{s}: {first}", errors.len()),
+                    ToastKind::Error,
+                );
+            }
+        }
         let live = self.drain_png_results(&ctx, now) | live;
         if live {
             ui.ctx().request_repaint();
@@ -2676,6 +2763,54 @@ impl eframe::App for RFMetricsApp {
                                 .on_hover_text(
                                     "Open the plot window automatically when a run starts",
                                 );
+                            let _ = ui
+                                .add(egui::Checkbox::new(
+                                    &mut self.csv_export,
+                                    "Save frames metrics to CSV files",
+                                ))
+                                .on_hover_text(
+                                    "Write one <name>.<METRIC>.csv per finished run \
+                                     (TAB-separated per-frame values), to the folder below \
+                                     or beside each distorted file when empty",
+                                );
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [70.0, 18.0],
+                                    egui::Label::new("CSV folder").selectable(false),
+                                );
+                                // Bounded display (full path stays in the hover);
+                                // the worker snapshots the real string at Start.
+                                let full = self.csv_dir.clone();
+                                let shown = if full.trim().is_empty() {
+                                    "Beside distorted files".to_owned()
+                                } else if full.chars().count() > 40 {
+                                    format!(
+                                        "…{}",
+                                        full.chars().skip(full.chars().count() - 39).collect::<String>()
+                                    )
+                                } else {
+                                    full.clone()
+                                };
+                                ui.label(shown).on_hover_text(if full.trim().is_empty() {
+                                    "Empty: each CSV lands next to its distorted file".to_owned()
+                                } else {
+                                    full
+                                });
+                                if ui.button("Browse…").clicked()
+                                    && let Some(dir) = rfd::FileDialog::new()
+                                        .set_title("CSV output folder")
+                                        .pick_folder()
+                                {
+                                    self.csv_dir = dir.to_string_lossy().into_owned();
+                                }
+                                if ui
+                                    .button("Clear")
+                                    .on_hover_text("Back to beside-the-distorted-file")
+                                    .clicked()
+                                {
+                                    self.csv_dir.clear();
+                                }
+                            });
                             if ui
                                 .add(egui::Button::new("Refresh Files Media Info"))
                                 .on_hover_text(
@@ -4876,6 +5011,56 @@ mod tests {
         assert!(matches!(app.rows[0].vmaf, crate::metrics::MetricCell::Idle));
     }
 
+    /// CsvReport stashes the summary; the UI frame toasts it (drain has
+    /// no timestamp). Stale generations stay silent.
+    #[test]
+    fn csv_report_stash_and_generation() {
+        use super::MetricMsg;
+        let mut app = RFMetricsApp::default();
+        app.metric_tx
+            .send(MetricMsg::CsvReport {
+                generation: app.run_generation,
+                ok: 3,
+                errors: Vec::new(),
+            })
+            .unwrap();
+        assert!(app.drain_metric_results());
+        assert_eq!(
+            app.csv_report,
+            Some((3, Vec::new())),
+            "fresh report must stash"
+        );
+        // Stale report: dropped without touching the stash.
+        app.run_generation = app.run_generation.wrapping_add(1);
+        app.metric_tx
+            .send(MetricMsg::CsvReport {
+                generation: app.run_generation.wrapping_sub(1),
+                ok: 9,
+                errors: vec!["x".to_owned()],
+            })
+            .unwrap();
+        assert!(app.drain_metric_results());
+        assert_eq!(app.csv_report, Some((3, Vec::new())));
+    }
+
+    /// CSV options persist and restore like the other Options keys.
+    #[test]
+    fn state_apply_restores_csv_options() {
+        let mut app = RFMetricsApp::default();
+        let state = crate::state::AppState {
+            options: crate::state::OptionsState {
+                csv_export: Some(true),
+                csv_dir: Some("D:/csv".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        app.apply_state(Some(state));
+        assert!(app.csv_export);
+        assert_eq!(app.csv_dir, "D:/csv");
+        assert!(app.snapshot().options.csv_export == Some(true));
+    }
+
     /// `is_state_dirty` must agree with `snapshot() != saved_snapshot` for
     /// every persisted field; a missed field silently stops saving.
     #[test]
@@ -4929,6 +5114,10 @@ mod tests {
         app.plot_at_start = !app.plot_at_start;
         check(&mut app);
         app.plot_size = crate::plot::PlotSize::S1600;
+        check(&mut app);
+        app.csv_export = !app.csv_export;
+        check(&mut app);
+        app.csv_dir = "D:/csv".to_owned();
         check(&mut app);
         app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
         check(&mut app);

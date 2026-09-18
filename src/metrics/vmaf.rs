@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::metrics::ffmpeg::{
-    NORM, RunInputs, RunOutcome, ScaleMethod, pump_process, rate_args, scale_filter,
+    FrameDetail, NORM, RunInputs, RunOutcome, ScaleMethod, pump_process, rate_args, scale_filter,
     setrange_segment, trim_window,
 };
 use crate::probe::MediaInfo;
@@ -269,6 +269,10 @@ pub struct VmafLog {
     pub values: Vec<f64>,
     pub mean: Option<f64>,
     pub harmonic_mean: Option<f64>,
+    /// CSV columns (libvmaf emission order, `vmaf` pinned last) + raw
+    /// unclamped feature rows, aligned 1:1 with `values`.
+    pub cols: Vec<String>,
+    pub rows: Vec<Vec<f64>>,
 }
 
 /// Parse a libvmaf JSON log (Python `_parse_vmaf_log` parity):
@@ -280,10 +284,24 @@ pub fn parse_vmaf_log(text: &str, max_score: f64) -> Option<VmafLog> {
     let mut log = VmafLog::default();
     if let Some(frames) = data.get("frames").and_then(|f| f.as_array()) {
         for f in frames {
-            let v = f
-                .get("metrics")
-                .and_then(|m| m.get("vmaf"))
-                .and_then(tolerant_f64);
+            let metrics = f.get("metrics").and_then(|m| m.as_object());
+            let Some(metrics) = metrics else {
+                continue;
+            };
+            // Column order from the first frame (libvmaf emission order
+            // with `preserve_order`); `vmaf` pinned last like the samples.
+            if log.cols.is_empty() {
+                log.cols.extend(
+                    metrics
+                        .keys()
+                        .filter(|k| *k != "vmaf")
+                        .map(|k| k.to_owned()),
+                );
+                if metrics.contains_key("vmaf") {
+                    log.cols.push("vmaf".to_owned());
+                }
+            }
+            let v = metrics.get("vmaf").and_then(tolerant_f64);
             if let Some(v) = v {
                 // `inf` (identical files) saturates at the top of the
                 // model's range; `nan` sanitizes to 0 downstream.
@@ -294,6 +312,25 @@ pub fn parse_vmaf_log(text: &str, max_score: f64) -> Option<VmafLog> {
                 };
                 if v.is_finite() {
                     log.values.push(v);
+                    // Raw features (no clamp — samples show values like
+                    // 1.007); only non-finite junk sanitizes. A frame
+                    // missing a column can never align, so it drops the
+                    // whole row (values + detail stay 1:1).
+                    let row: Option<Vec<f64>> = log
+                        .cols
+                        .iter()
+                        .map(|k| {
+                            metrics
+                                .get(k)
+                                .and_then(tolerant_f64)
+                                .map(crate::metrics::ffmpeg::sanitize_db)
+                        })
+                        .collect();
+                    if let Some(row) = row {
+                        log.rows.push(row);
+                    } else {
+                        log.values.pop();
+                    }
                 }
             }
         }
@@ -369,6 +406,7 @@ pub fn run_vmaf(job: &RunInputs, cfg: &VmafCfg, on_progress: &(dyn Fn(u64) + Syn
         avg: None,
         exec_s: 0.0,
         error: Some(msg),
+        detail: FrameDetail::None,
     };
     let home = vmaf_home();
     let models_dir = home.join("vmaf-models");
@@ -438,6 +476,7 @@ pub fn run_vmaf(job: &RunInputs, cfg: &VmafCfg, on_progress: &(dyn Fn(u64) + Syn
             avg: None,
             exec_s: pumped.exec_s,
             error: Some("aborted".to_owned()),
+            detail: FrameDetail::None,
         };
     }
     let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
@@ -468,20 +507,25 @@ pub fn run_vmaf(job: &RunInputs, cfg: &VmafCfg, on_progress: &(dyn Fn(u64) + Syn
             avg: None,
             exec_s: pumped.exec_s,
             error: Some(msg),
+            detail: FrameDetail::None,
         };
     }
     // Re-resolve for the score range (one extra tiny dir read per run;
     // cheaper than threading the name out of `build_filter`).
     let max_score = model_score_max(&resolve_model(&cfg.model, &models_dir).1);
-    let (values, avg) = match parse_vmaf_log(&log_text, max_score) {
+    let (values, avg, detail) = match parse_vmaf_log(&log_text, max_score) {
         Some(log) if !log.values.is_empty() => {
             let pooled = match cfg.pooling {
                 Pooling::HarmonicMean => log.harmonic_mean,
                 Pooling::Mean => log.mean,
             };
-            (log.values, pooled)
+            let detail = FrameDetail::Vmaf {
+                cols: log.cols,
+                rows: log.rows,
+            };
+            (log.values, pooled, detail)
         }
-        _ => (Vec::new(), None),
+        _ => (Vec::new(), None, FrameDetail::None),
     };
     if values.is_empty() {
         let tail = pumped
@@ -500,6 +544,7 @@ pub fn run_vmaf(job: &RunInputs, cfg: &VmafCfg, on_progress: &(dyn Fn(u64) + Syn
             avg: None,
             exec_s: pumped.exec_s,
             error: Some(msg),
+            detail: FrameDetail::None,
         };
     }
     let show = avg.unwrap_or_else(|| values.iter().sum::<f64>() / values.len() as f64);
@@ -515,6 +560,7 @@ pub fn run_vmaf(job: &RunInputs, cfg: &VmafCfg, on_progress: &(dyn Fn(u64) + Syn
         avg,
         exec_s: pumped.exec_s,
         error: None,
+        detail,
     }
 }
 

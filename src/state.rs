@@ -96,6 +96,8 @@ pub struct OptionsState {
     pub scaling: Option<String>,
     pub plot_at_start: Option<bool>,
     pub plot_size: Option<String>,
+    pub csv_export: Option<bool>,
+    pub csv_dir: Option<String>,
 }
 
 /// The whole persisted snapshot: verbatim boxes, optional queue, and
@@ -204,6 +206,8 @@ mod tests {
                 scaling: Some("Bicubic".to_owned()),
                 plot_at_start: Some(true),
                 plot_size: Some("3200×800".to_owned()),
+                csv_export: Some(true),
+                csv_dir: Some("D:/csv".to_owned()),
             },
         };
         let back: AppState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();

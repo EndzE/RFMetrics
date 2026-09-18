@@ -201,11 +201,13 @@ pub fn run_ffvship(
         ..
     } = *job;
     let name = kind.metric_arg();
+    // FFVship kinds are out of CSV scope: no frame detail is retained.
     let fail = |msg: String| RunOutcome {
         values: Vec::new(),
         avg: None,
         exec_s: 0.0,
         error: Some(msg),
+        detail: crate::metrics::ffmpeg::FrameDetail::None,
     };
     let (window, expected_n) = match trim_window_frames(ref_info, dist_info, skip, clip_dur) {
         Ok(w) => w,
@@ -271,6 +273,7 @@ pub fn run_ffvship(
             avg: None,
             exec_s: pumped.exec_s,
             error: Some("aborted".to_owned()),
+            detail: crate::metrics::ffmpeg::FrameDetail::None,
         };
     }
     // Python ignores the exit code and trusts the strict parse instead.
@@ -291,6 +294,7 @@ pub fn run_ffvship(
                 avg,
                 exec_s: pumped.exec_s,
                 error: None,
+                detail: crate::metrics::ffmpeg::FrameDetail::None,
             }
         }
         None => {
@@ -308,6 +312,7 @@ pub fn run_ffvship(
                 avg: None,
                 exec_s: pumped.exec_s,
                 error: Some(msg),
+                detail: crate::metrics::ffmpeg::FrameDetail::None,
             }
         }
     }

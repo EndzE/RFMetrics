@@ -214,6 +214,45 @@ pub fn parse_frame_line(line: &str, kind: MetricKind) -> Option<f64> {
     Some(v.clamp(0.0, hi))
 }
 
+/// Raw number after a `key:` token on a stats line (`psnr_y:43.93`,
+/// `Y:0.98`). `None` when the key is absent, unparseable, or `nan` —
+/// a nan plane poisons the row, mirroring the pooled-value skip, so
+/// detail rows stay 1:1 with `values`. Order-independent (unlike the
+/// single-regex frame parsers above).
+fn stat_num(line: &str, key: &str) -> Option<f64> {
+    line.split_whitespace().find_map(|tok| {
+        tok.strip_prefix(key)?
+            .strip_prefix(':')?
+            .trim_end_matches(')')
+            .parse::<f64>()
+            .ok()
+            .filter(|v| !v.is_nan())
+    })
+}
+
+/// PSNR planes per frame: [avg, y, u, v], sanitized like the series
+/// (`inf` → 100; a surviving line never holds `nan`).
+pub fn parse_psnr_planes(line: &str) -> Option<[f64; 4]> {
+    if !line.trim_start().starts_with("n:") {
+        return None;
+    }
+    Some([
+        sanitize_db(stat_num(line, "psnr_avg")?),
+        sanitize_db(stat_num(line, "psnr_y")?),
+        sanitize_db(stat_num(line, "psnr_u")?),
+        sanitize_db(stat_num(line, "psnr_v")?),
+    ])
+}
+
+/// SSIM planes per frame: [Y, U, V, All], clamped like the series.
+pub fn parse_ssim_planes(line: &str) -> Option<[f64; 4]> {
+    if !line.trim_start().starts_with("n:") {
+        return None;
+    }
+    let plane = |key: &str| stat_num(line, key).map(|v| v.clamp(0.0, 1.0));
+    Some([plane("Y")?, plane("U")?, plane("V")?, plane("All")?])
+}
+
 /// Frame counter from a stats line (`n:12 ...`) for progress.
 pub fn parse_progress(line: &str) -> Option<u64> {
     progress_re().captures(line)?.get(1)?.as_str().parse().ok()
@@ -480,17 +519,24 @@ fn weighted_avg(y: f64, u: f64, v: f64, weights: (f64, f64, f64)) -> f64 {
     (wy * y + wu * u + wv * v) / total
 }
 
-/// Per-frame XPSNR value from a stats line
-/// (`n:1 XPSNR y: 42.1 XPSNR u: 45.0 XPSNR v: 44.2`), plane-weighted.
+/// Raw XPSNR planes from a stats line
+/// (`n:1 XPSNR y: 42.1 XPSNR u: 45.0 XPSNR v: 44.2`), sanitized.
 /// Frame regex requires the `XPSNR` prefix on every plane.
-pub fn parse_xpsnr_frame_line(line: &str, weights: (f64, f64, f64)) -> Option<f64> {
+pub fn parse_xpsnr_planes(line: &str) -> Option<[f64; 3]> {
     if !line.trim_start().starts_with("n:") {
         return None;
     }
     let c = xpsnr_frame_re().captures(line)?;
-    let y = sanitize_db(c.get(1)?.as_str().parse().ok()?);
-    let u = sanitize_db(c.get(2)?.as_str().parse().ok()?);
-    let v = sanitize_db(c.get(3)?.as_str().parse().ok()?);
+    Some([
+        sanitize_db(c.get(1)?.as_str().parse().ok()?),
+        sanitize_db(c.get(2)?.as_str().parse().ok()?),
+        sanitize_db(c.get(3)?.as_str().parse().ok()?),
+    ])
+}
+
+/// Per-frame XPSNR value from a stats line, plane-weighted.
+pub fn parse_xpsnr_frame_line(line: &str, weights: (f64, f64, f64)) -> Option<f64> {
+    let [y, u, v] = parse_xpsnr_planes(line)?;
     Some(weighted_avg(y, u, v, weights))
 }
 
@@ -583,6 +629,31 @@ pub struct RunOutcome {
     pub avg: Option<f64>,
     pub exec_s: f64,
     pub error: Option<String>,
+    /// Per-frame detail rows for CSV export, aligned 1:1 with `values`
+    /// (row `i` describes `values[i]`). The pooled series stays the only
+    /// source for stats/plots; this never enters the UI data path.
+    pub detail: FrameDetail,
+}
+
+/// Per-frame detail rows for CSV export (raw planes/features; pooled
+/// `values` stay the single source for stats/plots).
+#[derive(Debug, Clone, Default)]
+pub enum FrameDetail {
+    /// Errors, and metrics without a CSV shape (FFVship kinds).
+    #[default]
+    None,
+    /// PSNR planes per frame: [avg, y, u, v] (sanitized like the series).
+    Psnr(Vec<[f64; 4]>),
+    /// SSIM planes per frame: [Y, U, V, All] (clamped like the series).
+    Ssim(Vec<[f64; 4]>),
+    /// XPSNR raw planes per frame: [y, u, v] (sanitized, unweighted).
+    Xpsnr(Vec<[f64; 3]>),
+    /// VMAF: feature columns in libvmaf emission order with `vmaf` pinned
+    /// last; rows hold raw (unclamped) feature values.
+    Vmaf {
+        cols: Vec<String>,
+        rows: Vec<Vec<f64>>,
+    },
 }
 
 /// Result of pumping one ffmpeg child to completion.
@@ -743,6 +814,7 @@ pub fn run_metric(
         avg: None,
         exec_s: 0.0,
         error: Some(msg),
+        detail: FrameDetail::None,
     };
     let args = build_args(
         kind, ref_path, dist_path, ref_info, dist_info, skip, clip_dur, scaler,
@@ -751,6 +823,15 @@ pub fn run_metric(
     // report (FFMetrics.log parity) — one line per metric job.
     log::info!(target: "rfmetrics::metric", "run: \"{}\" {}", exe.display(), args.join(" "));
     let mut values = Vec::new();
+    // CSV detail rows, pushed in lockstep with `values` (row `i`
+    // describes `values[i]`); the writer zips defensively anyway.
+    let mut detail = match kind {
+        MetricKind::Psnr => FrameDetail::Psnr(Vec::new()),
+        MetricKind::Ssim => FrameDetail::Ssim(Vec::new()),
+        MetricKind::Xpsnr => FrameDetail::Xpsnr(Vec::new()),
+        // VMAF/FFVship fill detail in their own runners.
+        _ => FrameDetail::None,
+    };
     // Live-curve tap: per-frame values stream to the plot in throttled
     // batches (the strict full series still lands on `Done`). No final
     // flush: `Done` arrives right behind and replaces the buffer.
@@ -779,6 +860,26 @@ pub fn run_metric(
                 values.push(v);
                 pending.push(v);
                 emit(&mut pending, &mut last_emit);
+                // A pooled value implies parseable planes (same line), so
+                // a missed row here is only theoretical; the writer zips.
+                match (&mut detail, kind) {
+                    (FrameDetail::Psnr(rows), MetricKind::Psnr) => {
+                        if let Some(p) = parse_psnr_planes(line) {
+                            rows.push(p);
+                        }
+                    }
+                    (FrameDetail::Ssim(rows), MetricKind::Ssim) => {
+                        if let Some(p) = parse_ssim_planes(line) {
+                            rows.push(p);
+                        }
+                    }
+                    (FrameDetail::Xpsnr(rows), MetricKind::Xpsnr) => {
+                        if let Some(p) = parse_xpsnr_planes(line) {
+                            rows.push(p);
+                        }
+                    }
+                    _ => {}
+                }
             }
         },
         on_progress,
@@ -797,6 +898,7 @@ pub fn run_metric(
             avg: None,
             exec_s,
             error: Some("aborted".to_owned()),
+            detail: FrameDetail::None,
         };
     }
     if values.is_empty() {
@@ -809,6 +911,7 @@ pub fn run_metric(
             avg: None,
             exec_s,
             error: Some(msg),
+            detail: FrameDetail::None,
         };
     }
     let avg = match kind {
@@ -826,6 +929,7 @@ pub fn run_metric(
         avg,
         exec_s,
         error: None,
+        detail,
     }
 }
 
@@ -1152,6 +1256,32 @@ mod tests {
         // Case-insensitive like the Python regex.
         assert!(
             parse_xpsnr_frame_line("n:6 xpsnr y: 40.0 xpsnr u: 40.0 xpsnr v: 40.0", w).is_some()
+        );
+    }
+
+    #[test]
+    fn plane_rows_for_csv() {
+        assert_eq!(
+            parse_psnr_planes(
+                "n:1 mse_avg:0.5 psnr_avg:45.42 psnr_y:43.93 psnr_u:52.94 psnr_v:52.73"
+            ),
+            Some([45.42, 43.93, 52.94, 52.73])
+        );
+        assert_eq!(parse_psnr_planes("frame= 12 fps=25"), None);
+        assert_eq!(parse_psnr_planes("n:1 psnr_avg:45.42"), None);
+        assert_eq!(
+            parse_ssim_planes("n:1 Y:0.984065 U:0.995422 V:0.995221 All:0.987817"),
+            Some([0.984065, 0.995422, 0.995221, 0.987817])
+        );
+        assert_eq!(parse_ssim_planes("n:1 Y:0.9 All:0.95"), None);
+        assert_eq!(
+            parse_xpsnr_planes("n:1 XPSNR y: 48.1827 XPSNR u: 56.2272 XPSNR v: 55.9481"),
+            Some([48.1827, 56.2272, 55.9481])
+        );
+        // inf sanitizes like the series.
+        assert_eq!(
+            parse_psnr_planes("n:1 psnr_avg:inf psnr_y:inf psnr_u:inf psnr_v:inf"),
+            Some([100.0, 100.0, 100.0, 100.0])
         );
     }
 
