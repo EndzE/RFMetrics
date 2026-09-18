@@ -452,6 +452,11 @@ pub struct RFMetricsApp {
     /// Follow poke still owed: set when a live phase starts without plot
     /// memory present (window just opened), retried until it lands.
     plot_follow_pending: bool,
+    /// Reset-view click still owed: the help-bar `Ui` scopes persistent
+    /// ids differently than the canvas `Ui`, so the button only arms this
+    /// flag and the central panel (plot id scope) executes the poke.
+    /// Retried until plot memory exists, like the follow poke.
+    plot_reset_pending: bool,
     /// Snap-to-data lock (plot window checkbox, session-only): panning is
     /// clamped to the first/last frame on x and the plotted min/max on y;
     /// zooming and in-limits panning stay free.
@@ -539,6 +544,7 @@ impl Default for RFMetricsApp {
             plot_tabs_w: 0.0,
             plot_live_fit: None,
             plot_follow_pending: false,
+            plot_reset_pending: false,
             plot_snap: false,
             plot_save_pending: None,
             png_tx,
@@ -890,6 +896,29 @@ impl RFMetricsApp {
                         continue;
                     }
                     self.pending = self.pending.saturating_sub(1);
+                    // First real data for a no-live-feed tab (VMAF): it sat
+                    // on the empty default all run, so owe one auto-follow
+                    // poke and Done snaps into view. Live-feed metrics
+                    // follow mid-run already — refitting those here would
+                    // yank a zoom the user is examining. Only when the plot
+                    // window is open on this tab and no sibling row shows
+                    // data yet (later rows must not disturb the first fit).
+                    if !kind.streams_live_values()
+                        && self.show_plot
+                        && kind == self.plot_tab
+                        && error.is_none()
+                        && !values.is_empty()
+                        && !self.rows.iter().any(|r| {
+                            r.key != key
+                                && matches!(
+                                    r.cell(kind),
+                                    crate::metrics::MetricCell::Done { values, .. }
+                                    if !values.is_empty()
+                                )
+                        })
+                    {
+                        self.plot_follow_pending = true;
+                    }
                     if let Some(row) = self.rows.iter_mut().find(|r| r.key == key) {
                         *row.cell_mut(kind) = match error {
                             // Killed by Stop: settle quietly like unstarted
@@ -1828,12 +1857,20 @@ impl RFMetricsApp {
                 (follow, grown)
             } else {
                 self.plot_live_fit = None;
+                // One-shot re-fit owed by a no-live-feed first Done (VMAF):
+                // consumed like the follow retry above, so a stale arm can
+                // never yank a later zoom.
+                let follow = self.plot_follow_pending;
                 self.plot_follow_pending = false;
-                (false, fresh)
+                (follow, fresh)
             };
             // Empty plot (no Done data): axes only, y on the metric
             // default range; x falls back to a unit span.
             let (xmin, xmax) = xlim.unwrap_or((0.0, 1.0));
+            // Per-tab plot id (zoom state persists per metric); hoisted so
+            // the help-bar Reset below pokes the same memory entry the
+            // canvas, snap clamp, and export snapshot use.
+            let plot_id = format!("plot-{}", crate::plot::tab_title(kind).to_lowercase());
             // Help bar pinned to the bottom (Python `side="bottom"` parity).
             egui::Panel::bottom("plot_help").show(vui, |ui| {
                 ui.horizontal(|ui| {
@@ -1846,6 +1883,20 @@ impl RFMetricsApp {
                     ui.checkbox(&mut self.plot_snap, "Snap to data").on_hover_text(
                         "Lock panning to the first/last frame and the plotted min/max; zoom and pan inside freely",
                     );
+                    // Explicit re-fit (double-click parity): only arms the
+                    // flag — the poke runs in the central panel below,
+                    // where the plot id scope lives (a help-bar `Ui`
+                    // derives different persistent ids than the canvas).
+                    if ui
+                        .add_enabled(
+                            !borrowed.is_empty(),
+                            egui::Button::new("Reset view"),
+                        )
+                        .on_hover_text("Fit the whole series (same as double-click)")
+                        .clicked()
+                    {
+                        self.plot_reset_pending = true;
+                    }
                     let save_label = if self.png_saving { "Saving…" } else { "Save PNG" };
                     let save_hover = if self.png_saving {
                         "Writing PNG in the background…"
@@ -1933,9 +1984,7 @@ impl RFMetricsApp {
                     });
                     self.plot_tabs_w = frame_resp.response.rect.width();
                 });
-                // Per-tab plot id: zoom state persists per metric.
-                let plot_id =
-                    format!("plot-{}", crate::plot::tab_title(kind).to_lowercase());
+                // Per-tab plot id shared with the help-bar Reset above.
                 // One-shot live-follow: explicit default bounds seed fresh
                 // PlotMemory with auto OFF, freezing the first-shown
                 // (often still empty) view until a double-click. Flip auto
@@ -1983,6 +2032,24 @@ impl RFMetricsApp {
                             [cx1, cy1],
                         ));
                         mem.store(ui.ctx(), pid);
+                    }
+                }
+                // Reset-view button (help bar arms the flag — this `Ui`
+                // owns the plot id scope): write the computed fit into
+                // this tab's stored bounds and take over from auto-follow
+                // (a user takeover, like pan/zoom). After snap so the
+                // exact fit wins over the clamp. Retried while memory is
+                // missing, like the follow poke.
+                if self.plot_reset_pending && !borrowed.is_empty() {
+                    let pid = ui.make_persistent_id(egui::Id::new(plot_id.clone()));
+                    if let Some(mut mem) = egui_plot::PlotMemory::load(ui.ctx(), pid) {
+                        mem.auto_bounds = false.into();
+                        mem.set_bounds(egui_plot::PlotBounds::from_min_max(
+                            [xmin, ymin],
+                            [xmax, ymax],
+                        ));
+                        mem.store(ui.ctx(), pid);
+                        self.plot_reset_pending = false;
                     }
                 }
                 // Draw budget: ~2 points per horizontal pixel (the y-axis
@@ -5235,6 +5302,110 @@ mod tests {
         assert_eq!(app.rows[0].psnr_cache.text, "boom");
         app.reset_psnr();
         assert!(app.rows[0].psnr_cache.text.is_empty());
+    }
+
+    /// No-live-feed first Done (VMAF) on the shown tab owes one auto-fit
+    /// poke; a later sibling row must not disturb the first fit.
+    #[test]
+    fn vmaf_first_done_arms_follow() {
+        use super::MetricMsg;
+        use crate::metrics::MetricCell;
+        use crate::metrics::ffmpeg::MetricKind;
+        let done = |key: &str| MetricMsg::Done {
+            generation: 0,
+            kind: MetricKind::Vmaf,
+            key: norm_key(key),
+            values: vec![90.0, 91.0],
+            avg: Some(90.5),
+            exec_s: 1.0,
+            error: None,
+            skip: None,
+            clip_dur: None,
+            vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
+        };
+        let mut app = RFMetricsApp {
+            show_plot: true,
+            plot_tab: MetricKind::Vmaf,
+            ..RFMetricsApp::default()
+        };
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows[0].vmaf = MetricCell::Running {
+            frame: 0,
+            values: Vec::new(),
+        };
+        app.metric_tx.send(done("C:/vids/a.mp4")).unwrap();
+        app.drain_metric_results();
+        assert!(
+            app.plot_follow_pending,
+            "first VMAF Done on the shown tab must arm a refit"
+        );
+        app.plot_follow_pending = false;
+        app.rows.push(psnr_test_row("C:/vids/b.mp4", true));
+        app.metric_tx.send(done("C:/vids/b.mp4")).unwrap();
+        app.drain_metric_results();
+        assert!(
+            !app.plot_follow_pending,
+            "later rows must not disturb the first fit"
+        );
+    }
+
+    /// Arming rules: live-feed metrics, hidden tabs, closed window, and
+    /// errored runs never arm the poke.
+    #[test]
+    fn follow_arm_rules() {
+        use super::MetricMsg;
+        use crate::metrics::ffmpeg::MetricKind;
+        let done = |kind, key: &str, error: Option<String>| MetricMsg::Done {
+            generation: 0,
+            kind,
+            key: norm_key(key),
+            values: vec![30.0],
+            avg: Some(30.0),
+            exec_s: 1.0,
+            error,
+            skip: None,
+            clip_dur: None,
+            vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
+        };
+        // Live-feed metric never arms, even first on the shown tab.
+        let mut app = RFMetricsApp {
+            show_plot: true,
+            plot_tab: MetricKind::Psnr,
+            ..RFMetricsApp::default()
+        };
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.metric_tx
+            .send(done(MetricKind::Psnr, "C:/vids/a.mp4", None))
+            .unwrap();
+        app.drain_metric_results();
+        assert!(!app.plot_follow_pending);
+        // First VMAF data on a hidden tab never arms.
+        app.metric_tx
+            .send(done(MetricKind::Vmaf, "C:/vids/a.mp4", None))
+            .unwrap();
+        app.drain_metric_results();
+        assert!(!app.plot_follow_pending);
+        // Closed window never arms.
+        app.show_plot = false;
+        app.plot_tab = MetricKind::Vmaf;
+        app.metric_tx
+            .send(done(MetricKind::Vmaf, "C:/vids/a.mp4", None))
+            .unwrap();
+        app.drain_metric_results();
+        assert!(!app.plot_follow_pending);
+        // Errored VMAF never arms.
+        app.show_plot = true;
+        app.metric_tx
+            .send(done(
+                MetricKind::Vmaf,
+                "C:/vids/a.mp4",
+                Some("boom".to_owned()),
+            ))
+            .unwrap();
+        app.drain_metric_results();
+        assert!(!app.plot_follow_pending);
     }
 
     /// Rerun start clears the frozen text synchronously (asserted before the

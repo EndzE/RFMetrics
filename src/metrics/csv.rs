@@ -72,6 +72,11 @@ fn render(
         (MetricKind::Vmaf, FrameDetail::Vmaf { cols, rows }) => {
             (format!("frame\t{}", cols.join("\t")), rows.clone(), false)
         }
+        // FFVship multi-score rows (headers from `FfvshipKind::csv_cols`);
+        // like the ffmpeg metrics these carry the 1-based `n` column.
+        (_, FrameDetail::Scores { cols, rows }) => {
+            (format!("frame\tn\t{}", cols.join("\t")), rows.clone(), true)
+        }
         _ => return Err("no frame data captured".to_owned()),
     };
     if rows.len() != n_values {
@@ -241,6 +246,73 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
             "frame\tinteger_adm2\tvmaf\r\n0\t0,995258\t95,946422\r\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Golden shapes with real measured live values (frames 0–1 of the
+    /// sample pair): SSIMULACRA2 single score, Butteraugli's three norms,
+    /// CVVDP single score — all with the `n` column.
+    #[test]
+    fn golden_ffvship_shapes() {
+        use crate::metrics::ffvship::FfvshipKind;
+        let dir = test_dir("ffvship");
+        let cfg = CsvCfg {
+            enabled: true,
+            dir: dir.to_string_lossy().into_owned(),
+        };
+        let dist = "C:/vids/a.mkv";
+        let p = write_metric_csv(
+            &cfg,
+            MetricKind::Ssim2,
+            dist,
+            &outcome(
+                FrameDetail::Scores {
+                    cols: FfvshipKind::Ssimulacra2.csv_cols(),
+                    rows: vec![vec![81.0507], vec![79.5221]],
+                },
+                2,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "frame\tn\tssimulacra2\r\n0\t1\t81,0507\r\n1\t2\t79,5221\r\n"
+        );
+        let p = write_metric_csv(
+            &cfg,
+            MetricKind::But,
+            dist,
+            &outcome(
+                FrameDetail::Scores {
+                    cols: FfvshipKind::Butteraugli.csv_cols(),
+                    rows: vec![vec![0.749519, 0.813082, 2.83991]],
+                },
+                1,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "frame\tn\tbutteraugli_2norm\tbutteraugli_3norm\tbutteraugli_infnorm\r\n\
+             0\t1\t0,749519\t0,813082\t2,83991\r\n"
+        );
+        let p = write_metric_csv(
+            &cfg,
+            MetricKind::Cvvdp,
+            dist,
+            &outcome(
+                FrameDetail::Scores {
+                    cols: FfvshipKind::Cvvdp.csv_cols(),
+                    rows: vec![vec![9.82829]],
+                },
+                1,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "frame\tn\tcvvdp\r\n0\t1\t9,82829\r\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

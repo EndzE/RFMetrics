@@ -52,6 +52,14 @@ impl MetricKind {
         matches!(self, Self::Ssim2 | Self::But | Self::Cvvdp)
     }
 
+    /// Metrics whose runner streams per-frame live values (the plot
+    /// follows them mid-run). VMAF has no live feed — scores exist only
+    /// at `Done` — so its tab never auto-fits without a Done-triggered
+    /// poke. A future no-live-feed metric must join the `Vmaf` arm.
+    pub fn streams_live_values(self) -> bool {
+        !matches!(self, Self::Vmaf)
+    }
+
     /// The FFVship sub-kind (metric name, arity, pooling); `None` for
     /// ffmpeg-backed metrics.
     pub fn ffvship_kind(self) -> Option<crate::metrics::ffvship::FfvshipKind> {
@@ -198,7 +206,7 @@ pub fn parse_frame_line(line: &str, kind: MetricKind) -> Option<f64> {
         ),
         // XPSNR combines three planes with weights: use parse_xpsnr_frame_line.
         // VMAF parses its JSON log instead: use vmaf::parse_vmaf_log.
-        // FFVship parses live stdout instead: use ffvship::parse_series.
+        // FFVship parses live stdout instead: use ffvship::parse_live_rows.
         MetricKind::Xpsnr
         | MetricKind::Vmaf
         | MetricKind::Ssim2
@@ -651,6 +659,12 @@ pub enum FrameDetail {
     /// VMAF: feature columns in libvmaf emission order with `vmaf` pinned
     /// last; rows hold raw (unclamped) feature values.
     Vmaf {
+        cols: Vec<String>,
+        rows: Vec<Vec<f64>>,
+    },
+    /// FFVship multi-score rows in live-output order (`idx`-sorted by the
+    /// parser); headers come from `FfvshipKind::csv_cols`.
+    Scores {
         cols: Vec<String>,
         rows: Vec<Vec<f64>>,
     },
@@ -1227,6 +1241,15 @@ mod tests {
         assert_eq!(sanitize_db(f64::NAN), 0.0);
         assert_eq!(sanitize_db(42.5), 42.5);
         assert_eq!(sanitize_db(-3.0), -3.0); // unclamped otherwise
+    }
+
+    #[test]
+    fn live_feed_flags() {
+        use super::MetricKind::*;
+        assert!(!Vmaf.streams_live_values());
+        for k in [Psnr, Ssim, Xpsnr, Ssim2, But, Cvvdp] {
+            assert!(k.streams_live_values());
+        }
     }
 
     #[test]

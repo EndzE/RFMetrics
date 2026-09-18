@@ -5,7 +5,9 @@
 //! FFVship-specific. Scores are never clamped (Python parity: finite-check
 //! only) — unlike the PSNR/SSIM frame clamps.
 
-use crate::metrics::ffmpeg::{RunInputs, RunOutcome, STDERR_TAIL_LINES, pump_process, stderr_tail};
+use crate::metrics::ffmpeg::{
+    FrameDetail, RunInputs, RunOutcome, STDERR_TAIL_LINES, pump_process, stderr_tail,
+};
 use crate::probe::MediaInfo;
 
 /// Which FFVship metric a run computes: CLI name, per-line score count,
@@ -38,6 +40,25 @@ impl FfvshipKind {
     /// CVVDP alone pools the last frame value; the rest use the mean.
     fn pool_last(self) -> bool {
         matches!(self, Self::Cvvdp)
+    }
+
+    /// CSV column headers (the writer prepends `frame`/`n`): measured
+    /// score names in live-output order. Butteraugli's first column is
+    /// the default `--qnorm 2` norm — verified live (`--qnorm 3` moves
+    /// it onto the second column, which is always the 3Norm).
+    pub fn csv_cols(self) -> Vec<String> {
+        match self {
+            Self::Ssimulacra2 => vec!["ssimulacra2".to_owned()],
+            Self::Butteraugli => [
+                "butteraugli_2norm",
+                "butteraugli_3norm",
+                "butteraugli_infnorm",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            Self::Cvvdp => vec!["cvvdp".to_owned()],
+        }
     }
 }
 
@@ -117,15 +138,9 @@ fn parse_live_rows(text: &str, expected_n: Option<i64>, n_scores: usize) -> Opti
         .collect::<Option<Vec<_>>>()
 }
 
-/// Per-frame series for one FFVship metric (first score per line).
-pub fn parse_series(text: &str, expected_n: Option<i64>, kind: FfvshipKind) -> Option<Vec<f64>> {
-    parse_live_rows(text, expected_n, kind.n_scores())
-        .map(|rows| rows.into_iter().map(|r| r[0]).collect())
-}
-
 /// Best-effort per-line curve value for live plots: the first score of a
-/// well-formed `<idx> <scores…>` line — exactly what `parse_series`
-/// collects per row. Anything else is skipped live; the strict end-parse
+/// well-formed `<idx> <scores…>` line — exactly what the runner collects
+/// per row. Anything else is skipped live; the strict end-parse
 /// (arity, finiteness, duplicates, coverage) still decides `Done`, which
 /// replaces the live buffer.
 pub fn live_value(line: &str, n_scores: usize) -> Option<f64> {
@@ -223,7 +238,7 @@ pub fn run_ffvship(
     let mut out_lines: Vec<String> = Vec::new();
     let mut frames = 0u64;
     // Live-curve tap: first score per well-formed line, mirroring what
-    // the strict end-parse collects (`parse_series` takes `r[0]`).
+    // the strict end-parse takes (`r[0]`).
     // Malformed lines are skipped live; `Done` replaces the buffer with
     // the strict result either way. Same throttle as `run_metric`.
     let n_scores = kind.n_scores();
@@ -277,9 +292,12 @@ pub fn run_ffvship(
         };
     }
     // Python ignores the exit code and trusts the strict parse instead.
+    // Full ordered rows feed both the pooled series (first score, the
+    // runner's live projection) and the CSV detail.
     let text = out_lines.join("\n");
-    match parse_series(&text, expected_n, kind).filter(|v| !v.is_empty()) {
-        Some(values) => {
+    match parse_live_rows(&text, expected_n, n_scores).filter(|r| !r.is_empty()) {
+        Some(rows) => {
+            let values: Vec<f64> = rows.iter().map(|r| r[0]).collect();
             let avg = pooled_avg(&values, kind);
             let show = avg.unwrap_or_else(|| crate::metrics::mean(&values));
             log::info!(
@@ -294,7 +312,10 @@ pub fn run_ffvship(
                 avg,
                 exec_s: pumped.exec_s,
                 error: None,
-                detail: crate::metrics::ffmpeg::FrameDetail::None,
+                detail: FrameDetail::Scores {
+                    cols: kind.csv_cols(),
+                    rows,
+                },
             }
         }
         None => {
@@ -328,6 +349,13 @@ mod tests {
             duration: Some(100.0),
             ..Default::default()
         }
+    }
+
+    /// Test-only first-score projection (the runner inlines this over
+    /// `parse_live_rows` so full rows survive for CSV detail).
+    fn parse_series(text: &str, expected_n: Option<i64>, kind: FfvshipKind) -> Option<Vec<f64>> {
+        parse_live_rows(text, expected_n, kind.n_scores())
+            .map(|rows| rows.into_iter().map(|r| r[0]).collect())
     }
 
     #[test]
@@ -381,6 +409,25 @@ mod tests {
         assert_eq!(pooled_avg(&v, Butteraugli), Some(92.0));
         assert_eq!(pooled_avg(&v, Cvvdp), Some(94.0));
         assert_eq!(pooled_avg(&[], Cvvdp), None);
+    }
+
+    #[test]
+    fn csv_column_shapes() {
+        use FfvshipKind::{Butteraugli, Cvvdp, Ssimulacra2};
+        assert_eq!(Ssimulacra2.csv_cols(), vec!["ssimulacra2".to_owned()]);
+        assert_eq!(
+            Butteraugli.csv_cols(),
+            vec![
+                "butteraugli_2norm".to_owned(),
+                "butteraugli_3norm".to_owned(),
+                "butteraugli_infnorm".to_owned()
+            ]
+        );
+        assert_eq!(Cvvdp.csv_cols(), vec!["cvvdp".to_owned()]);
+        // Live arity matches the CSV width (strict parser enforces it).
+        assert_eq!(Ssimulacra2.n_scores(), 1);
+        assert_eq!(Butteraugli.n_scores(), 3);
+        assert_eq!(Cvvdp.n_scores(), 1);
     }
 
     #[test]
