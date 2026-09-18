@@ -1326,6 +1326,24 @@ mod tests {
     }
 
     #[test]
+    fn xpsnr_summary_v9_shape() {
+        // Real ffmpeg 9.0.1 stderr tail: poolable planes ride the
+        // `[Parsed_xpsnr_*]` line (the `XPSNR average, N frames y:` line
+        // carries y only and must not match).
+        let w = (4.0, 1.0, 1.0);
+        let err = "[Parsed_xpsnr_7 @ 000002296aacdc00] XPSNR  y: 39.6885  u: 44.3744  v: 44.0219  (minimum: 39.6885)\n\
+                   XPSNR average, 300 frames  y: 39.6885\n";
+        assert_eq!(
+            parse_xpsnr_summary(err, w),
+            Some((4.0 * 39.6885 + 44.3744 + 44.0219) / 6.0)
+        );
+        assert_eq!(
+            parse_xpsnr_summary("XPSNR average, 300 frames  y: 39.6885\n", w),
+            None
+        );
+    }
+
+    #[test]
     fn xpsnr_graph_inverts_input_order() {
         use super::MetricKind::{Psnr, Xpsnr};
         let psnr = filtergraph(

@@ -63,6 +63,10 @@ pub struct BinaryInfo {
     /// Meaningless for FFVship (always empty); fail-open to all four when
     /// the probe itself won't run (see `ffmpeg_supported_filters`).
     pub supported_metrics: Vec<MetricKind>,
+    /// Raw `ffmpeg version` token (`9.0.1-full_build-www.gyan.dev`):
+    /// the results CSV keeps the vendor suffix the bottom-bar `short`
+    /// strips. `None` when ffmpeg is missing/unusable (FFVship: always).
+    pub ffmpeg_version: Option<String>,
 }
 
 /// Directory holding the running executable (Rust analog of Python's script dir).
@@ -257,6 +261,7 @@ pub fn ffmpeg_info() -> BinaryInfo {
             detail: "Checked next to app and in PATH, none found".to_owned(),
             usable: false,
             supported_metrics: Vec::new(),
+            ffmpeg_version: None,
         };
     };
     let missing = |msg: String| BinaryInfo {
@@ -266,6 +271,7 @@ pub fn ffmpeg_info() -> BinaryInfo {
         detail: msg,
         usable: false,
         supported_metrics: Vec::new(),
+        ffmpeg_version: None,
     };
     let Some(v) = run_version(&exe, "-version") else {
         log::warn!(target: "rfmetrics::binaries", "ffmpeg at {} ({origin}) failed to run", exe.display());
@@ -295,6 +301,7 @@ pub fn ffmpeg_info() -> BinaryInfo {
     // copyright tail into the bottom bar.
     let full = copyright_re().replace(full, "").trim_end().to_owned();
     let short = short_ffmpeg_version(&full);
+    let version = ffmpeg_version_token(&full);
     log::info!(target: "rfmetrics::binaries", "ffmpeg: {short} at {} ({origin})", exe.display());
     let supported = ffmpeg_supported_filters(&exe);
     let line = supported_line(&supported);
@@ -306,7 +313,18 @@ pub fn ffmpeg_info() -> BinaryInfo {
         detail: format!("{full}\n{} ({origin})\n{line}", exe.display()),
         usable: true,
         supported_metrics: supported,
+        ffmpeg_version: version,
     }
+}
+
+/// Raw `ffmpeg version` token (`9.0.1-full_build-www.gyan.dev`,
+/// `N-126626-g7070fe638e-20260917`, …) from a copyright-stripped first
+/// `-version` line. The results CSV keeps it verbatim (vendor suffix
+/// included); the bottom bar shows the stripped `short` form instead.
+fn ffmpeg_version_token(first_line: &str) -> Option<String> {
+    ffmpeg_ver_re()
+        .captures(first_line)
+        .map(|c| c[1].to_owned())
 }
 
 /// Pure version-token parser over stdout+stderr. `Some` = usable version
@@ -349,6 +367,7 @@ pub fn ffvship_info() -> BinaryInfo {
             usable: false,
             // Filter support is an ffmpeg concept; always empty here.
             supported_metrics: Vec::new(),
+            ffmpeg_version: None,
         };
     };
     let missing = |msg: String| BinaryInfo {
@@ -358,6 +377,7 @@ pub fn ffvship_info() -> BinaryInfo {
         detail: msg,
         usable: false,
         supported_metrics: Vec::new(),
+        ffmpeg_version: None,
     };
     let Some(v) = run_version(&exe, "--version") else {
         log::warn!(target: "rfmetrics::binaries", "FFVship at {} ({origin}) failed to run", exe.display());
@@ -376,6 +396,7 @@ pub fn ffvship_info() -> BinaryInfo {
             detail: format!("{raw}\n{} ({origin})", exe.display()),
             usable: true,
             supported_metrics: Vec::new(),
+            ffmpeg_version: None,
         };
     }
     // Guard rail: binary persists but reports no version (e.g. AMD build on
@@ -402,6 +423,7 @@ pub fn ffvship_info() -> BinaryInfo {
         detail,
         usable: false,
         supported_metrics: Vec::new(),
+        ffmpeg_version: None,
     }
 }
 
@@ -420,7 +442,10 @@ pub fn ffprobe_path(ffmpeg_path: Option<&Path>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::parse_ffvship_version;
-    use super::{copyright_re, parse_filters_list, short_ffmpeg_version, supported_line};
+    use super::{
+        copyright_re, ffmpeg_version_token, parse_filters_list, short_ffmpeg_version,
+        supported_line,
+    };
     use crate::metrics::ffmpeg::MetricKind;
 
     #[test]
@@ -551,5 +576,19 @@ mod tests {
             "FFmpeg: N-126626-g7070fe638e-20260917"
         );
         assert!(!short_ffmpeg_version(&full).contains("Copyright"));
+    }
+
+    #[test]
+    fn version_token_keeps_vendor_suffix() {
+        // The results CSV keeps the raw token verbatim.
+        assert_eq!(
+            ffmpeg_version_token("ffmpeg version 9.0.1-full_build-www.gyan.dev"),
+            Some("9.0.1-full_build-www.gyan.dev".to_owned())
+        );
+        assert_eq!(
+            ffmpeg_version_token("ffmpeg version N-126626-g7070fe638e-20260917"),
+            Some("N-126626-g7070fe638e-20260917".to_owned())
+        );
+        assert_eq!(ffmpeg_version_token("some weird build"), None);
     }
 }

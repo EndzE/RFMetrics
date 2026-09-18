@@ -367,6 +367,39 @@ pub fn table_media_text(info: Option<&MediaInfo>) -> String {
     format!("{enc_s}, {height_s}, {pix_s}, {bit_s}")
 }
 
+/// Results-CSV `Frame` column (`1600x1080-60p, yuv420p10le (tv)`):
+/// size + rate + field suffix, then pixfmt + range. Unknown parts are
+/// skipped; fully unknown media is `-unknown-`.
+pub fn results_media_text(info: Option<&MediaInfo>) -> String {
+    let u = "-unknown-";
+    let Some(info) = info else {
+        return u.to_owned();
+    };
+    let mut head = String::new();
+    if let (Some(w), Some(h)) = (info.width, info.height) {
+        head.push_str(&format!("{w}x{h}"));
+    }
+    if let Some(fps) = info.fps {
+        let suffix = if info.interlaced { "i" } else { "p" };
+        if !head.is_empty() {
+            head.push('-');
+        }
+        head.push_str(&format!("{}{suffix}", format_fps(fps)));
+    }
+    let mut pix = info.pix_fmt.clone().unwrap_or_default();
+    if let Some(rt) = info.range_tag.as_deref()
+        && !pix.is_empty()
+    {
+        pix.push_str(&format!(" ({rt})"));
+    }
+    match (head.is_empty(), pix.is_empty()) {
+        (false, false) => format!("{head}, {pix}"),
+        (false, true) => head,
+        (true, false) => pix,
+        (true, true) => u.to_owned(),
+    }
+}
+
 /// Python `_cell_media_text`: comma-aware truncation to `limit` chars.
 pub fn cell_media_text(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
@@ -634,6 +667,22 @@ mod tests {
         let (v, f) = fixture();
         let m = parse_media(&v, &f);
         assert_eq!(table_media_text(Some(&m)), "h264, 1080p, YUV420, 5000 kb/s");
+    }
+
+    #[test]
+    fn results_media_line() {
+        // Fixture: 1920x1080, 29.97fps progressive, yuv420p tv.
+        let (v, f) = fixture();
+        let m = parse_media(&v, &f);
+        assert_eq!(
+            results_media_text(Some(&m)),
+            "1920x1080-29.97p, yuv420p (tv)"
+        );
+        assert_eq!(results_media_text(None), "-unknown-");
+        let mut interlaced = m;
+        interlaced.interlaced = true;
+        interlaced.pix_fmt = None;
+        assert!(results_media_text(Some(&interlaced)).ends_with("i"));
     }
 
     #[test]

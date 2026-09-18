@@ -1,6 +1,7 @@
 pub mod csv;
 pub mod ffmpeg;
 pub mod ffvship;
+pub mod results;
 pub mod vmaf;
 
 /// Per-cell lifecycle of one metric on one queue row (Python `results` dict

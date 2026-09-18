@@ -21,7 +21,7 @@ pub enum Pooling {
 }
 
 impl Pooling {
-    fn as_filter_str(self) -> &'static str {
+    pub(crate) fn as_filter_str(self) -> &'static str {
         match self {
             Self::Mean => "mean",
             Self::HarmonicMean => "harmonic_mean",

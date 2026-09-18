@@ -49,6 +49,10 @@ struct CachedStats {
     /// so the table loop never formats per frame. Cleared wherever `stats`
     /// is cleared (rerun start, Reset via wholesale `default()`).
     text: String,
+    /// Wall-clock completion stamp (`%Y-%m-%d %H:%M:%S` local) for the
+    /// results CSV `*-DateTime` columns; frozen with the rest, cleared
+    /// with it.
+    finished: Option<String>,
 }
 
 impl QueueRow {
@@ -381,6 +385,10 @@ pub struct RFMetricsApp {
     csv_export: bool,
     /// CSV output folder; empty = beside the distorted file (Options).
     csv_dir: String,
+    /// Append results rows to the results file when each run ends.
+    results_autosave: bool,
+    /// Results file path; empty = `RFMetrics.Results.csv` next to the exe.
+    results_path: String,
     /// Save PNG / Copy image size preset (Options combobox).
     plot_size: crate::plot::PlotSize,
     rows: Vec<QueueRow>,
@@ -400,6 +408,10 @@ pub struct RFMetricsApp {
     /// with a real timestamp at the next UI frame (drain has none).
     /// `(files_written, error_strings)`.
     csv_report: Option<(usize, Vec<String>)>,
+    /// Results auto-save owed: set by the Finished drain arm when the
+    /// option is on (aborted runs included), consumed with a timestamp
+    /// at the next UI frame like `csv_report` above.
+    results_autosave_pending: bool,
     probe_tx: Sender<ProbeMsg>,
     probe_rx: Receiver<ProbeMsg>,
     metric_tx: Sender<MetricMsg>,
@@ -504,6 +516,8 @@ impl Default for RFMetricsApp {
             plot_at_start: false,
             csv_export: false,
             csv_dir: String::new(),
+            results_autosave: false,
+            results_path: String::new(),
             plot_size: crate::plot::PlotSize::default(),
             rows: Vec::new(),
             ffmpeg,
@@ -518,6 +532,7 @@ impl Default for RFMetricsApp {
             hovered_now: None,
             toast: None,
             csv_report: None,
+            results_autosave_pending: false,
             probe_tx,
             probe_rx,
             metric_tx,
@@ -956,6 +971,9 @@ impl RFMetricsApp {
                         row.cached_mut(kind).stats = stats;
                         row.cached_mut(kind).points = points;
                         row.cached_mut(kind).text = text;
+                        row.cached_mut(kind).finished =
+                            matches!(row.cell(kind), crate::metrics::MetricCell::Done { .. })
+                                .then(wall_now_string);
                         scored_changed = true;
                     }
                     if self.pending == 0 {
@@ -980,6 +998,12 @@ impl RFMetricsApp {
                                 }
                             }
                         }
+                    }
+                    // Results auto-save (option): exported with a timestamp
+                    // at the next UI frame, stopped runs included — their
+                    // finished cells still count.
+                    if self.results_autosave {
+                        self.results_autosave_pending = true;
                     }
                     self.pending = 0;
                     self.measuring = false;
@@ -1144,6 +1168,8 @@ impl RFMetricsApp {
                 plot_size: Some(self.plot_size.label().to_owned()),
                 csv_export: Some(self.csv_export),
                 csv_dir: Some(self.csv_dir.clone()),
+                results_autosave: Some(self.results_autosave),
+                results_path: Some(self.results_path.clone()),
             },
         }
     }
@@ -1263,6 +1289,12 @@ impl RFMetricsApp {
         if let Some(csv_dir) = s.options.csv_dir {
             self.csv_dir = csv_dir;
         }
+        if let Some(results_autosave) = s.options.results_autosave {
+            self.results_autosave = results_autosave;
+        }
+        if let Some(results_path) = s.options.results_path {
+            self.results_path = results_path;
+        }
         // Restored ticks obey capability (see helper docs).
         self.untick_unsupported_metrics();
     }
@@ -1318,6 +1350,8 @@ impl RFMetricsApp {
             || o.plot_size.as_deref() != Some(self.plot_size.label())
             || o.csv_export != Some(self.csv_export)
             || o.csv_dir.as_deref() != Some(self.csv_dir.as_str())
+            || o.results_autosave != Some(self.results_autosave)
+            || o.results_path.as_deref() != Some(self.results_path.as_str())
         {
             return true;
         }
@@ -1581,6 +1615,7 @@ impl RFMetricsApp {
                     self.rows[i].cached_mut(*kind).stats = None;
                     self.rows[i].cached_mut(*kind).points.clear();
                     self.rows[i].cached_mut(*kind).text.clear();
+                    self.rows[i].cached_mut(*kind).finished = None;
                 }
             }
         }
@@ -1731,6 +1766,113 @@ impl RFMetricsApp {
             .collect();
         if !parts.is_empty() {
             self.toast(now, parts.join("\n"), ToastKind::Info);
+        }
+    }
+
+    /// Flush a run-end auto-save (armed by the Finished drain arm):
+    /// resolves the configured path or the exe-dir default, exports via
+    /// the manual path below, and disarms. Headless-testable: the UI
+    /// frame only supplies `now`.
+    fn consume_autosave(&mut self, now: f64) {
+        if !self.results_autosave_pending {
+            return;
+        }
+        self.results_autosave_pending = false;
+        let path = if self.results_path.trim().is_empty() {
+            crate::metrics::results::default_results_path()
+        } else {
+            std::path::PathBuf::from(&self.results_path)
+        };
+        self.save_results(now, path);
+    }
+
+    /// Export the results summary CSV (bottom-bar "Save results"): one
+    /// row per queued row in table order, appended to the chosen file
+    /// (header only when new/empty). Unscored cells export as empty
+    /// blocks; the caller gates on `!run_locked`.
+    fn save_results(&mut self, now: f64, path: std::path::PathBuf) {
+        use crate::metrics::results::{Block, ORDER, ResultsRow};
+        let stamp = wall_now_string();
+        let app_version = env!("CARGO_PKG_VERSION");
+        let ffmpeg_version = self.ffmpeg.ffmpeg_version.clone().unwrap_or_default();
+        let lines: Vec<String> = self
+            .rows
+            .iter()
+            .map(|r| {
+                let blocks: [Block; 7] = std::array::from_fn(|i| {
+                    let kind = ORDER[i];
+                    match r.cell(kind) {
+                        crate::metrics::MetricCell::Done {
+                            avg,
+                            skip,
+                            clip_dur,
+                            vmaf_cfg,
+                            ..
+                        } => {
+                            let cached = r.cached(kind);
+                            let vmaf = (kind == MetricKind::Vmaf)
+                                .then_some(vmaf_cfg.as_ref())
+                                .flatten()
+                                .map(|c| (c.model.as_str(), c.pooling));
+                            Block {
+                                avg: Some(*avg),
+                                stats: cached.stats.as_ref(),
+                                finished: cached.finished.as_deref(),
+                                options: crate::metrics::results::options_for(
+                                    kind, *skip, *clip_dur, vmaf,
+                                ),
+                            }
+                        }
+                        _ => Block {
+                            avg: None,
+                            stats: None,
+                            finished: None,
+                            options: String::new(),
+                        },
+                    }
+                });
+                let frames = ORDER
+                    .iter()
+                    .find_map(|k| match r.cell(*k) {
+                        crate::metrics::MetricCell::Done { values, .. } if !values.is_empty() => {
+                            Some(values.len().to_string())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                ResultsRow {
+                    blocks,
+                    frames,
+                    frame: crate::probe::results_media_text(r.info.as_ref()),
+                    bitrate: r
+                        .info
+                        .as_ref()
+                        .and_then(|info| info.bitrate_kbps)
+                        .map(|kbps| kbps.to_string())
+                        .unwrap_or_default(),
+                    path: &r.path,
+                }
+            })
+            .map(|data| crate::metrics::results::row(&stamp, &data, app_version, &ffmpeg_version))
+            .collect();
+        match crate::metrics::results::append(&path, &lines) {
+            Ok(n) => {
+                let s = if n == 1 { "" } else { "s" };
+                log::info!(target: "rfmetrics::app", "saved {n} result row{s} to {}", path.display());
+                self.toast(
+                    now,
+                    format!("Appended {n} row{s} to {}", path.display()),
+                    ToastKind::Info,
+                );
+            }
+            Err(e) => {
+                log::error!(target: "rfmetrics::app", "save results failed: {e}");
+                self.toast(
+                    now,
+                    format!("Could not save results: {e}"),
+                    ToastKind::Error,
+                );
+            }
         }
     }
 
@@ -2248,6 +2390,14 @@ impl RFMetricsApp {
         });
     }
 }
+/// Local wall-clock stamp (`%Y-%m-%d %H:%M:%S`) for results CSV
+/// `DateTime` columns (original `DateTime` parity).
+fn wall_now_string() -> String {
+    jiff::Timestamp::now()
+        .to_zoned(jiff::tz::TimeZone::system())
+        .strftime("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
 /// Kinds sharing an identical skip set merge into one toast line
 /// ("Skipped 2 with existing PSNR, SSIM: a, b") so filenames print once
 /// instead of repeating per metric. First-seen kind order is kept.
@@ -2506,6 +2656,7 @@ impl eframe::App for RFMetricsApp {
                 );
             }
         }
+        self.consume_autosave(now);
         let live = self.drain_png_results(&ctx, now) | live;
         if live {
             ui.ctx().request_repaint();
@@ -2649,6 +2800,22 @@ impl eframe::App for RFMetricsApp {
                     .clicked()
                 {
                     self.show_plot = true;
+                }
+                if ui
+                    .add_enabled_ui(!run_locked, |ui| {
+                        ui.add_sized([110.0, 24.0], egui::Button::new("Save results"))
+                    })
+                    .inner
+                    .on_hover_text("Append one row per queued file to RFMetrics.Results.csv")
+                    .clicked()
+                    && let Some(mut path) = rfd::FileDialog::new()
+                        .set_title("Save results CSV")
+                        .set_file_name(crate::metrics::results::RESULTS_FILE_NAME)
+                        .add_filter("CSV file", &["csv"])
+                        .save_file()
+                {
+                    path.set_extension("csv");
+                    self.save_results(now, path);
                 }
                 ui.label(&self.ffmpeg.short)
                     .on_hover_text(&self.ffmpeg.detail);
@@ -2889,6 +3056,66 @@ impl eframe::App for RFMetricsApp {
                                     .clicked()
                                 {
                                     self.csv_dir.clear();
+                                }
+                            });
+                            let _ = ui
+                                .add(egui::Checkbox::new(
+                                    &mut self.results_autosave,
+                                    "Auto-save results",
+                                ))
+                                .on_hover_text(
+                                    "Append one row per queued file to the results file \
+                                     when each run ends, stopped runs included",
+                                );
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [70.0, 18.0],
+                                    egui::Label::new("Results file").selectable(false),
+                                );
+                                // Bounded display (full path stays in the hover);
+                                // resolved (custom or exe-dir default) at save time.
+                                let full = self.results_path.clone();
+                                let empty = full.trim().is_empty();
+                                let shown = if empty {
+                                    "RFMetrics.Results.csv next to exe".to_owned()
+                                } else if full.chars().count() > 40 {
+                                    format!(
+                                        "…{}",
+                                        full.chars().skip(full.chars().count() - 39).collect::<String>()
+                                    )
+                                } else {
+                                    full.clone()
+                                };
+                                ui.label(shown).on_hover_text(if empty {
+                                    crate::metrics::results::default_results_path()
+                                        .to_string_lossy()
+                                        .into_owned()
+                                } else {
+                                    full.clone()
+                                });
+                                if ui.button("Browse…").clicked() {
+                                    let mut dialog = rfd::FileDialog::new()
+                                        .set_title("Results file")
+                                        .add_filter("CSV file", &["csv"]);
+                                    if empty {
+                                        dialog = dialog.set_file_name(
+                                            crate::metrics::results::RESULTS_FILE_NAME,
+                                        );
+                                    } else {
+                                        dialog = dialog.set_file_name(&full);
+                                    }
+                                    if let Some(mut path) = dialog.save_file() {
+                                        path.set_extension("csv");
+                                        self.results_path =
+                                            path.to_string_lossy().into_owned();
+                                    }
+                                }
+                                if ui
+                                    .button("Clear")
+                                    .on_hover_text("Back to next-to-the-exe default")
+                                    .clicked()
+                                {
+                                    self.results_path.clear();
                                 }
                             });
                                 });
@@ -5134,6 +5361,104 @@ mod tests {
         assert!(app.snapshot().options.csv_export == Some(true));
     }
 
+    /// Results auto-save: Finished (clean or aborted) arms the flag when
+    /// opted in; consuming exports one row and disarms. Stale generations
+    /// stay silent.
+    #[test]
+    fn results_autosave_end_to_end() {
+        use super::MetricMsg;
+        use crate::metrics::MetricCell;
+        let dir =
+            std::env::temp_dir().join(format!("rfmetrics-autosave-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = RFMetricsApp {
+            results_autosave: true,
+            results_path: dir
+                .join("RFMetrics.Results.csv")
+                .to_string_lossy()
+                .into_owned(),
+            ..RFMetricsApp::default()
+        };
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows[0].psnr = MetricCell::Done {
+            values: vec![30.0, 31.0],
+            avg: 30.5,
+            exec_s: 1.0,
+            skip: None,
+            clip_dur: Some(5.0),
+            vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
+        };
+        for aborted in [false, true] {
+            app.metric_tx
+                .send(MetricMsg::Finished {
+                    generation: app.run_generation,
+                    aborted,
+                })
+                .unwrap();
+            app.drain_metric_results();
+            assert!(
+                app.results_autosave_pending,
+                "Finished (aborted={aborted}) must arm with the option on"
+            );
+            app.consume_autosave(0.0);
+            assert!(!app.results_autosave_pending);
+        }
+        let text = std::fs::read_to_string(dir.join("RFMetrics.Results.csv")).unwrap();
+        let lines: Vec<&str> = text.split("\r\n").collect();
+        // Header + 2 appended rows + trailing empty after final CRLF.
+        assert!(lines[0].starts_with("DateTime\tPSNR-DateTime"));
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("C:/vids/a.mp4")).count(),
+            2
+        );
+        assert!(lines[1].contains("\t30.5\t"));
+        assert_eq!(lines[3], "");
+        // Opted out: Finished arms nothing.
+        app.results_autosave = false;
+        app.metric_tx
+            .send(MetricMsg::Finished {
+                generation: app.run_generation,
+                aborted: false,
+            })
+            .unwrap();
+        app.drain_metric_results();
+        assert!(!app.results_autosave_pending);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Results options persist and restore like the other Options keys.
+    #[test]
+    fn state_apply_restores_results_options() {
+        let mut app = RFMetricsApp::default();
+        let state = crate::state::AppState {
+            options: crate::state::OptionsState {
+                results_autosave: Some(true),
+                results_path: Some("D:/r.csv".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        app.apply_state(Some(state));
+        assert!(app.results_autosave);
+        assert_eq!(app.results_path, "D:/r.csv");
+        assert!(app.snapshot().options.results_autosave == Some(true));
+    }
+
+    /// Wall stamp shape only (`%Y-%m-%d %H:%M:%S`): the instant is
+    /// host-clock dependent, the layout is not.
+    #[test]
+    fn wall_stamp_shape() {
+        let s = super::wall_now_string();
+        let b = s.as_bytes();
+        assert_eq!(s.len(), 19);
+        assert_eq!([b[4], b[7]], [b'-', b'-']);
+        assert_eq!(b[10], b' ');
+        assert_eq!([b[13], b[16]], [b':', b':']);
+        assert!(s[..10].chars().all(|c| c.is_ascii_digit() || c == '-'));
+    }
+
     /// `is_state_dirty` must agree with `snapshot() != saved_snapshot` for
     /// every persisted field; a missed field silently stops saving.
     #[test]
@@ -5191,6 +5516,10 @@ mod tests {
         app.csv_export = !app.csv_export;
         check(&mut app);
         app.csv_dir = "D:/csv".to_owned();
+        check(&mut app);
+        app.results_autosave = !app.results_autosave;
+        check(&mut app);
+        app.results_path = "D:/r.csv".to_owned();
         check(&mut app);
         app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
         check(&mut app);
