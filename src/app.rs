@@ -121,6 +121,29 @@ fn norm_key(p: &str) -> String {
     s
 }
 
+/// Reveal a queued file in the OS file manager without blocking the UI.
+/// Windows selects the file (`explorer /select,`); other platforms open the
+/// containing folder (select-on-open has no portable equivalent).
+/// Spawn-only: never waits on the child, so a slow Explorer can't freeze a frame.
+fn reveal_in_explorer(path: &str) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer")
+            .args(["/select,", path])
+            .spawn()
+            .map(|_| ())
+    }
+    #[cfg(not(windows))]
+    {
+        let target = Path::new(path)
+            .parent()
+            .map(|p| p.as_os_str().to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| path.to_owned());
+        open::that(&target)
+    }
+}
+
 /// Thumbnail seek duration: reuse the completed reference probe's
 /// duration when it belongs to the current path; otherwise `None` and the
 /// worker falls back to a dedicated probe (`media_duration`).
@@ -2715,6 +2738,7 @@ impl eframe::App for RFMetricsApp {
                     // are needed to dodge the borrow checker.
                     let mut toggle_row: Option<usize> = None;
                     let mut open_path: Option<String> = None;
+                    let mut reveal_path: Option<String> = None;
                     let mut hovered_next: Option<usize> = None;
                     table
                         .header(18.0, |mut header| {
@@ -2784,11 +2808,29 @@ impl eframe::App for RFMetricsApp {
                                 let (_, r) = row.col(|ui| {
                                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                                     let row_data = &self.rows[i];
-                                    // Plain selectable text: no button hover
-                                    // outline; drag-select/copy still works and
-                                    // the full path shows as tooltip (Python parity).
-                                    ui.add(egui::Label::new(&row_data.display).selectable(true))
+                                    // Plain non-selectable text: no button hover
+                                    // outline; copy lives in the right-click menu
+                                    // and the full path shows as tooltip (Python parity).
+                                    ui.add(egui::Label::new(&row_data.display).selectable(false))
                                         .on_hover_text(&row_data.path);
+                                });
+                                r.context_menu(|ui| {
+                                    if ui.button("Show in explorer").clicked() {
+                                        reveal_path = Some(self.rows[i].path.clone());
+                                        ui.close();
+                                    }
+                                    if ui.button("Copy Path").clicked() {
+                                        ui.ctx().copy_text(self.rows[i].path.clone());
+                                        ui.close();
+                                    }
+                                    if ui.button("Copy filename").clicked() {
+                                        let name = Path::new(&self.rows[i].path)
+                                            .file_name()
+                                            .map(|s| s.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| self.rows[i].display.clone());
+                                        ui.ctx().copy_text(name);
+                                        ui.close();
+                                    }
                                 });
                                 if r.clicked() {
                                     toggle_row = Some(i);
@@ -2892,7 +2934,8 @@ impl eframe::App for RFMetricsApp {
                         });
                     // Deferred row-click side effects (L3): selection
                     // toggle, open-in-player (error toast needs `now`),
-                    // and hover tracking all land after the loop.
+                    // reveal-in-explorer, and hover tracking all land after
+                    // the loop.
                     if let Some(i) = toggle_row {
                         self.rows[i].selected = !self.rows[i].selected;
                     }
@@ -2902,6 +2945,16 @@ impl eframe::App for RFMetricsApp {
                         log::error!(target: "rfmetrics::app", "open \"{path}\" failed: {e}");
                         self.toast = Some(Toast {
                             text: format!("Could not open file: {e}"),
+                            until: now + TOAST_SECS,
+                            kind: ToastKind::Error,
+                        });
+                    }
+                    if let Some(path) = reveal_path
+                        && let Err(e) = reveal_in_explorer(&path)
+                    {
+                        log::error!(target: "rfmetrics::app", "reveal \"{path}\" failed: {e}");
+                        self.toast = Some(Toast {
+                            text: format!("Could not show in explorer: {e}"),
                             until: now + TOAST_SECS,
                             kind: ToastKind::Error,
                         });
