@@ -9,6 +9,10 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug)]
 struct QueueRow {
     path: String,
+    /// `norm_key(path)` computed once at insert; `path` is never mutated
+    /// after push, so worker-message routing compares this instead of
+    /// re-normalizing (and re-hitting `current_dir()`) per row per message.
+    key: String,
     display: String,
     include: bool,
     selected: bool,
@@ -41,6 +45,10 @@ struct CachedStats {
     stats: Option<crate::metrics::DoneStats>,
     ranks: [crate::metrics::StatRank; 10],
     points: Vec<egui_plot::PlotPoint>,
+    /// Rendered Done text (`format!("{avg:.4}")`), frozen at Done arrival
+    /// so the table loop never formats per frame. Cleared wherever `stats`
+    /// is cleared (rerun start, Reset via wholesale `default()`).
+    text: String,
 }
 
 impl QueueRow {
@@ -517,7 +525,7 @@ impl RFMetricsApp {
                     tip,
                     info,
                 } => {
-                    if let Some(row) = self.rows.iter_mut().find(|r| norm_key(&r.path) == key) {
+                    if let Some(row) = self.rows.iter_mut().find(|r| r.key == key) {
                         row.media = media;
                         row.media_tip = tip;
                         row.info = info;
@@ -653,7 +661,7 @@ impl RFMetricsApp {
         let paths: Vec<(String, String)> = self
             .rows
             .iter()
-            .map(|r| (norm_key(&r.path), r.path.clone()))
+            .map(|r| (r.key.clone(), r.path.clone()))
             .collect();
         std::thread::spawn(move || {
             for (key, s) in paths {
@@ -672,7 +680,7 @@ impl RFMetricsApp {
     /// Media probing runs on a worker thread; rows show "Probing…"
     /// until their results arrive, so drops never freeze the window.
     fn add_queue_files(&mut self, paths: Vec<std::path::PathBuf>) {
-        let mut seen: HashSet<String> = self.rows.iter().map(|r| norm_key(&r.path)).collect();
+        let mut seen: HashSet<String> = self.rows.iter().map(|r| r.key.clone()).collect();
         let mut fresh: Vec<(String, String)> = Vec::new();
         for p in paths {
             let s = p.to_string_lossy().into_owned();
@@ -682,6 +690,7 @@ impl RFMetricsApp {
             }
             self.rows.push(QueueRow {
                 path: s.clone(),
+                key: key.clone(),
                 display: String::new(),
                 include: true,
                 selected: false,
@@ -742,7 +751,7 @@ impl RFMetricsApp {
                     // The job emitting progress is the live one: the plot
                     // tab follows it while measuring.
                     self.live_kind = Some(kind);
-                    if let Some(row) = self.rows.iter_mut().find(|r| norm_key(&r.path) == key)
+                    if let Some(row) = self.rows.iter_mut().find(|r| r.key == key)
                         && let crate::metrics::MetricCell::Running { frame: cur, .. } =
                             row.cell_mut(kind)
                         && frame > *cur
@@ -760,7 +769,7 @@ impl RFMetricsApp {
                         continue;
                     }
                     self.live_kind = Some(kind);
-                    if let Some(row) = self.rows.iter_mut().find(|r| norm_key(&r.path) == key)
+                    if let Some(row) = self.rows.iter_mut().find(|r| r.key == key)
                         && let crate::metrics::MetricCell::Running { values, .. } =
                             row.cell_mut(kind)
                     {
@@ -794,7 +803,7 @@ impl RFMetricsApp {
                         continue;
                     }
                     self.pending = self.pending.saturating_sub(1);
-                    if let Some(row) = self.rows.iter_mut().find(|r| norm_key(&r.path) == key) {
+                    if let Some(row) = self.rows.iter_mut().find(|r| r.key == key) {
                         *row.cell_mut(kind) = match error {
                             // Killed by Stop: settle quietly like unstarted
                             // rows (H4); `Finished{aborted}` below handles
@@ -825,8 +834,12 @@ impl RFMetricsApp {
                                 .collect(),
                             _ => Vec::new(),
                         };
+                        // Rendered text frozen once per result (the table loop
+                        // borrows it instead of formatting per frame).
+                        let text = row.cell(kind).cell_text();
                         row.cached_mut(kind).stats = stats;
                         row.cached_mut(kind).points = points;
+                        row.cached_mut(kind).text = text;
                         scored_changed = true;
                     }
                     if self.pending == 0 {
@@ -1020,11 +1033,8 @@ impl RFMetricsApp {
                     .collect(),
             );
             for e in live {
-                if let Some(row) = self
-                    .rows
-                    .iter_mut()
-                    .find(|r| norm_key(&r.path) == norm_key(&e.path))
-                {
+                let ekey = norm_key(&e.path);
+                if let Some(row) = self.rows.iter_mut().find(|r| r.key == ekey) {
                     row.include = e.include;
                 }
             }
@@ -1091,12 +1101,67 @@ impl RFMetricsApp {
         }
     }
 
+    /// Allocation-free dirty check mirroring `snapshot() != saved_snapshot`
+    /// without building `AppState`. Covers every field `snapshot()` sets;
+    /// a new persisted field must be added here too, or edits to it will
+    /// silently stop saving.
+    fn is_state_dirty(&self) -> bool {
+        let s = &self.saved_snapshot;
+        if self.ref_path != s.ref_path || self.skip != s.skip || self.duration != s.duration {
+            return true;
+        }
+        // `snapshot()` always emits `Some(vec)`; a `None` here can only mean
+        // "never saved this shape", which never equals a snapshot.
+        match &s.files {
+            Some(files) => {
+                if files.len() != self.rows.len() {
+                    return true;
+                }
+                for (live, saved) in self.rows.iter().zip(files.iter()) {
+                    if live.path != saved.path || live.include != saved.include {
+                        return true;
+                    }
+                }
+            }
+            None => return true,
+        }
+        let m = &s.metrics;
+        if m.psnr != Some(self.m_psnr)
+            || m.ssim != Some(self.m_ssim)
+            || m.vmaf != Some(self.m_vmaf)
+            || m.xpsnr != Some(self.m_xpsnr)
+            || m.ssim2 != Some(self.m_ssim2)
+            || m.butteraugli != Some(self.m_but)
+            || m.cvvdp != Some(self.m_cvvdp)
+        {
+            return true;
+        }
+        let v = &s.vmaf;
+        if v.model.as_deref() != Some(self.vmaf_model.as_str())
+            || v.phone != Some(self.vmaf_phone)
+            || v.scale != Some(self.vmaf_scale)
+            || v.pooling.as_deref() != Some(self.vmaf_pooling.as_str())
+            || v.subsample.as_deref() != Some(self.vmaf_subsample.as_str())
+            || v.threads.as_deref() != Some(self.vmaf_threads.as_str())
+        {
+            return true;
+        }
+        let o = &s.options;
+        if o.scaling.as_deref() != Some(self.scale_method.label())
+            || o.plot_at_start != Some(self.plot_at_start)
+            || o.plot_size.as_deref() != Some(self.plot_size.label())
+        {
+            return true;
+        }
+        false
+    }
+
     /// Debounced state write (1s after the last detected change): compare
     /// the live snapshot against the last write, arm/re-arm a single
     /// wake-up while dirty, save once it settles.
     fn autosave_tick(&mut self, ctx: &egui::Context, now: f64) {
         use crate::state::SAVE_DEBOUNCE_SECS;
-        if self.snapshot() == self.saved_snapshot {
+        if !self.is_state_dirty() {
             self.pending_save_since = None;
             return;
         }
@@ -1330,7 +1395,7 @@ impl RFMetricsApp {
                 if let Some(info) = self.rows[i].info.clone() {
                     jobs.push((
                         *kind,
-                        norm_key(&self.rows[i].path),
+                        self.rows[i].key.clone(),
                         self.rows[i].path.clone(),
                         info,
                         exe.clone(),
@@ -1344,6 +1409,7 @@ impl RFMetricsApp {
                     // cached points (capacity kept for the rerun).
                     self.rows[i].cached_mut(*kind).stats = None;
                     self.rows[i].cached_mut(*kind).points.clear();
+                    self.rows[i].cached_mut(*kind).text.clear();
                 }
             }
         }
@@ -2691,26 +2757,30 @@ impl eframe::App for RFMetricsApp {
                                         toggle_row = Some(i);
                                     }
                                     let (_, r) = row.col(|ui| {
-                                        let (text, tip, stats, ranks) = {
-                                            let row_data = &self.rows[i];
-                                            let cell = row_data.cell(kind);
-                                            let cached = row_data.cached(kind);
-                                            let text = cell.cell_text();
-                                            // The ~15-line stats string is only
-                                            // built for unscored cells; Done
-                                            // cells use the chip grid below.
-                                            match &cached.stats {
-                                                Some(s) => (
-                                                    text,
-                                                    String::new(),
-                                                    Some(s.clone()),
-                                                    cached.ranks,
-                                                ),
-                                                None => {
-                                                    (text, cell.tooltip(title), None, cached.ranks)
-                                                }
+                                        let row_data = &self.rows[i];
+                                        let cell = row_data.cell(kind);
+                                        let cached = row_data.cached(kind);
+                                        // Idle borrows a static, Done borrows
+                                        // the arrival-frozen text, Error borrows
+                                        // its message; only live Running frames
+                                        // format per frame (they change anyway).
+                                        let running;
+                                        let text: &str = match cell {
+                                            crate::metrics::MetricCell::Idle => "N/A",
+                                            crate::metrics::MetricCell::Running {
+                                                frame, ..
+                                            } => {
+                                                running = format!("Frame: {frame}");
+                                                &running
                                             }
+                                            crate::metrics::MetricCell::Done { .. } => &cached.text,
+                                            crate::metrics::MetricCell::Error { msg } => msg,
                                         };
+                                        // Borrow the cached stats when scored;
+                                        // unscored cells build their one-line tip
+                                        // below, and only while hovered.
+                                        let stats = cached.stats.as_ref();
+                                        let ranks = cached.ranks;
                                         let mut cell_frame = egui::Frame::NONE;
                                         if let Some(fill) = rank_fill(ranks[0]) {
                                             cell_frame = cell_frame.fill(fill);
@@ -2718,17 +2788,19 @@ impl eframe::App for RFMetricsApp {
                                         cell_frame.show(ui, |ui| {
                                             ui.set_width(ui.available_width());
                                             ui.centered_and_justified(|ui| {
-                                                let resp = ui.label(&text);
+                                                let resp = ui.label(text);
                                                 match stats {
                                                     Some(stats) => {
                                                         resp.on_hover_ui(|ui| {
                                                             metric_stat_tooltip(
-                                                                ui, title, &stats, &ranks,
+                                                                ui, title, stats, &ranks,
                                                             );
                                                         });
                                                     }
                                                     None => {
-                                                        resp.on_hover_text(&tip);
+                                                        if resp.hovered() {
+                                                            resp.on_hover_text(cell.tooltip(title));
+                                                        }
                                                     }
                                                 }
                                             });
@@ -3009,6 +3081,7 @@ mod tests {
         let mut app = RFMetricsApp::default();
         app.rows.push(QueueRow {
             path: "C:/vids/a.mp4".to_owned(),
+            key: norm_key("C:/vids/a.mp4"),
             display: "a.mp4".to_owned(),
             include: true,
             selected: false,
@@ -3072,6 +3145,7 @@ mod tests {
     fn psnr_test_row(path: &str, include: bool) -> QueueRow {
         QueueRow {
             path: path.to_owned(),
+            key: norm_key(path),
             display: "a.mp4".to_owned(),
             include,
             selected: false,
@@ -4566,5 +4640,249 @@ mod tests {
         assert_eq!(app.vmaf_pooling, "Mean");
         assert_eq!(app.vmaf_subsample, "1");
         assert!(app.vmaf_phone);
+    }
+
+    /// `is_state_dirty` must agree with `snapshot() != saved_snapshot` for
+    /// every persisted field; a missed field silently stops saving.
+    #[test]
+    fn dirty_check_matches_snapshot_compare() {
+        let mut app = RFMetricsApp::default();
+        app.saved_snapshot = app.snapshot();
+        assert!(!app.is_state_dirty());
+
+        // One mutation at a time: each must read dirty under both paths,
+        // and re-saving must read clean.
+        let check = |app: &mut RFMetricsApp| {
+            assert!(app.is_state_dirty());
+            assert_ne!(app.snapshot(), app.saved_snapshot);
+            app.saved_snapshot = app.snapshot();
+            assert!(!app.is_state_dirty());
+        };
+        app.ref_path = "C:/vids/ref.mp4".to_owned();
+        check(&mut app);
+        app.skip = "5".to_owned();
+        check(&mut app);
+        app.duration = "00:10".to_owned();
+        check(&mut app);
+        app.m_psnr = !app.m_psnr;
+        check(&mut app);
+        app.m_ssim = !app.m_ssim;
+        check(&mut app);
+        app.m_vmaf = !app.m_vmaf;
+        check(&mut app);
+        app.m_xpsnr = !app.m_xpsnr;
+        check(&mut app);
+        app.m_ssim2 = !app.m_ssim2;
+        check(&mut app);
+        app.m_but = !app.m_but;
+        check(&mut app);
+        app.m_cvvdp = !app.m_cvvdp;
+        check(&mut app);
+        app.vmaf_model = "other.json".to_owned();
+        check(&mut app);
+        app.vmaf_phone = !app.vmaf_phone;
+        check(&mut app);
+        app.vmaf_scale = !app.vmaf_scale;
+        check(&mut app);
+        app.vmaf_pooling = "Harmonic Mean".to_owned();
+        check(&mut app);
+        app.vmaf_subsample = "2".to_owned();
+        check(&mut app);
+        app.vmaf_threads = "4".to_owned();
+        check(&mut app);
+        app.scale_method = ScaleMethod::Lanczos;
+        check(&mut app);
+        app.plot_at_start = !app.plot_at_start;
+        check(&mut app);
+        app.plot_size = crate::plot::PlotSize::S1600;
+        check(&mut app);
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        check(&mut app);
+        app.rows[0].include = false;
+        check(&mut app);
+        app.rows[0].path = "C:/vids/b.mp4".to_owned();
+        app.rows[0].key = norm_key("C:/vids/b.mp4");
+        check(&mut app);
+        // Order-sensitive like the snapshot vec.
+        app.rows.push(psnr_test_row("C:/vids/c.mp4", true));
+        check(&mut app);
+        app.rows.swap(0, 1);
+        assert!(app.is_state_dirty());
+        assert_ne!(app.snapshot(), app.saved_snapshot);
+    }
+
+    /// Before/after timing: full `snapshot()` clone+compare (old per-frame
+    /// path) vs `is_state_dirty` (new path) over a 200-row queue.
+    #[test]
+    fn dirty_check_perf() {
+        let mut app = RFMetricsApp::default();
+        for i in 0..200 {
+            app.rows.push(psnr_test_row(
+                &format!("C:/vids/clip_{i:04}.mp4"),
+                i % 2 == 0,
+            ));
+        }
+        app.saved_snapshot = app.snapshot();
+        assert!(!app.is_state_dirty());
+
+        let n = 2000;
+        let t0 = std::time::Instant::now();
+        let mut dirty_old = false;
+        for _ in 0..n {
+            dirty_old |= app.snapshot() != app.saved_snapshot;
+        }
+        let old_ms = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let mut dirty_new = false;
+        for _ in 0..n {
+            dirty_new |= app.is_state_dirty();
+        }
+        let new_ms = t1.elapsed();
+        assert_eq!(dirty_old, dirty_new);
+        eprintln!(
+            "autosave dirty-check ({n} iters, 200 rows): snapshot-clone {old_ms:?} vs field-compare {new_ms:?}"
+        );
+    }
+
+    /// Before/after timing for worker-message routing: re-normalizing every
+    /// row per lookup (old `Progress`-rate path) vs stored-key compare.
+    #[test]
+    fn row_routing_perf() {
+        let mut app = RFMetricsApp::default();
+        for i in 0..200 {
+            app.rows.push(psnr_test_row(
+                &format!("C:/vids/clip_{i:04}.mp4"),
+                i % 2 == 0,
+            ));
+        }
+        let key = app.rows[100].key.clone();
+        let n = 5000;
+        let t0 = std::time::Instant::now();
+        let mut found_old = 0;
+        for _ in 0..n {
+            if let Some(r) = app.rows.iter().find(|r| norm_key(&r.path) == key) {
+                found_old += r.path.len();
+            }
+        }
+        let old = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let mut found_new = 0;
+        for _ in 0..n {
+            if let Some(r) = app.rows.iter().find(|r| r.key == key) {
+                found_new += r.path.len();
+            }
+        }
+        let new = t1.elapsed();
+        assert_eq!(found_old, found_new);
+        eprintln!(
+            "row routing ({n} lookups, 200 rows): norm_key-scan {old:?} vs stored-key {new:?}"
+        );
+    }
+
+    /// Done/Error arrival freezes the rendered cell text (equal to
+    /// `cell_text()` by construction); Reset clears it.
+    #[test]
+    fn cell_text_cache_set_and_cleared() {
+        use super::MetricMsg;
+        use crate::metrics::MetricCell;
+        use crate::metrics::ffmpeg::MetricKind;
+        let mut app = RFMetricsApp::default();
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.run_generation = 1;
+        let done = |error: Option<String>| MetricMsg::Done {
+            generation: 1,
+            kind: MetricKind::Psnr,
+            key: norm_key("C:/vids/a.mp4"),
+            values: vec![29.0, 30.0, 31.0],
+            avg: Some(30.123_456),
+            exec_s: 1.0,
+            error,
+            skip: None,
+            clip_dur: None,
+            vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
+        };
+        app.metric_tx.send(done(None)).unwrap();
+        app.drain_metric_results();
+        assert_eq!(app.rows[0].psnr_cache.text, "30.1235");
+        assert_eq!(app.rows[0].psnr_cache.text, app.rows[0].psnr.cell_text());
+        app.metric_tx.send(done(Some("boom".to_owned()))).unwrap();
+        app.drain_metric_results();
+        assert!(matches!(app.rows[0].psnr, MetricCell::Error { .. }));
+        assert_eq!(app.rows[0].psnr_cache.text, "boom");
+        app.reset_psnr();
+        assert!(app.rows[0].psnr_cache.text.is_empty());
+    }
+
+    /// Rerun start clears the frozen text synchronously (asserted before the
+    /// doomed worker's error reply is ever drained, so no race).
+    #[test]
+    fn cell_text_cache_cleared_on_rerun() {
+        use crate::metrics::MetricCell;
+        use crate::probe::MediaInfo;
+        let dir = std::env::temp_dir();
+        let ref_file = dir.join("rfmetrics-rerun-ref.tmp");
+        let fake_exe = dir.join("rfmetrics-rerun-exe.tmp");
+        std::fs::write(&ref_file, b"x").unwrap();
+        std::fs::write(&fake_exe, b"x").unwrap();
+        let mut app = RFMetricsApp {
+            m_psnr: true,
+            m_vmaf: false,
+            ref_path: ref_file.to_string_lossy().into_owned(),
+            ref_info_data: Some(MediaInfo::default()),
+            ..RFMetricsApp::default()
+        };
+        app.ffmpeg.path = Some(fake_exe.clone());
+        app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+        app.rows[0].info = Some(MediaInfo::default());
+        app.rows[0].psnr_cache.text = "30.1235".to_owned();
+        app.start_run(0.0);
+        assert!(matches!(app.rows[0].psnr, MetricCell::Running { .. }));
+        assert!(app.rows[0].psnr_cache.text.is_empty());
+        assert!(app.rows[0].psnr_cache.stats.is_none());
+        app.reset_psnr();
+        std::fs::remove_file(&ref_file).ok();
+        std::fs::remove_file(&fake_exe).ok();
+    }
+
+    /// Before/after timing for the table cell string work: per-frame
+    /// `cell_text()` + `tooltip()` (old) vs borrowing statics (new).
+    /// Models 200 rows × 7 idle columns.
+    #[test]
+    fn cell_text_perf() {
+        use crate::metrics::{MetricCell, ffmpeg::MetricKind};
+        use std::hint::black_box;
+        let kinds = MetricKind::ALL;
+        let cells: Vec<MetricCell> = (0..200 * kinds.len()).map(|_| MetricCell::Idle).collect();
+        // Borrowed text must read identically to the formatted one.
+        assert_eq!(cells[0].cell_text(), "N/A");
+        let n = 500;
+        let t0 = std::time::Instant::now();
+        let mut len_old = 0;
+        for _ in 0..n {
+            for (cell, kind) in cells.iter().zip(kinds.iter().cycle()) {
+                let text = cell.cell_text();
+                let tip = cell.tooltip(kind.name());
+                len_old += text.len() + tip.len();
+            }
+        }
+        let old = t0.elapsed();
+        black_box(len_old);
+        let t1 = std::time::Instant::now();
+        let mut len_new = 0;
+        for _ in 0..n {
+            for cell in &cells {
+                let text: &str = match cell {
+                    MetricCell::Idle => "N/A",
+                    _ => unreachable!("idle-only fixture"),
+                };
+                len_new += text.len();
+            }
+        }
+        let new = t1.elapsed();
+        black_box(len_new);
+        eprintln!(
+            "cell text ({n} frames, 1400 idle cells): format-per-frame {old:?} vs borrow {new:?}"
+        );
     }
 }
