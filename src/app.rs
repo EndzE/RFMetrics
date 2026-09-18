@@ -2777,6 +2777,8 @@ impl eframe::App for RFMetricsApp {
                     ui.add(egui::Label::new("Options").selectable(false));
                     ui.add_enabled_ui(!run_locked, |ui| {
                         egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.horizontal_top(|ui| {
+                                ui.vertical(|ui| {
                             ui.horizontal(|ui| {
                                 ui.add_sized(
                                     [70.0, 18.0],
@@ -2830,6 +2832,17 @@ impl eframe::App for RFMetricsApp {
                                 .on_hover_text(
                                     "Open the plot window automatically when a run starts",
                                 );
+                            if ui
+                                .add(egui::Button::new("Refresh Files Media Info"))
+                                .on_hover_text(
+                                    "Re-probe the reference and every queued file (media info only)",
+                                )
+                                .clicked()
+                            {
+                                self.refresh_media_info();
+                            }
+                                });
+                                ui.vertical(|ui| {
                             let _ = ui
                                 .add(egui::Checkbox::new(
                                     &mut self.csv_export,
@@ -2837,7 +2850,7 @@ impl eframe::App for RFMetricsApp {
                                 ))
                                 .on_hover_text(
                                     "Write one <name>.<METRIC>.csv per finished run \
-                                     (TAB-separated per-frame values), to the folder below \
+                                     (TAB-separated per-frame values), to the chosen CSV folder \
                                      or beside each distorted file when empty",
                                 );
                             ui.horizontal(|ui| {
@@ -2878,15 +2891,8 @@ impl eframe::App for RFMetricsApp {
                                     self.csv_dir.clear();
                                 }
                             });
-                            if ui
-                                .add(egui::Button::new("Refresh Files Media Info"))
-                                .on_hover_text(
-                                    "Re-probe the reference and every queued file (media info only)",
-                                )
-                                .clicked()
-                            {
-                                self.refresh_media_info();
-                            }
+                                });
+                            });
                         });
                     });
                 });
