@@ -416,4 +416,35 @@ mod tests {
             "Error: probe failed"
         );
     }
+
+    /// Done-arrival budget check (2.5h @ 30fps ≈ 270k frames): `DoneStats::new`
+    /// (clone+sort+passes), `stats_text` (second sort + formats), and
+    /// `harm_mean` alone. Measurement only — decides whether any of the
+    /// one-shot paths deserve risk.
+    #[test]
+    fn done_arrival_budget() {
+        use std::hint::black_box;
+        let values: Vec<f64> = (0..270_000)
+            .map(|i| 30.0 + (i as f64 * 0.01).sin() * 5.0)
+            .collect();
+        let n = 10;
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            black_box(DoneStats::new(&values, 30.0, 61.5));
+        }
+        let stats = t0.elapsed() / n;
+        let t1 = std::time::Instant::now();
+        for _ in 0..n {
+            black_box(stats_text(Some(30.0), 61.5, &values));
+        }
+        let text = t1.elapsed() / n;
+        let t2 = std::time::Instant::now();
+        for _ in 0..n {
+            black_box(harm_mean(&values));
+        }
+        let harm = t2.elapsed() / n;
+        eprintln!(
+            "done arrival (270k frames): DoneStats::new {stats:?} | stats_text {text:?} | harm_mean {harm:?}"
+        );
+    }
 }

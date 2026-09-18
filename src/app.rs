@@ -121,6 +121,17 @@ fn norm_key(p: &str) -> String {
     s
 }
 
+/// Thumbnail seek duration: reuse the completed reference probe's
+/// duration when it belongs to the current path; otherwise `None` and the
+/// worker falls back to a dedicated probe (`media_duration`).
+fn thumb_duration(ref_path: &str, ref_info_path: &str, probed: Option<f64>) -> Option<f64> {
+    if !ref_path.is_empty() && ref_path == ref_info_path {
+        probed.filter(|&d| d > 0.0)
+    } else {
+        None
+    }
+}
+
 /// Shortest unique trailing-path suffix per entry (Python `_display_names`).
 fn display_names(paths: &[String]) -> Vec<String> {
     let parts: Vec<Vec<String>> = paths
@@ -367,6 +378,11 @@ pub struct RFMetricsApp {
     run_generation: u64,
     /// Path last handed to a probe worker (or resolved cheaply without one).
     last_spawned_ref: String,
+    /// Path the current `ref_info_data` was probed from (set when its
+    /// worker result lands). The thumbnail worker reuses its duration only
+    /// on a match — `ref_info_data` alone lags one probe behind on ref
+    /// change and can't say which path it belongs to.
+    ref_info_path: String,
     /// Bumped on every ref change; worker results with an older generation
     /// are stale (typed-through) and discarded.
     ref_generation: u64,
@@ -466,6 +482,7 @@ impl Default for RFMetricsApp {
             pending: 0,
             run_generation: 0,
             last_spawned_ref: String::new(),
+            ref_info_path: String::new(),
             ref_generation: 0,
             thumb_tx,
             thumb_rx,
@@ -504,8 +521,13 @@ impl RFMetricsApp {
     /// Apply any probe results that arrived since the last frame. Stale
     /// reference results (typed-through while a worker was running) are
     /// dropped via the generation check.
-    fn drain_probe_results(&mut self) {
+    /// Drains the probe channel; returns whether any message arrived (even
+    /// a stale one — callers use it to decide on a repaint, and one extra
+    /// frame on a rare stale message is harmless).
+    fn drain_probe_results(&mut self) -> bool {
+        let mut activity = false;
         while let Ok(msg) = self.probe_rx.try_recv() {
+            activity = true;
             match msg {
                 ProbeMsg::Reference {
                     generation,
@@ -515,6 +537,9 @@ impl RFMetricsApp {
                     if generation == self.ref_generation {
                         self.ref_info = text;
                         self.ref_info_data = info;
+                        // No newer spawn happened since (same generation),
+                        // so `last_spawned_ref` is the path this probed.
+                        self.ref_info_path = self.last_spawned_ref.clone();
                     } else {
                         log::debug!(target: "rfmetrics::app", "discarded stale ref probe (gen {generation})");
                     }
@@ -533,15 +558,18 @@ impl RFMetricsApp {
                 }
             }
         }
+        activity
     }
 
     /// Re-probe only when the path actually changed, and only off the UI
     /// thread: cheap cases (empty/missing/no ffprobe) resolve inline, an
     /// existing file spawns a worker and shows "Probing…" meanwhile.
-    fn refresh_ref_info(&mut self) {
-        self.drain_probe_results();
+    /// Returns the probe drain flag (spawns stem from input frames, which
+    /// repaint on their own).
+    fn refresh_ref_info(&mut self) -> bool {
+        let activity = self.drain_probe_results();
         if self.ref_path == self.last_spawned_ref {
-            return;
+            return activity;
         }
         self.last_spawned_ref = self.ref_path.clone();
         self.ref_generation = self.ref_generation.wrapping_add(1);
@@ -550,17 +578,17 @@ impl RFMetricsApp {
                 "Encoder: -unknown-, Frame: -unknown-, Bitrate: -unknown-, Duration: -unknown-"
                     .to_owned();
             self.ref_info_data = None;
-            return;
+            return activity;
         }
         if !Path::new(&self.ref_path).is_file() {
             self.ref_info = "File not found".to_owned();
             self.ref_info_data = None;
-            return;
+            return activity;
         }
         if self.ffprobe.is_none() {
             self.ref_info = "ffprobe not found".to_owned();
             self.ref_info_data = None;
-            return;
+            return activity;
         }
         self.ref_info = "Probing…".to_owned();
         let tx = self.probe_tx.clone();
@@ -575,11 +603,15 @@ impl RFMetricsApp {
                 info,
             });
         });
+        activity
     }
 
     /// Apply arrived thumbnails; stale generations (typed-through) are dropped.
-    fn drain_thumbs(&mut self, ctx: &egui::Context) {
+    /// Returns whether any message arrived (see `drain_probe_results`).
+    fn drain_thumbs(&mut self, ctx: &egui::Context) -> bool {
+        let mut activity = false;
         while let Ok(msg) = self.thumb_rx.try_recv() {
+            activity = true;
             if msg.generation != self.thumb_generation {
                 log::debug!(target: "rfmetrics::app", "discarded stale thumbnail (gen {})", msg.generation);
                 continue;
@@ -593,39 +625,50 @@ impl RFMetricsApp {
                 None => self.thumb_tex = None,
             }
         }
+        activity
     }
 
     /// Spawn a dedicated ffmpeg worker when the ref path changed. Cheap cases
     /// clear inline; the worker sends duration-aware extracts back on the
-    /// thumb channel and repaints via the cloned ctx.
-    fn refresh_thumbnail(&mut self, ctx: &egui::Context) {
-        self.drain_thumbs(ctx);
+    /// thumb channel and repaints via the cloned ctx. Returns the thumb
+    /// drain flag (spawns stem from input frames, which repaint on their own).
+    fn refresh_thumbnail(&mut self, ctx: &egui::Context) -> bool {
+        let activity = self.drain_thumbs(ctx);
         if self.ref_path == self.last_thumb_path {
-            return;
+            return activity;
         }
         self.last_thumb_path = self.ref_path.clone();
         self.thumb_generation = self.thumb_generation.wrapping_add(1);
         self.thumb_tex = None;
         if self.ref_path.trim().is_empty() || !Path::new(&self.ref_path).is_file() {
             self.thumb_loading = false;
-            return;
+            return activity;
         }
         let Some(ffmpeg_exe) = self.ffmpeg.path.clone() else {
             self.thumb_loading = false;
-            return;
+            return activity;
         };
         self.thumb_loading = true;
         let tx = self.thumb_tx.clone();
         let generation = self.thumb_generation;
         let path = self.ref_path.clone();
         let ffprobe_exe = self.ffprobe.clone();
+        // Prefer the completed reference probe's duration (same path only);
+        // the worker probes itself when the ref probe hasn't landed yet.
+        let duration = thumb_duration(
+            &self.ref_path,
+            &self.ref_info_path,
+            self.ref_info_data.as_ref().and_then(|i| i.duration),
+        );
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let duration = crate::probe::media_duration(&path, ffprobe_exe.as_deref());
+            let duration =
+                duration.or_else(|| crate::probe::media_duration(&path, ffprobe_exe.as_deref()));
             let image = crate::preview::extract_thumbnail(&ffmpeg_exe, &path, duration);
             let _ = tx.send(ThumbMsg { generation, image });
             ctx.request_repaint();
         });
+        activity
     }
 
     /// Short display names for all rows (Python `_refresh_names`).
@@ -735,9 +778,12 @@ impl RFMetricsApp {
 
     /// Apply metric worker results; stale generations (post-Reset) drop.
     /// Progress keeps the max frame per row (dual stdout/stderr feeds).
-    fn drain_metric_results(&mut self) {
+    /// Returns whether any message arrived (see `drain_probe_results`).
+    fn drain_metric_results(&mut self) -> bool {
         let mut scored_changed = false;
+        let mut activity = false;
         while let Ok(msg) = self.metric_rx.try_recv() {
+            activity = true;
             match msg {
                 MetricMsg::Progress {
                     generation,
@@ -878,6 +924,7 @@ impl RFMetricsApp {
                 self.refresh_ranks(kind);
             }
         }
+        activity
     }
 
     /// Recompute cross-row ranks for one metric from the cached stats.
@@ -921,9 +968,11 @@ impl RFMetricsApp {
     /// Apply plot export thread results; clears the Saving…/Copying…
     /// lock so the buttons re-arm. Copy pixels land here because
     /// `ctx.copy_image()` must run on the UI thread. Runs on the main
-    /// viewport each frame.
-    fn drain_png_results(&mut self, ctx: &egui::Context, now: f64) {
+    /// viewport each frame. Returns whether any message arrived.
+    fn drain_png_results(&mut self, ctx: &egui::Context, now: f64) -> bool {
+        let mut activity = false;
         while let Ok(msg) = self.png_rx.try_recv() {
+            activity = true;
             self.png_saving = false;
             match msg {
                 PngSaveMsg::Saved { path } => {
@@ -948,6 +997,7 @@ impl RFMetricsApp {
                 }
             }
         }
+        activity
     }
 
     fn toast(&mut self, now: f64, text: String, kind: ToastKind) {
@@ -2242,14 +2292,26 @@ impl eframe::App for RFMetricsApp {
             }
             DropAction::Queue(paths) => self.add_queue_files(paths),
         }
-        self.refresh_ref_info();
+        // Repaint only on frames that drained worker traffic, so live
+        // `Frame: N` progress and arriving results render while data flows
+        // and gaps (VMAF startup, slow encodes, between-jobs) no longer
+        // spin the full table rebuild at 60fps. `|` (not `||`) keeps every
+        // drain running. Spawns above stem from input frames, which repaint
+        // on their own; thumb workers also wake the UI themselves.
+        let live = self.refresh_ref_info();
         let ctx = ui.ctx().clone();
-        self.refresh_thumbnail(&ctx);
-        self.drain_metric_results();
-        self.drain_png_results(&ctx, now);
-        // Live `Frame: N` progress while the metric worker runs.
-        if self.measuring {
+        let live = self.refresh_thumbnail(&ctx) | live;
+        let live = self.drain_metric_results() | live;
+        let live = self.drain_png_results(&ctx, now) | live;
+        if live {
             ui.ctx().request_repaint();
+        } else if self.measuring {
+            // Heartbeat: metric/probe workers never wake the UI, so without
+            // a running frame their traffic would strand in the channel
+            // (stuck `Frame: 0` until the next mouse move). 10Hz keeps
+            // counters live; traffic frames repaint immediately above.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
         }
         // Debounced `ffmetrics-state.json` write (Python parity).
         self.autosave_tick(ui.ctx(), now);
@@ -2835,8 +2897,9 @@ impl eframe::App for RFMetricsApp {
                 });
             });
             self.table_rect = Some(table_resp.response.rect);
-            // Roll the delayed-hover timer forward; repaint while the
-            // delay is pending so the outline appears without moving.
+            // Roll the delayed-hover timer forward; schedule one wake-up
+            // for when the delay elapses so the outline appears without
+            // moving (no every-frame spin while pending).
             if self.hovered_now != self.hover_row {
                 self.hover_row = self.hovered_now;
                 self.hover_since = self.hover_row.map(|_| now);
@@ -2846,7 +2909,13 @@ impl eframe::App for RFMetricsApp {
                 (Some(a), Some(b), Some(t)) if a == b && now - t < ROW_HOVER_DELAY
             );
             if hover_pending {
-                ui.ctx().request_repaint();
+                // `hover_pending` implies `hover_since` is `Some`.
+                let remaining = self
+                    .hover_since
+                    .map(|t| (ROW_HOVER_DELAY - (now - t)).max(0.0))
+                    .unwrap_or(ROW_HOVER_DELAY);
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs_f64(remaining));
             }
         });
 
@@ -2875,9 +2944,13 @@ impl eframe::App for RFMetricsApp {
         }
 
         // Transient toast (e.g. extra files dropped on the reference box).
+        // Static text needs exactly two frames (show + hide): schedule one
+        // wake-up at expiry instead of full-rate repaints for 3 s.
         if let Some(toast) = self.toast.clone() {
             if now < toast.until {
-                ui.ctx().request_repaint();
+                let remaining = (toast.until - now).max(0.0);
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs_f64(remaining));
                 let corner = ui.max_rect().right_bottom();
                 let mut frame = egui::Frame::popup(ui.style());
                 if let Some(outline) = toast.kind.outline() {
@@ -4884,5 +4957,310 @@ mod tests {
         eprintln!(
             "cell text ({n} frames, 1400 idle cells): format-per-frame {old:?} vs borrow {new:?}"
         );
+    }
+
+    /// Idle-heartbeat budget: our-code CPU of one heartbeat frame (dirty
+    /// check + borrowed cell text for 200×7 idle cells + fit/decimate of
+    /// 5×5000 plot series) ×2/s, vs zero frames without the heartbeat.
+    /// egui layout/tessellation is not included (headless can't render).
+    #[test]
+    fn idle_heartbeat_budget() {
+        use crate::metrics::{MetricCell, ffmpeg::MetricKind};
+        use std::hint::black_box;
+        let mut app = RFMetricsApp::default();
+        for i in 0..200 {
+            app.rows.push(psnr_test_row(
+                &format!("C:/vids/clip_{i:04}.mp4"),
+                i % 2 == 0,
+            ));
+        }
+        app.saved_snapshot = app.snapshot();
+        let raw: Vec<Vec<f64>> = (0..5)
+            .map(|s| {
+                (0..5000)
+                    .map(|i| 30.0 + s as f64 + (i as f64 * 0.01).sin() * 5.0)
+                    .collect()
+            })
+            .collect();
+        let borrowed: Vec<&[f64]> = raw.iter().map(Vec::as_slice).collect();
+        let points: Vec<Vec<egui_plot::PlotPoint>> = raw
+            .iter()
+            .map(|v| {
+                v.iter()
+                    .enumerate()
+                    .map(|(i, &y)| egui_plot::PlotPoint::new(i as f64 + 1.0, y))
+                    .collect()
+            })
+            .collect();
+        let n = 200;
+        let t0 = std::time::Instant::now();
+        let mut acc = 0usize;
+        for _ in 0..n {
+            acc += app.is_state_dirty() as usize;
+            for row in &app.rows {
+                for kind in MetricKind::ALL {
+                    let text: &str = match row.cell(kind) {
+                        MetricCell::Idle => "N/A",
+                        MetricCell::Running { .. } => unreachable!("idle fixture"),
+                        MetricCell::Done { .. } => &row.cached(kind).text,
+                        MetricCell::Error { msg } => msg,
+                    };
+                    acc += text.len();
+                }
+            }
+            black_box(crate::plot::fit_limits(
+                &borrowed,
+                crate::plot::PSNR_LO,
+                crate::plot::PSNR_HI,
+            ));
+            for p in &points {
+                acc += crate::plot::decimate_minmax(p, 1000).points().len();
+            }
+        }
+        let per_frame = t0.elapsed() / n;
+        black_box(acc);
+        let per_sec = per_frame * 2;
+        eprintln!(
+            "idle heartbeat: {per_frame:?}/frame our-code ×2/s = {per_sec:?}/s (~{:.3}% of a core); without heartbeat: 0 frames",
+            per_sec.as_secs_f64() * 100.0,
+        );
+    }
+
+    /// Drain activity flags: queued message → `true`; empty channel → `false`.
+    /// Stale messages count as traffic (one harmless extra frame).
+    #[test]
+    fn drains_report_activity() {
+        use super::{MetricMsg, PngSaveMsg, ThumbMsg};
+        use crate::metrics::ffmpeg::MetricKind;
+        let ctx = egui::Context::default();
+        let mut app = RFMetricsApp::default();
+        assert!(!app.drain_probe_results());
+        assert!(!app.drain_metric_results());
+        assert!(!app.drain_png_results(&ctx, 0.0));
+        assert!(!app.drain_thumbs(&ctx));
+        // Stale metric message (wrong generation) is still traffic.
+        app.metric_tx
+            .send(MetricMsg::Progress {
+                generation: 999,
+                kind: MetricKind::Psnr,
+                key: "gone".to_owned(),
+                frame: 1,
+            })
+            .unwrap();
+        assert!(app.drain_metric_results());
+        assert!(!app.drain_metric_results());
+        // Stale probe message likewise.
+        app.probe_tx
+            .send(ProbeMsg::Reference {
+                generation: 999,
+                text: "stale".to_owned(),
+                info: None,
+            })
+            .unwrap();
+        assert!(app.drain_probe_results());
+        assert!(!app.drain_probe_results());
+        // PNG worker reply lands a toast.
+        app.png_tx
+            .send(PngSaveMsg::Saved {
+                path: std::path::PathBuf::from("C:/vids/plot.png"),
+            })
+            .unwrap();
+        assert!(app.drain_png_results(&ctx, 0.0));
+        assert!(app.toast.is_some());
+        assert!(!app.drain_png_results(&ctx, 0.0));
+        // Empty-image thumbnail clears without touching the GPU path.
+        app.thumb_tx
+            .send(ThumbMsg {
+                generation: app.thumb_generation,
+                image: None,
+            })
+            .unwrap();
+        assert!(app.drain_thumbs(&ctx));
+        assert!(!app.drain_thumbs(&ctx));
+        // Refresh helpers propagate their drain flags (paths unchanged, so
+        // no worker spawns — pure drain reporting).
+        app.probe_tx
+            .send(ProbeMsg::Reference {
+                generation: 999,
+                text: "stale".to_owned(),
+                info: None,
+            })
+            .unwrap();
+        assert!(app.refresh_ref_info());
+        assert!(!app.refresh_ref_info());
+        app.thumb_tx
+            .send(ThumbMsg {
+                generation: app.thumb_generation,
+                image: None,
+            })
+            .unwrap();
+        assert!(app.refresh_thumbnail(&ctx));
+        assert!(!app.refresh_thumbnail(&ctx));
+    }
+
+    /// FPS-counter cost across regimes, one run on identical fixtures
+    /// (200 idle rows, 5×5000 plot series, debug build = upper bound):
+    /// old frame (snapshot clone+compare, per-cell format+tooltip,
+    /// fit/decimate, FPS format every frame) vs new frame (borrowed text,
+    /// dirty check, fit/decimate, FPS format), plus the counter label
+    /// alone (format every frame vs only when the rounded value changes).
+    #[test]
+    fn fps_counter_budget() {
+        use crate::metrics::{MetricCell, ffmpeg::MetricKind};
+        use std::hint::black_box;
+        let mut app = RFMetricsApp::default();
+        for i in 0..200 {
+            app.rows.push(psnr_test_row(
+                &format!("C:/vids/clip_{i:04}.mp4"),
+                i % 2 == 0,
+            ));
+        }
+        app.saved_snapshot = app.snapshot();
+        let kinds = MetricKind::ALL;
+        let cells: Vec<MetricCell> = (0..200 * kinds.len()).map(|_| MetricCell::Idle).collect();
+        let raw: Vec<Vec<f64>> = (0..5)
+            .map(|s| {
+                (0..5000)
+                    .map(|i| 30.0 + s as f64 + (i as f64 * 0.01).sin() * 5.0)
+                    .collect()
+            })
+            .collect();
+        let borrowed: Vec<&[f64]> = raw.iter().map(Vec::as_slice).collect();
+        let points: Vec<Vec<egui_plot::PlotPoint>> = raw
+            .iter()
+            .map(|v| {
+                v.iter()
+                    .enumerate()
+                    .map(|(i, &y)| egui_plot::PlotPoint::new(i as f64 + 1.0, y))
+                    .collect()
+            })
+            .collect();
+        let n = 100;
+        // Old frame: everything formatted per frame.
+        let t0 = std::time::Instant::now();
+        let mut acc = 0usize;
+        for _ in 0..n {
+            acc += (app.snapshot() != app.saved_snapshot) as usize;
+            for (cell, kind) in cells.iter().zip(kinds.iter().cycle()) {
+                let text = cell.cell_text();
+                let tip = cell.tooltip(kind.name());
+                acc += text.len() + tip.len();
+            }
+            black_box(crate::plot::fit_limits(
+                &borrowed,
+                crate::plot::PSNR_LO,
+                crate::plot::PSNR_HI,
+            ));
+            for p in &points {
+                acc += crate::plot::decimate_minmax(p, 1000).points().len();
+            }
+            acc += format!("FPS: {:.0}", black_box(59.7)).len();
+        }
+        let old_frame = t0.elapsed() / n;
+        // New frame: borrows + dirty check.
+        let t1 = std::time::Instant::now();
+        for _ in 0..n {
+            acc += app.is_state_dirty() as usize;
+            for cell in &cells {
+                let text: &str = match cell {
+                    MetricCell::Idle => "N/A",
+                    _ => unreachable!("idle fixture"),
+                };
+                acc += text.len();
+            }
+            black_box(crate::plot::fit_limits(
+                &borrowed,
+                crate::plot::PSNR_LO,
+                crate::plot::PSNR_HI,
+            ));
+            for p in &points {
+                acc += crate::plot::decimate_minmax(p, 1000).points().len();
+            }
+            acc += format!("FPS: {:.0}", black_box(59.7)).len();
+        }
+        let new_frame = t1.elapsed() / n;
+        black_box(acc);
+        // Counter label alone over a jittering fps stream.
+        let stream: Vec<f64> = (0..10_000)
+            .map(|i| 59.5 + (i as f64 * 0.37).sin())
+            .collect();
+        let t2 = std::time::Instant::now();
+        let mut chars_a = 0;
+        for &f in &stream {
+            chars_a += format!("FPS: {f:.0}").len();
+        }
+        let always = t2.elapsed();
+        black_box(chars_a);
+        let t3 = std::time::Instant::now();
+        let mut chars_b = 0;
+        let mut last = i64::MIN;
+        for &f in &stream {
+            let r = f.round() as i64;
+            if r != last {
+                last = r;
+                chars_b += format!("FPS: {f:.0}").len();
+            }
+        }
+        let on_change = t3.elapsed();
+        black_box(chars_b);
+        let pct = |per_frame: std::time::Duration, hz: f64| per_frame.as_secs_f64() * hz * 100.0;
+        eprintln!(
+            "fps counter: old frame {old_frame:?} | new frame {new_frame:?}\n\
+             regimes (% of a core, our-code only): old-measuring 60Hz {:.2}% | old-idle 10Hz {:.2}% | \
+             new-measuring 10Hz {:.2}% | new-idle 2Hz {:.3}%\n\
+             counter label 10k samples: format-always {always:?} vs on-change {on_change:?}",
+            pct(old_frame, 60.0),
+            pct(old_frame, 10.0),
+            pct(new_frame, 10.0),
+            pct(new_frame, 2.0),
+        );
+    }
+
+    /// Thumbnail duration reuse: only the completed probe's own path
+    /// qualifies; anything else (or no/zero duration) falls back.
+    #[test]
+    fn thumb_duration_reuse_rules() {
+        use super::thumb_duration;
+        assert_eq!(
+            thumb_duration("C:/r.mp4", "C:/r.mp4", Some(63.0)),
+            Some(63.0)
+        );
+        // Stale cache (other path), missing, or non-positive: re-probe.
+        assert_eq!(thumb_duration("C:/r.mp4", "C:/old.mp4", Some(63.0)), None);
+        assert_eq!(thumb_duration("C:/r.mp4", "", Some(63.0)), None);
+        assert_eq!(thumb_duration("C:/r.mp4", "C:/r.mp4", None), None);
+        assert_eq!(thumb_duration("C:/r.mp4", "C:/r.mp4", Some(0.0)), None);
+        assert_eq!(thumb_duration("C:/r.mp4", "C:/r.mp4", Some(-1.0)), None);
+        assert_eq!(thumb_duration("", "", Some(63.0)), None);
+    }
+
+    /// The reference drain records which path its info was probed from.
+    #[test]
+    fn ref_drain_tracks_info_path() {
+        let mut app = RFMetricsApp {
+            last_spawned_ref: "C:/vids/r.mp4".to_owned(),
+            ..RFMetricsApp::default()
+        };
+        app.probe_tx
+            .send(ProbeMsg::Reference {
+                generation: app.ref_generation,
+                text: "info".to_owned(),
+                info: None,
+            })
+            .unwrap();
+        app.drain_probe_results();
+        assert_eq!(app.ref_info_path, "C:/vids/r.mp4");
+        // Stale generation leaves the tracked path alone.
+        app.last_spawned_ref = "C:/vids/new.mp4".to_owned();
+        app.ref_generation = app.ref_generation.wrapping_add(1);
+        app.probe_tx
+            .send(ProbeMsg::Reference {
+                generation: 0,
+                text: "stale".to_owned(),
+                info: None,
+            })
+            .unwrap();
+        app.drain_probe_results();
+        assert_eq!(app.ref_info_path, "C:/vids/r.mp4");
     }
 }

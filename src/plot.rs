@@ -678,6 +678,53 @@ mod tests {
         assert!(decimate_minmax(&[], 512).points().is_empty());
     }
 
+    /// Per-frame plot CPU budget check (5 rows × 5000 frames, the queue
+    /// shape the render loop re-scans every frame): `fit_limits` over the
+    /// value slices, `decimate_minmax` per series at viewport width, and
+    /// the two collected-vec builds. Measurement only — decides whether
+    /// caching the fit/decimation is worth any risk.
+    #[test]
+    fn per_frame_rebuild_budget() {
+        use std::hint::black_box;
+        let raw: Vec<Vec<f64>> = (0..5)
+            .map(|s| {
+                (0..5000)
+                    .map(|i| 30.0 + s as f64 + (i as f64 * 0.01).sin() * 5.0)
+                    .collect()
+            })
+            .collect();
+        let borrowed: Vec<&[f64]> = raw.iter().map(Vec::as_slice).collect();
+        let points: Vec<Vec<egui_plot::PlotPoint>> = raw.iter().map(|v| dec_pts(v)).collect();
+        let n = 100;
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            black_box(fit_limits(&borrowed, PSNR_LO, PSNR_HI));
+        }
+        let fit = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let mut lens = 0;
+        for _ in 0..n {
+            for p in &points {
+                lens += decimate_minmax(p, 1000).points().len();
+            }
+        }
+        let dec = t1.elapsed();
+        black_box(lens);
+        let t2 = std::time::Instant::now();
+        let mut rows = 0;
+        for _ in 0..n {
+            let done: Vec<(&str, &[f64])> =
+                raw.iter().map(|v| ("clip.mp4", v.as_slice())).collect();
+            let thin: Vec<&[f64]> = done.iter().map(|(_, v)| *v).collect();
+            rows += done.len() + thin.len();
+        }
+        let vecs = t2.elapsed();
+        black_box(rows);
+        eprintln!(
+            "plot rebuild ({n} frames, 5x5000): fit {fit:?} | decimate {dec:?} | vec-builds {vecs:?}"
+        );
+    }
+
     #[test]
     fn decimate_keeps_endpoints_and_spikes() {
         // 1001 points with a spike and a dip: thinned to ~100.

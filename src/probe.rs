@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
 
 use serde::Deserialize;
 
@@ -92,6 +93,13 @@ fn format_duration(seconds: f64) -> String {
     format!("{h:02}:{m:02}:{s:05.2}")
 }
 
+/// `pix_fmt` range suffix (`yuv420p(tv)`): compiled once, not per probe
+/// (same `OnceLock` pattern as the metric parsers in `metrics/ffmpeg.rs`).
+fn pix_fmt_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"([a-zA-Z0-9_]+)\s*\(([^)]+)\)").unwrap())
+}
+
 pub fn parse_media(v: &Stream, fmt: &Format) -> MediaInfo {
     let mut fps = None;
     for key in [v.avg_frame_rate.as_deref(), v.r_frame_rate.as_deref()] {
@@ -116,8 +124,7 @@ pub fn parse_media(v: &Stream, fmt: &Format) -> MediaInfo {
     }
     if let Some(pf) = pix_fmt.clone()
         && pf.contains('(')
-        && let Ok(re) = regex::Regex::new(r"([a-zA-Z0-9_]+)\s*\(([^)]+)\)")
-        && let Some(c) = re.captures(&pf)
+        && let Some(c) = pix_fmt_re().captures(&pf)
     {
         let inner = c[2].to_lowercase();
         if inner.contains("tv") {
@@ -238,14 +245,22 @@ fn count_packets(exe: &Path, path: &str) -> Option<i64> {
     n
 }
 
-/// Shared ffprobe spawn + parse; `None` = no usable video stream.
-pub(crate) fn probe_media(path: &str, ffprobe: Option<&Path>) -> Option<MediaInfo> {
-    if path.trim().is_empty() || !Path::new(path).is_file() {
-        return None;
-    }
-    let exe = ffprobe?;
-    let start = std::time::Instant::now();
-    log::debug!(target: "rfmetrics::probe", "probe: \"{}\" -show_format -show_streams \"{path}\"", exe.display());
+/// Spawn failure classes of the shared ffprobe core, so `probe_media`
+/// (silent `None`) and `reference_media_text` (user-facing strings) share
+/// the spawn + parse + stream-pick + packet-count fallback while keeping
+/// their exact texts and log lines.
+#[derive(Debug)]
+enum ProbeFail {
+    Spawn(String),
+    InvalidJson(String),
+    NoVideo,
+}
+
+/// Shared ffprobe spawn + JSON parse + video-stream pick + packet-count
+/// fallback (for streams without usable `nb_frames`). Callers time this
+/// call themselves, so their ms logs stay equivalent, and map `ProbeFail`
+/// to their own user-facing text.
+fn probe_once(path: &str, exe: &Path) -> Result<MediaInfo, ProbeFail> {
     let out = Command::new(exe)
         .args([
             "-v",
@@ -260,22 +275,16 @@ pub(crate) fn probe_media(path: &str, ffprobe: Option<&Path>) -> Option<MediaInf
             path,
         ])
         .output()
-        .ok()?;
-    let data: ProbeOutput = match serde_json::from_slice(&out.stdout) {
-        Ok(d) => d,
-        Err(e) => {
-            log::warn!(target: "rfmetrics::probe", "probe \"{path}\" invalid JSON: {e} ({}ms)", start.elapsed().as_millis());
-            return None;
-        }
-    };
-    let v = data
+        .map_err(|e| ProbeFail::Spawn(e.to_string()))?;
+    let data: ProbeOutput =
+        serde_json::from_slice(&out.stdout).map_err(|e| ProbeFail::InvalidJson(e.to_string()))?;
+    let Some(v) = data
         .streams
         .iter()
         .find(|s| s.codec_type.as_deref() == Some("video"))
-        .or_else(|| data.streams.first());
-    let Some(v) = v else {
-        log::warn!(target: "rfmetrics::probe", "probe \"{path}\" no video stream ({}ms)", start.elapsed().as_millis());
-        return None;
+        .or_else(|| data.streams.first())
+    else {
+        return Err(ProbeFail::NoVideo);
     };
     let mut info = parse_media(v, &data.format);
     // `duration × fps` is only an estimate (wrong on VFR/long-GOP files),
@@ -288,6 +297,30 @@ pub(crate) fn probe_media(path: &str, ffprobe: Option<&Path>) -> Option<MediaInf
     if !has_nb && let Some(n) = count_packets(exe, path) {
         info.total_frames = Some(n);
     }
+    Ok(info)
+}
+
+/// Shared ffprobe spawn + parse; `None` = no usable video stream.
+pub(crate) fn probe_media(path: &str, ffprobe: Option<&Path>) -> Option<MediaInfo> {
+    if path.trim().is_empty() || !Path::new(path).is_file() {
+        return None;
+    }
+    let exe = ffprobe?;
+    let start = std::time::Instant::now();
+    log::debug!(target: "rfmetrics::probe", "probe: \"{}\" -show_format -show_streams \"{path}\"", exe.display());
+    let info = match probe_once(path, exe) {
+        Ok(info) => info,
+        // Today's exact behavior: spawn failure is silent (`ok()?`).
+        Err(ProbeFail::Spawn(_)) => return None,
+        Err(ProbeFail::InvalidJson(e)) => {
+            log::warn!(target: "rfmetrics::probe", "probe \"{path}\" invalid JSON: {e} ({}ms)", start.elapsed().as_millis());
+            return None;
+        }
+        Err(ProbeFail::NoVideo) => {
+            log::warn!(target: "rfmetrics::probe", "probe \"{path}\" no video stream ({}ms)", start.elapsed().as_millis());
+            return None;
+        }
+    };
     log::info!(
         target: "rfmetrics::probe",
         "probe \"{path}\" → {}x{} {:?} ({}ms)",
@@ -439,54 +472,21 @@ pub fn reference_media_text(path: &str, ffprobe: Option<&Path>) -> (String, Opti
     };
     let start = std::time::Instant::now();
     log::debug!(target: "rfmetrics::probe", "probe ref: \"{}\" -show_format -show_streams \"{path}\"", exe.display());
-    let out = match Command::new(exe)
-        .args([
-            "-v",
-            "quiet",
-            // FFMetrics.conf parity: larger probe window for sparse headers.
-            "-probesize",
-            "50M",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-            path,
-        ])
-        .output()
-    {
-        Ok(o) => o,
-        Err(e) => {
+    let info = match probe_once(path, exe) {
+        Ok(info) => info,
+        Err(ProbeFail::Spawn(e)) => {
             log::warn!(target: "rfmetrics::probe", "probe ref \"{path}\" spawn failed: {e}");
             return (format!("Probe failed: {e}"), None);
         }
-    };
-    let data: ProbeOutput = match serde_json::from_slice(&out.stdout) {
-        Ok(d) => d,
-        Err(_) => {
+        Err(ProbeFail::InvalidJson(_)) => {
             log::warn!(target: "rfmetrics::probe", "probe ref \"{path}\" invalid output ({}ms)", start.elapsed().as_millis());
             return ("Probe failed: invalid output".to_owned(), None);
         }
+        Err(ProbeFail::NoVideo) => {
+            log::warn!(target: "rfmetrics::probe", "probe ref \"{path}\" no video stream ({}ms)", start.elapsed().as_millis());
+            return ("No video stream".to_owned(), None);
+        }
     };
-    let streams = &data.streams;
-    let Some(v) = streams
-        .iter()
-        .find(|s| s.codec_type.as_deref() == Some("video"))
-        .or_else(|| streams.first())
-    else {
-        log::warn!(target: "rfmetrics::probe", "probe ref \"{path}\" no video stream ({}ms)", start.elapsed().as_millis());
-        return ("No video stream".to_owned(), None);
-    };
-    let mut info = parse_media(v, &data.format);
-    // Same accurate-count fallback as queue rows (estimate is wrong on
-    // VFR/long-GOP files when `nb_frames` is missing).
-    let has_nb = v
-        .nb_frames
-        .as_deref()
-        .and_then(|s| s.parse::<i64>().ok())
-        .is_some_and(|n| n > 0);
-    if !has_nb && let Some(n) = count_packets(exe, path) {
-        info.total_frames = Some(n);
-    }
 
     let mut parts: Vec<String> = Vec::new();
     if let Some(e) = info.encoder.as_deref().filter(|s| !s.is_empty()) {
@@ -645,6 +645,28 @@ mod tests {
         assert!(table_media_text(Some(&m)).contains("RGB24"));
         m.pix_fmt = None;
         assert!(table_media_text(Some(&m)).contains("-unknown-"));
+    }
+
+    /// `pix_fmt` range suffix (`yuv420p(tv)`) splits off the range tag and
+    /// the base format (exercises the shared `pix_fmt_re` static).
+    #[test]
+    fn pix_fmt_parens_range() {
+        let (mut v, f) = fixture();
+        v.pix_fmt = Some("yuv420p(tv)".to_owned());
+        v.color_range = None;
+        let t0 = std::time::Instant::now();
+        let m = parse_media(&v, &f);
+        eprintln!("pix_fmt parens parse: {:?}", t0.elapsed());
+        assert_eq!(m.pix_fmt.as_deref(), Some("yuv420p"));
+        assert_eq!(m.range_tag.as_deref(), Some("tv"));
+        v.pix_fmt = Some("yuv420p(pc)".to_owned());
+        let m = parse_media(&v, &f);
+        assert_eq!(m.range_tag.as_deref(), Some("pc"));
+        // No parens: untouched, no range inferred.
+        v.pix_fmt = Some("yuv420p".to_owned());
+        let m = parse_media(&v, &f);
+        assert_eq!(m.pix_fmt.as_deref(), Some("yuv420p"));
+        assert_eq!(m.range_tag, None);
     }
 
     #[test]

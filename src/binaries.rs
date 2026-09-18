@@ -1,7 +1,31 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use regex::Regex;
+
+/// Compiled once (startup/version probes), not per call — same `OnceLock`
+/// pattern as the metric parsers in `metrics/ffmpeg.rs`. Literals below
+/// are proven-valid (they compile on every current call), hence `unwrap`.
+fn ffmpeg_ver_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)ffmpeg version (\d+(?:\.\d+)*)").unwrap())
+}
+
+fn copyright_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)\s*copyright.*$").unwrap())
+}
+
+fn ffvship_ver_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)FFVship\s+([^\s\r\n]+)").unwrap())
+}
+
+fn ffvship_back_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)^([a-zA-Z0-9]+)\s+version\s*$").unwrap())
+}
 
 #[derive(Debug, Clone)]
 pub struct BinaryInfo {
@@ -175,15 +199,13 @@ pub fn ffmpeg_info() -> BinaryInfo {
             stderr_snippet(&v.stderr),
         ));
     }
-    let short = Regex::new(r"(?i)ffmpeg version (\d+(?:\.\d+)*)")
-        .ok()
-        .and_then(|re| re.captures(full).map(|c| format!("FFmpeg: {}", &c[1])))
+    let short = ffmpeg_ver_re()
+        .captures(full)
+        .map(|c| format!("FFmpeg: {}", &c[1]))
         .unwrap_or_else(|| full.to_owned());
     // `ffmpeg -version` puts "Copyright (c) ..." on the same first line;
     // strip it so the hover tooltip stays to version + path.
-    let full = Regex::new(r"(?i)\s*copyright.*$")
-        .map(|re| re.replace(full, "").trim_end().to_owned())
-        .unwrap_or_else(|_| full.to_owned());
+    let full = copyright_re().replace(full, "").trim_end().to_owned();
     log::info!(target: "rfmetrics::binaries", "ffmpeg: {short} at {} ({origin})", exe.display());
     BinaryInfo {
         path: Some(exe.clone()),
@@ -198,20 +220,16 @@ pub fn ffmpeg_info() -> BinaryInfo {
 /// string (`ver` or `ver_backend`); `None` = binary gave nothing parseable
 /// (e.g. wrong-GPU build exiting silently).
 fn parse_ffvship_version(stdout: &str, stderr: &str) -> Option<String> {
-    let ver_re = Regex::new(r"(?i)FFVship\s+([^\s\r\n]+)").ok();
-    let back_re = Regex::new(r"(?i)^([a-zA-Z0-9]+)\s+version\s*$").ok();
     let mut ver: Option<String> = None;
     let mut backend: Option<String> = None;
     for line in format!("{stdout}\n{stderr}").lines() {
         let s = line.trim();
         if ver.is_none()
-            && let Some(re) = &ver_re
-            && let Some(c) = re.captures(s)
+            && let Some(c) = ffvship_ver_re().captures(s)
         {
             ver = Some(c[1].to_owned());
         } else if backend.is_none()
-            && let Some(re) = &back_re
-            && let Some(c) = re.captures(s)
+            && let Some(c) = ffvship_back_re().captures(s)
         {
             let word = c[1].to_lowercase();
             if word != "libvship" && word != "ffvship" {
