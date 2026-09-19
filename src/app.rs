@@ -407,6 +407,12 @@ pub struct RFMetricsApp {
     hover_row: Option<usize>,
     hover_since: Option<f64>,
     hovered_now: Option<usize>,
+    /// Shift+click range anchor: last clicked include-checkbox row
+    /// (session-only, like hover/selection — never persisted).
+    include_anchor: Option<usize>,
+    /// Shift+click range anchor: last free-space-clicked row for the
+    /// `selected` removal set (session-only, never persisted).
+    selected_anchor: Option<usize>,
     toast: Option<Toast>,
     /// Pending CSV summary, set by the CsvReport drain arm and toasted
     /// with a real timestamp at the next UI frame (drain has none).
@@ -536,6 +542,8 @@ impl Default for RFMetricsApp {
             hover_row: None,
             hover_since: None,
             hovered_now: None,
+            include_anchor: None,
+            selected_anchor: None,
             toast: None,
             csv_report: None,
             results_autosave_pending: false,
@@ -749,6 +757,8 @@ impl RFMetricsApp {
         // Row indices may have shifted; drop stale hover state.
         self.hover_row = None;
         self.hover_since = None;
+        self.include_anchor = None;
+        self.selected_anchor = None;
     }
 
     /// Re-probe everything (Options "Refresh Files Media Info"): the
@@ -2485,6 +2495,41 @@ fn rank_fill(rank: crate::metrics::StatRank) -> Option<egui::Color32> {
     }
 }
 
+/// Alt+click solo/select-all for the first-column include checkboxes
+/// (egui_plot legend parity): operates on the POST-toggle flags — the
+/// single checkbox already flipped before this runs, and the other rows
+/// are untouched, so "any other checked" is identical pre/post.
+/// Others checked → isolate (only `idx` stays on); no others checked
+/// (was all-off, or was solo on `idx`) → select all. Out-of-range `idx`
+/// is a no-op. Runs only on discrete Alt+clicks, never per frame.
+fn apply_alt_include(includes: &mut [bool], idx: usize) {
+    if idx >= includes.len() {
+        return;
+    }
+    if includes.iter().enumerate().any(|(j, &v)| j != idx && v) {
+        for (j, v) in includes.iter_mut().enumerate() {
+            *v = j == idx;
+        }
+    } else {
+        for v in includes.iter_mut() {
+            *v = true;
+        }
+    }
+}
+
+/// Shift+click range for the first-column include checkboxes
+/// (Gmail-style): the closed `(lo, hi)` span between the anchor row and
+/// the clicked row. The caller fills the span with the clicked box's
+/// post-toggle value. `None` when the anchor or `idx` points past the
+/// queue (stale anchor after row removal). Runs only on discrete
+/// Shift+clicks, never per frame.
+fn shift_include_range(len: usize, anchor: usize, idx: usize) -> Option<(usize, usize)> {
+    if anchor >= len || idx >= len {
+        return None;
+    }
+    Some((anchor.min(idx), anchor.max(idx)))
+}
+
 /// Table metric-column layout, left to right — MUST match the header
 /// checkbox order.
 const METRIC_COLUMNS: [(Option<MetricKind>, &str); 7] = [
@@ -3229,6 +3274,18 @@ impl eframe::App for RFMetricsApp {
                     let mut open_path: Option<String> = None;
                     let mut reveal_path: Option<String> = None;
                     let mut hovered_next: Option<usize> = None;
+                    // Alt+click solo target: set inside the row loop when a
+                    // checkbox flips with Alt held, applied once below.
+                    let mut alt_solo: Option<usize> = None;
+                    // Shift+click range fill: `(lo, hi, value)` span plus
+                    // the anchor update, both applied once below.
+                    let mut shift_range: Option<(usize, usize, bool)> = None;
+                    let mut anchor_next: Option<usize> = None;
+                    // Range anchor snapshot (stale = dangling past the
+                    // queue → plain toggle); copied before the `&mut`
+                    // flag borrows below so no shared borrow lives on.
+                    let anchor = self.include_anchor.filter(|&a| a < self.rows.len());
+                    let sel_anchor = self.selected_anchor.filter(|&a| a < self.rows.len());
                     table
                         .header(18.0, |mut header| {
                             header.col(|_| {});
@@ -3298,8 +3355,31 @@ impl eframe::App for RFMetricsApp {
                                 // (checkbox, play, text drag-select) must not.
                                 // (`toggle_row` etc. are set here, applied below.)
                                 row.col(|ui| {
-                                    ui.checkbox(&mut self.rows[i].include, "")
+                                    let alt = ui.input(|i| i.modifiers.alt);
+                                    let shift = ui.input(|i| i.modifiers.shift);
+                                    let resp = ui
+                                        .checkbox(&mut self.rows[i].include, "")
                                         .on_hover_text("Include in run and plot");
+                                    if resp.changed() {
+                                        if alt {
+                                            // Alt wins over Shift on combo.
+                                            alt_solo = Some(i);
+                                        } else if shift {
+                                            // Gmail-style: the span takes
+                                            // the clicked box's post-toggle
+                                            // value; stale anchor falls
+                                            // through to a plain toggle.
+                                            if let Some((lo, hi)) = anchor.and_then(|a| {
+                                                shift_include_range(self.rows.len(), a, i)
+                                            }) {
+                                                shift_range = Some((lo, hi, self.rows[i].include));
+                                            }
+                                        }
+                                        // Every click moves the anchor, so
+                                        // chained Shift+clicks extend from
+                                        // the last clicked row.
+                                        anchor_next = Some(i);
+                                    }
                                 });
                                 let (_, r) =
                                     row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
@@ -3446,9 +3526,75 @@ impl eframe::App for RFMetricsApp {
                     // Deferred row-click side effects (L3): selection
                     // toggle, open-in-player (error toast needs `now`),
                     // reveal-in-explorer, and hover tracking all land after
-                    // the loop.
-                    if let Some(i) = toggle_row {
-                        self.rows[i].selected = !self.rows[i].selected;
+                    // the loop. Modifiers are read here, in the same frame
+                    // as the clicks above, so they match the click-time
+                    // state without threading through every cell.
+                    let (sel_alt, sel_shift) = ui.input(|i| (i.modifiers.alt, i.modifiers.shift));
+                    if let Some(i) = toggle_row
+                        && i < self.rows.len()
+                    {
+                        if sel_alt {
+                            // Alt-solo/select-all, mirroring the include
+                            // column: the helper's call depends only on
+                            // other-rows state, so it runs directly on the
+                            // unflipped column (rare action: one small
+                            // alloc is fine — never per frame).
+                            let mut flags: Vec<bool> =
+                                self.rows.iter().map(|r| r.selected).collect();
+                            apply_alt_include(&mut flags, i);
+                            for (r, v) in self.rows.iter_mut().zip(flags) {
+                                r.selected = v;
+                            }
+                        } else if sel_shift {
+                            // Checkbox-style: the span takes the clicked
+                            // row's post-toggle state — Shift+clicking a
+                            // selected row unselects the range, an
+                            // unselected one selects it. Stale/missing
+                            // anchor falls through to a plain toggle.
+                            match sel_anchor
+                                .and_then(|a| shift_include_range(self.rows.len(), a, i))
+                            {
+                                Some((lo, hi)) => {
+                                    let v = !self.rows[i].selected;
+                                    for r in &mut self.rows[lo..=hi] {
+                                        r.selected = v;
+                                    }
+                                }
+                                None => {
+                                    self.rows[i].selected = !self.rows[i].selected;
+                                }
+                            }
+                        } else {
+                            self.rows[i].selected = !self.rows[i].selected;
+                        }
+                        // Every selection click moves the anchor, so chained
+                        // Shift+clicks extend from the last clicked row.
+                        self.selected_anchor = Some(i);
+                    }
+                    // Alt+click solo/select-all: the clicked box already
+                    // flipped above; the helper overwrites the whole column
+                    // from that post-toggle state (rare action: one small
+                    // alloc is fine — never on the per-frame hot path).
+                    if let Some(i) = alt_solo
+                        && i < self.rows.len()
+                    {
+                        let mut flags: Vec<bool> = self.rows.iter().map(|r| r.include).collect();
+                        apply_alt_include(&mut flags, i);
+                        for (r, v) in self.rows.iter_mut().zip(flags) {
+                            r.include = v;
+                        }
+                    }
+                    // Shift+click range fill skipped when Alt solo ran.
+                    if alt_solo.is_none()
+                        && let Some((lo, hi, v)) = shift_range
+                        && hi < self.rows.len()
+                    {
+                        for r in &mut self.rows[lo..=hi] {
+                            r.include = v;
+                        }
+                    }
+                    if let Some(a) = anchor_next {
+                        self.include_anchor = Some(a);
                     }
                     if let Some(path) = open_path
                         && let Err(e) = open::that(&path)
@@ -3474,6 +3620,22 @@ impl eframe::App for RFMetricsApp {
                 });
             });
             self.table_rect = Some(table_resp.response.rect);
+            // Ctrl/Cmd+A select-all for the removal set, scoped to
+            // pointer-over-table (the "focused" proxy — egui tables take no
+            // keyboard focus). Runs after the table so a focused TextEdit
+            // (ref path/trim boxes, built above) consumes the key first and
+            // keeps its select-all-text behavior.
+            if !self.rows.is_empty()
+                && self.table_rect.is_some_and(|r| ui.rect_contains_pointer(r))
+                && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A))
+            {
+                for r in &mut self.rows {
+                    r.selected = true;
+                }
+                // Anchor at the end: a follow-up Shift+click on a selected
+                // row unselects the trailing range (checkbox-style).
+                self.selected_anchor = Some(self.rows.len() - 1);
+            }
             // Roll the delayed-hover timer forward; schedule one wake-up
             // for when the delay elapses so the outline appears without
             // moving (no every-frame spin while pending).

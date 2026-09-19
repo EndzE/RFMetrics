@@ -2613,3 +2613,102 @@ fn ref_drain_tracks_info_path() {
     app.drain_probe_results();
     assert_eq!(app.ref_info_path, "C:/vids/r.mp4");
 }
+
+/// Alt+click on a checked include box isolates it; on a solo/all-off
+/// column it selects all (egui_plot legend parity). The helper takes
+/// POST-toggle flags — the clicked box already flipped once.
+#[test]
+fn alt_include_solo_and_select_all() {
+    use super::apply_alt_include;
+    // Others checked + Alt+click row 0 (was checked): post-toggle is
+    // [F,T,T] → isolate to the clicked row.
+    let mut flags = vec![false, true, true];
+    apply_alt_include(&mut flags, 0);
+    assert_eq!(flags, vec![true, false, false]);
+    // All unchecked + Alt+click row 1: post-toggle [F,T,F] → all on.
+    let mut flags = vec![false, true, false];
+    apply_alt_include(&mut flags, 1);
+    assert_eq!(flags, vec![true, true, true]);
+    // Solo row 0 + Alt+click it (was the only checked): post-toggle
+    // [F,F,F] → restore all.
+    let mut flags = vec![false, false, false];
+    apply_alt_include(&mut flags, 0);
+    assert_eq!(flags, vec![true, true, true]);
+    // Mixed + Alt+click unchecked row 2: post-toggle [T,T,T] → isolate.
+    let mut flags = vec![true, true, true];
+    apply_alt_include(&mut flags, 2);
+    assert_eq!(flags, vec![false, false, true]);
+    // Single row Alt+click stays on; out-of-range idx is a no-op.
+    let mut flags = vec![false];
+    apply_alt_include(&mut flags, 0);
+    assert_eq!(flags, vec![true]);
+    let mut flags = vec![true, false];
+    apply_alt_include(&mut flags, 9);
+    assert_eq!(flags, vec![true, false]);
+}
+
+/// Shift+click on an include box fills anchor..=clicked with the clicked
+/// box's post-toggle value. The helper only resolves the span; stale
+/// anchors (past the queue) yield `None` → plain single toggle.
+#[test]
+fn shift_include_range_span_and_stale_anchor() {
+    use super::shift_include_range;
+    assert_eq!(shift_include_range(5, 1, 3), Some((1, 3)));
+    assert_eq!(shift_include_range(5, 3, 1), Some((1, 3)));
+    assert_eq!(shift_include_range(5, 2, 2), Some((2, 2)));
+    assert_eq!(shift_include_range(1, 0, 0), Some((0, 0)));
+    assert_eq!(shift_include_range(3, 7, 1), None);
+    assert_eq!(shift_include_range(3, 0, 9), None);
+    // Check-direction: anchor 0, Shift+click row 3 to check it.
+    let mut flags = vec![true, false, false, false];
+    if let Some((lo, hi)) = shift_include_range(flags.len(), 0, 3) {
+        for v in &mut flags[lo..=hi] {
+            *v = true;
+        }
+    }
+    assert_eq!(flags, vec![true, true, true, true]);
+    // Uncheck-direction: anchor 0, Shift+click row 2 to uncheck it.
+    let mut flags = vec![true, true, true, true];
+    if let Some((lo, hi)) = shift_include_range(flags.len(), 0, 2) {
+        for v in &mut flags[lo..=hi] {
+            *v = false;
+        }
+    }
+    assert_eq!(flags, vec![false, false, false, true]);
+}
+
+/// Full-row `selected` (the removal set) reuses both helpers: Alt-solo
+/// mirrors the include column, Shift+click fills the span with the
+/// clicked row's post-toggle state (checkbox-style).
+#[test]
+fn selection_alt_solo_and_shift_clicked_wins() {
+    use super::{apply_alt_include, shift_include_range};
+    // Alt+click row 0 with others selected → isolate to row 0.
+    let mut sel = vec![false, true, true];
+    apply_alt_include(&mut sel, 0);
+    assert_eq!(sel, vec![true, false, false]);
+    // Alt+click with nothing selected → select all.
+    let mut sel = vec![false, true, false];
+    apply_alt_include(&mut sel, 1);
+    assert_eq!(sel, vec![true, true, true]);
+    // Shift+click: anchor 3 (selected), click unselected row 1 →
+    // post-toggle true selects the span.
+    let mut sel = vec![false, false, false, true, false];
+    if let Some((lo, hi)) = shift_include_range(sel.len(), 3, 1) {
+        let v = !sel[1];
+        for v2 in &mut sel[lo..=hi] {
+            *v2 = v;
+        }
+    }
+    assert_eq!(sel, vec![false, true, true, true, false]);
+    // Shift+click: anchor 0 (selected), click selected row 2 →
+    // post-toggle false unselects the span.
+    let mut sel = vec![true, false, true];
+    if let Some((lo, hi)) = shift_include_range(sel.len(), 0, 2) {
+        let v = !sel[2];
+        for v2 in &mut sel[lo..=hi] {
+            *v2 = v;
+        }
+    }
+    assert_eq!(sel, vec![false, false, false]);
+}
