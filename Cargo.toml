@@ -13,7 +13,9 @@ jiff = "0.2"
 flexi_logger = "0.31.10"
 log = "0.4"
 open = "5.4.4"
-plotters = "0.3.7"
+plotters = { version = "0.3.7", features = ["svg_backend"] }
+plotters-svg = "0.3.7"
+resvg = "0.48.1"
 regex = "1.13.1"
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }

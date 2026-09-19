@@ -356,9 +356,9 @@ impl PlotSize {
 /// `color_idx`) picks the color so exports match the live lines even when
 /// some rows are hidden; the name is display-only.
 ///
-/// Anti-aliasing: plotters' bitmap backend draws aliased strokes, so the
-/// chart renders supersampled (2x at default size, more when small) and
-/// Lanczos-downscales (real supersampled edges).
+/// Anti-aliasing: the chart renders to an in-memory SVG vector and
+/// rasterizes it at target size via resvg/tiny-skia (exact subpixel
+/// geometric coverage, no supersample buffer).
 pub fn export_png(
     path: &std::path::Path,
     title: &str,
@@ -400,33 +400,30 @@ pub fn render_rgba(
     }
     let (x0, x1) = strict_span((x0, x1));
     let (y0, y1) = strict_span((y0, y1));
-    // Supersample, then Lanczos-downscale (plotters draws aliased
-    // strokes): real anti-aliased edges like matplotlib's. All pixel
-    // sizes below are pre-scale.
-    //
-    // Adaptive factor: small presets supersample more (4x at 1280-wide)
-    // so downscaled small text stays crisp instead of pixelated. Capped
-    // so the buffer never exceeds the 3200-wide default's (~10M px):
-    // smaller exports stay faster than the default while matching its
-    // per-pixel sample count.
-    let ssaa: u32 = (5120 / size.0.max(1)).clamp(2, 4);
     // Layout scale: font/margin sizes are tuned for the 3200-wide
     // default; smaller presets shrink them proportionally so axis labels
     // and the legend fit instead of overflowing. All presets share the
     // 4:1 aspect, so width alone sets the factor (1.0 at default keeps
     // the old pixels exactly).
     let layout = size.0 as f32 / 3200.0;
-    let fp = |n: u32| ((n as f32 * layout).round() as u32).max(1) * ssaa;
-    let (bw, bh) = (size.0 * ssaa, size.1 * ssaa);
-    let mut buf = vec![0u8; (bw * bh * 3) as usize];
+    let fp = |n: u32| ((n as f32 * layout).round() as u32).max(1);
+    // Floors so the bottom stack (tick labels top-anchored, "Frames"
+    // desc bottom-anchored) never converges: both only bite below
+    // 2400-wide, 2400/3200 keep their exact current pixels.
+    let tick = fp(24).max(13);
+    let x_area = fp(48).max(36);
+    // 1. Render chart to an in-memory SVG string (vector paths with
+    // exact stroke widths, bypassing the bitmap backend's integer
+    // snapping).
+    let mut svg_buffer = String::with_capacity(64 * 1024);
     {
-        let root = BitMapBackend::with_buffer(&mut buf, (bw, bh)).into_drawing_area();
+        let root = plotters_svg::SVGBackend::with_string(&mut svg_buffer, size).into_drawing_area();
         root.fill(&RGBColor(20, 20, 20))
             .map_err(|e| e.to_string())?;
         let mut chart = ChartBuilder::on(&root)
             .caption(title, ("sans-serif", fp(40)).into_font().color(&WHITE))
             .margin(fp(12))
-            .x_label_area_size(fp(48))
+            .x_label_area_size(x_area)
             .y_label_area_size(fp(100))
             .build_cartesian_2d(x0..x1, y0..y1)
             .map_err(|e| e.to_string())?;
@@ -437,7 +434,7 @@ pub fn render_rgba(
             .x_labels(16)
             .y_labels(8)
             .axis_style(WHITE)
-            .label_style(("sans-serif", fp(24)).into_font().color(&WHITE))
+            .label_style(("sans-serif", tick).into_font().color(&WHITE))
             .light_line_style(RGBColor(42, 42, 42))
             .draw()
             .map_err(|e| e.to_string())?;
@@ -472,21 +469,54 @@ pub fn render_rgba(
             .position(SeriesLabelPosition::LowerRight)
             .background_style(RGBColor(30, 30, 30).mix(0.85))
             .border_style(WHITE)
-            .label_font(("sans-serif", fp(24)).into_font().color(&WHITE))
+            .label_font(("sans-serif", tick).into_font().color(&WHITE))
             .draw()
             .map_err(|e| e.to_string())?;
         root.present().map_err(|e| e.to_string())?;
     }
-    let img = image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(bw, bh, buf)
-        .ok_or_else(|| "supersample buffer mismatch".to_owned())?;
-    let small =
-        image::imageops::resize(&img, size.0, size.1, image::imageops::FilterType::Lanczos3);
-    // Opaque alpha: the plot canvas has no transparency.
-    let mut rgba = Vec::with_capacity((size.0 * size.1 * 4) as usize);
-    for p in small.pixels() {
-        rgba.extend_from_slice(&[p[0], p[1], p[2], 0xFF]);
+    // 2. Rasterize the SVG with resvg (analytical coverage
+    // anti-aliasing). Small presets rasterize at 2x and downscale:
+    // sub-20px glyphs are inherently crunchy at 1x, while 2x hinted
+    // glyphs downscale smooth (the old SSAA text effect at a quarter
+    // of its cost). 2400-wide and up stay exact 1x.
+    // ponytail: system-font scan once per process; reload per call if
+    // missing glyphs ever appear in exports.
+    static FONTDB: std::sync::OnceLock<std::sync::Arc<resvg::usvg::fontdb::Database>> =
+        std::sync::OnceLock::new();
+    let fontdb = FONTDB
+        .get_or_init(|| {
+            let mut db = resvg::usvg::fontdb::Database::new();
+            db.load_system_fonts();
+            std::sync::Arc::new(db)
+        })
+        .clone();
+    let opt = resvg::usvg::Options {
+        fontdb,
+        ..resvg::usvg::Options::default()
+    };
+    let tree = resvg::usvg::Tree::from_str(&svg_buffer, &opt)
+        .map_err(|e| format!("SVG parse error: {e}"))?;
+    let k: u32 = if size.0 < 2400 { 2 } else { 1 };
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(size.0 * k, size.1 * k)
+        .ok_or_else(|| "Failed to allocate rasterizer buffer".to_owned())?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(k as f32, k as f32),
+        &mut pixmap.as_mut(),
+    );
+    // 3. Extract pixels. The canvas has an opaque background
+    // (RGB(20,20,20)), so premultiplied RGBA from tiny-skia is identical
+    // to straight RGBA.
+    if k == 1 {
+        let rgba = pixmap.take();
+        return Ok((size.0, size.1, rgba));
     }
-    Ok((size.0, size.1, rgba))
+    let big =
+        image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(size.0 * k, size.1 * k, pixmap.take())
+            .ok_or_else(|| "rasterizer buffer mismatch".to_owned())?;
+    let small =
+        image::imageops::resize(&big, size.0, size.1, image::imageops::FilterType::Lanczos3);
+    Ok((size.0, size.1, small.into_raw()))
 }
 #[cfg(test)]
 #[path = "tests/test_plot.rs"]

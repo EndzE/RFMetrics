@@ -529,8 +529,10 @@ fn zoomed_export_has_no_edge_waterfalls() {
         }
     }
     // Curve is really drawn, but no column carries a streak (the bug
-    // stacked ~100+ red px on the edge columns).
-    assert!(mid > 100, "curve drawn, mid30={mid}");
+    // stacked ~100+ red px on the edge columns). The vector renderer
+    // draws crisper 1px strokes than the old SSAA blur halo, so the
+    // mid-window count reads lower (~98 vs ~100+): keep margin below it.
+    assert!(mid > 50, "curve drawn, mid30={mid} max={max_col}");
     assert!(max_col <= 80, "no waterfall column, max={max_col}");
     std::fs::remove_dir_all(&dir).ok();
 }
