@@ -69,9 +69,10 @@ fn container_bitrate_flag() {
 
 #[test]
 fn text_edge_cases() {
-    let (text, info) = reference_media_text("", None);
+    let (text, info, timed_out) = reference_media_text("", None);
     assert!(text.contains("-unknown-"));
     assert!(info.is_none());
+    assert!(!timed_out);
     assert_eq!(
         reference_media_text("C:/no/such/file.mp4", None).0,
         "File not found"
@@ -82,10 +83,11 @@ fn text_edge_cases() {
 fn text_needs_ffprobe() {
     let p = std::env::temp_dir().join("rfmetrics-probe-test.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let (s, info) = reference_media_text(&p.to_string_lossy(), None);
+    let (s, info, timed_out) = reference_media_text(&p.to_string_lossy(), None);
     std::fs::remove_file(&p).ok();
     assert_eq!(s, "ffprobe not found");
     assert!(info.is_none());
+    assert!(!timed_out);
 }
 
 #[test]

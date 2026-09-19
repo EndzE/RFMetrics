@@ -838,15 +838,29 @@ pub(crate) fn pump_process(
             .unwrap_or_default()
     });
     // Reap: Stop takes + kills + waits ahead of us when aborting (it sets
-    // the flag first, so a missing child always means "aborted").
+    // the flag first, so a missing child always means "aborted"). Bounded:
+    // a wedged child must not hang the worker past REAP_TIMEOUT.
     let status = child_slot
         .lock()
         .ok()
         .and_then(|mut slot| slot.take())
-        .map(|mut c| c.wait());
+        .map(|mut c| {
+            match wait_timeout::ChildExt::wait_timeout(&mut c, crate::cmd::REAP_TIMEOUT) {
+                Ok(Some(status)) => Some(status),
+                Ok(None) => {
+                    log::error!(target: "rfmetrics::metric", "reap timed out after {:?} — killing child", crate::cmd::REAP_TIMEOUT);
+                    let _ = c.kill();
+                    c.wait().ok()
+                }
+                Err(e) => {
+                    log::error!(target: "rfmetrics::metric", "reap failed: {e}");
+                    None
+                }
+            }
+        });
     let aborted = abort.load(Ordering::SeqCst);
     Ok(Pumped {
-        code: status.and_then(|s| s.ok()).and_then(|s| s.code()),
+        code: status.flatten().and_then(|s| s.code()),
         stderr: err_text,
         exec_s: start.elapsed().as_secs_f64(),
         aborted,

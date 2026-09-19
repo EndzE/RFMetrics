@@ -156,6 +156,7 @@ fn stale_reference_result_discarded() {
             generation: 999,
             text: "stale".to_owned(),
             info: None,
+            timed_out: false,
         })
         .unwrap();
     app.refresh_ref_info();
@@ -165,6 +166,7 @@ fn stale_reference_result_discarded() {
             generation: app.ref_generation,
             text: "fresh".to_owned(),
             info: None,
+            timed_out: false,
         })
         .unwrap();
     app.refresh_ref_info();
@@ -206,6 +208,7 @@ fn row_media_applies_by_key() {
             media: "h264, 1080p".to_owned(),
             tip: "tip".to_owned(),
             info: None,
+            timed_out: false,
         })
         .unwrap();
     app.probe_tx
@@ -214,6 +217,7 @@ fn row_media_applies_by_key() {
             media: "x".to_owned(),
             tip: "y".to_owned(),
             info: None,
+            timed_out: false,
         })
         .unwrap();
     app.refresh_ref_info();
@@ -2499,6 +2503,7 @@ fn drains_report_activity() {
             generation: 999,
             text: "stale".to_owned(),
             info: None,
+            timed_out: false,
         })
         .unwrap();
     assert!(app.drain_probe_results());
@@ -2528,6 +2533,7 @@ fn drains_report_activity() {
             generation: 999,
             text: "stale".to_owned(),
             info: None,
+            timed_out: false,
         })
         .unwrap();
     assert!(app.refresh_ref_info());
@@ -2690,6 +2696,7 @@ fn ref_drain_tracks_info_path() {
             generation: app.ref_generation,
             text: "info".to_owned(),
             info: None,
+            timed_out: false,
         })
         .unwrap();
     app.drain_probe_results();
@@ -2702,6 +2709,7 @@ fn ref_drain_tracks_info_path() {
             generation: 0,
             text: "stale".to_owned(),
             info: None,
+            timed_out: false,
         })
         .unwrap();
     app.drain_probe_results();
@@ -2805,4 +2813,46 @@ fn selection_alt_solo_and_shift_clicked_wins() {
         }
     }
     assert_eq!(sel, vec![false, false, false]);
+}
+
+/// Timed-out probes record a note for the update-level toast; stale or
+/// row-less timeouts stay silent.
+#[test]
+fn probe_timeout_note_recorded_once() {
+    let mut app = RFMetricsApp::default();
+    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.probe_tx
+        .send(ProbeMsg::RowMedia {
+            key: norm_key("C:/vids/a.mp4"),
+            media: "x".to_owned(),
+            tip: "y".to_owned(),
+            info: None,
+            timed_out: true,
+        })
+        .unwrap();
+    app.drain_probe_results();
+    assert_eq!(app.probe_timeout_note.as_deref(), Some("a.mp4"));
+    // Stale ref timeout: generation mismatch drops it, note untouched.
+    app.probe_tx
+        .send(ProbeMsg::Reference {
+            generation: 999,
+            text: "Probe timed out".to_owned(),
+            info: None,
+            timed_out: true,
+        })
+        .unwrap();
+    app.drain_probe_results();
+    assert_eq!(app.probe_timeout_note.as_deref(), Some("a.mp4"));
+    // Timeout for a removed row stays silent.
+    app.probe_tx
+        .send(ProbeMsg::RowMedia {
+            key: "gone".to_owned(),
+            media: "x".to_owned(),
+            tip: "y".to_owned(),
+            info: None,
+            timed_out: true,
+        })
+        .unwrap();
+    app.drain_probe_results();
+    assert_eq!(app.probe_timeout_note.as_deref(), Some("a.mp4"));
 }

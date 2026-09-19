@@ -146,12 +146,19 @@ struct VersionOutput {
     code: Option<i32>,
 }
 
-// ponytail: no timeout on std Command; one local spawn at startup is ~ms
+// Bounded version probe: a hung `--version` (wedged exe, AV stall) must
+// never freeze startup — 5 s, then `None` like a spawn failure.
 fn run_version(exe: &Path, arg: &str) -> Option<VersionOutput> {
     let start = std::time::Instant::now();
     log::debug!(target: "rfmetrics::binaries", "run: \"{}\" {arg}", exe.display());
-    let out = match Command::new(exe).arg(arg).output() {
+    let mut cmd = Command::new(exe);
+    cmd.arg(arg);
+    let out = match crate::cmd::output_timeout(cmd, crate::cmd::VERSION_TIMEOUT) {
         Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            log::warn!(target: "rfmetrics::binaries", "run: \"{}\" {arg} timed out after {:?} — treating as missing", exe.display(), crate::cmd::VERSION_TIMEOUT);
+            return None;
+        }
         Err(e) => {
             log::warn!(target: "rfmetrics::binaries", "run: \"{}\" {arg} spawn failed: {e}", exe.display());
             return None;

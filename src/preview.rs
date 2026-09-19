@@ -53,7 +53,7 @@ fn decode_and_fit(png_bytes: &[u8]) -> Option<egui::ColorImage> {
 
 /// One ffmpeg single-frame extract per seek candidate; first success wins.
 /// `None` = empty/missing input or every seek failed (caller shows placeholder).
-/// ponytail: no timeout on std Command; single-frame pipe:1 extract is ~ms.
+/// Each seek is bounded (a wedged decode must not hang the thumb worker).
 pub fn extract_thumbnail(
     ffmpeg: &Path,
     path: &str,
@@ -70,30 +70,33 @@ pub fn extract_thumbnail(
     for ss in seek_candidates(duration) {
         let start = std::time::Instant::now();
         log::debug!(target: "rfmetrics::preview", "thumbnail: -ss {ss} -i \"{path}\"");
-        let out = match Command::new(ffmpeg)
-            .args([
-                "-hide_banner",
-                "-nostdin",
-                // FFMetrics.conf `Thumbnail.Template` parity.
-                "-probesize",
-                "50M",
-                "-ss",
-                ss,
-                "-i",
-                path,
-                "-frames:v",
-                "1",
-                "-vf",
-                &vf,
-                "-f",
-                "image2pipe",
-                "-c:v",
-                "png",
-                "pipe:1",
-            ])
-            .output()
-        {
+        let mut cmd = Command::new(ffmpeg);
+        cmd.args([
+            "-hide_banner",
+            "-nostdin",
+            // FFMetrics.conf `Thumbnail.Template` parity.
+            "-probesize",
+            "50M",
+            "-ss",
+            ss,
+            "-i",
+            path,
+            "-frames:v",
+            "1",
+            "-vf",
+            &vf,
+            "-f",
+            "image2pipe",
+            "-c:v",
+            "png",
+            "pipe:1",
+        ]);
+        let out = match crate::cmd::output_timeout(cmd, crate::cmd::THUMB_TIMEOUT) {
             Ok(o) => o,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                log::warn!(target: "rfmetrics::preview", "thumbnail -ss {ss} \"{path}\" timed out after {:?} ({}ms)", crate::cmd::THUMB_TIMEOUT, start.elapsed().as_millis());
+                continue;
+            }
             Err(e) => {
                 log::warn!(target: "rfmetrics::preview", "thumbnail ffmpeg -ss {ss} \"{path}\" spawn failed: {e}");
                 return None;

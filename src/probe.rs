@@ -213,24 +213,31 @@ pub fn parse_media(v: &Stream, fmt: &Format) -> MediaInfo {
 fn count_packets(exe: &Path, path: &str) -> Option<i64> {
     let start = std::time::Instant::now();
     log::debug!(target: "rfmetrics::probe", "count_packets: \"{}\" -count_packets \"{path}\"", exe.display());
-    let out = Command::new(exe)
-        .args([
-            "-v",
-            "error",
-            // FFMetrics.conf parity: larger probe window for sparse headers.
-            "-probesize",
-            "50M",
-            "-select_streams",
-            "v:0",
-            "-count_packets",
-            "-show_entries",
-            "stream=nb_read_packets",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            path,
-        ])
-        .output()
-        .ok()?;
+    // Packet scans walk whole files: generous bound, warn on timeout.
+    let mut cmd = Command::new(exe);
+    cmd.args([
+        "-v",
+        "error",
+        // FFMetrics.conf parity: larger probe window for sparse headers.
+        "-probesize",
+        "50M",
+        "-select_streams",
+        "v:0",
+        "-count_packets",
+        "-show_entries",
+        "stream=nb_read_packets",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]);
+    let out = match crate::cmd::output_timeout(cmd, crate::cmd::PACKET_COUNT_TIMEOUT) {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            log::warn!(target: "rfmetrics::probe", "count_packets \"{path}\" timed out after {:?} ({}ms)", crate::cmd::PACKET_COUNT_TIMEOUT, start.elapsed().as_millis());
+            return None;
+        }
+        Err(_) => return None,
+    };
     let n = String::from_utf8_lossy(&out.stdout)
         .trim()
         .parse::<i64>()
@@ -252,6 +259,7 @@ fn count_packets(exe: &Path, path: &str) -> Option<i64> {
 #[derive(Debug)]
 enum ProbeFail {
     Spawn(String),
+    Timeout,
     InvalidJson(String),
     NoVideo,
 }
@@ -261,21 +269,24 @@ enum ProbeFail {
 /// call themselves, so their ms logs stay equivalent, and map `ProbeFail`
 /// to their own user-facing text.
 fn probe_once(path: &str, exe: &Path) -> Result<MediaInfo, ProbeFail> {
-    let out = Command::new(exe)
-        .args([
-            "-v",
-            "quiet",
-            // FFMetrics.conf parity: larger probe window for sparse headers.
-            "-probesize",
-            "50M",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-            path,
-        ])
-        .output()
-        .map_err(|e| ProbeFail::Spawn(e.to_string()))?;
+    let mut cmd = Command::new(exe);
+    cmd.args([
+        "-v",
+        "quiet",
+        // FFMetrics.conf parity: larger probe window for sparse headers.
+        "-probesize",
+        "50M",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        path,
+    ]);
+    let out = match crate::cmd::output_timeout(cmd, crate::cmd::PROBE_TIMEOUT) {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Err(ProbeFail::Timeout),
+        Err(e) => return Err(ProbeFail::Spawn(e.to_string())),
+    };
     let data: ProbeOutput =
         serde_json::from_slice(&out.stdout).map_err(|e| ProbeFail::InvalidJson(e.to_string()))?;
     let Some(v) = data
@@ -306,19 +317,29 @@ pub(crate) fn probe_media(path: &str, ffprobe: Option<&Path>) -> Option<MediaInf
         return None;
     }
     let exe = ffprobe?;
+    probe_media_fail(path, exe).0
+}
+
+/// Same as [`probe_media`], plus whether the probe timed out (the queue
+/// worker surfaces timeouts as toasts; `probe_media` callers don't care).
+fn probe_media_fail(path: &str, exe: &Path) -> (Option<MediaInfo>, bool) {
     let start = std::time::Instant::now();
     log::debug!(target: "rfmetrics::probe", "probe: \"{}\" -show_format -show_streams \"{path}\"", exe.display());
     let info = match probe_once(path, exe) {
         Ok(info) => info,
         // Today's exact behavior: spawn failure is silent (`ok()?`).
-        Err(ProbeFail::Spawn(_)) => return None,
+        Err(ProbeFail::Spawn(_)) => return (None, false),
+        Err(ProbeFail::Timeout) => {
+            log::warn!(target: "rfmetrics::probe", "probe \"{path}\" timed out after {:?} ({}ms)", crate::cmd::PROBE_TIMEOUT, start.elapsed().as_millis());
+            return (None, true);
+        }
         Err(ProbeFail::InvalidJson(e)) => {
             log::warn!(target: "rfmetrics::probe", "probe \"{path}\" invalid JSON: {e} ({}ms)", start.elapsed().as_millis());
-            return None;
+            return (None, false);
         }
         Err(ProbeFail::NoVideo) => {
             log::warn!(target: "rfmetrics::probe", "probe \"{path}\" no video stream ({}ms)", start.elapsed().as_millis());
-            return None;
+            return (None, false);
         }
     };
     log::info!(
@@ -329,7 +350,7 @@ pub(crate) fn probe_media(path: &str, ffprobe: Option<&Path>) -> Option<MediaInf
         info.encoder,
         start.elapsed().as_millis(),
     );
-    Some(info)
+    (Some(info), false)
 }
 
 /// Duration helper for the thumbnail worker (Python `_get_media_duration`).
@@ -485,30 +506,47 @@ pub fn table_media_tooltip(info: Option<&MediaInfo>) -> String {
 
 /// Single spawn returning truncated cell text + full tooltip for a queue row,
 /// plus the raw info for metric runners (filtergraph scale/format decisions).
-pub fn probe_table_text(path: &str, ffprobe: Option<&Path>) -> (String, String, Option<MediaInfo>) {
-    let info = probe_media(path, ffprobe);
+pub fn probe_table_text(
+    path: &str,
+    ffprobe: Option<&Path>,
+) -> (String, String, Option<MediaInfo>, bool) {
+    // Same guards as `probe_media`; the flag reports an ffprobe timeout
+    // (the queue worker surfaces it as a toast).
+    let (info, timed_out) = match (
+        path.trim().is_empty() || !Path::new(path).is_file(),
+        ffprobe,
+    ) {
+        (true, _) | (_, None) => (None, false),
+        (false, Some(exe)) => probe_media_fail(path, exe),
+    };
     let full = table_media_text(info.as_ref());
     let cell = cell_media_text(&full, 38);
     let tip = table_media_tooltip(info.as_ref());
-    (cell, tip, info)
+    (cell, tip, info, timed_out)
 }
 
 /// Single-line reference info, mirroring Python `reference_media_text`.
 /// Spawns ffprobe only for existing files; anything else is a cheap string.
 /// The returned info feeds metric runners (filtergraph scale/format decisions).
-pub fn reference_media_text(path: &str, ffprobe: Option<&Path>) -> (String, Option<MediaInfo>) {
+/// The trailing flag reports an ffprobe timeout (the worker surfaces it as
+/// a toast; the text itself stays user-facing like the other failures).
+pub fn reference_media_text(
+    path: &str,
+    ffprobe: Option<&Path>,
+) -> (String, Option<MediaInfo>, bool) {
     if path.trim().is_empty() {
         return (
             "Encoder: -unknown-, Frame: -unknown-, Bitrate: -unknown-, Duration: -unknown-"
                 .to_owned(),
             None,
+            false,
         );
     }
     if !Path::new(path).is_file() {
-        return ("File not found".to_owned(), None);
+        return ("File not found".to_owned(), None, false);
     }
     let Some(exe) = ffprobe else {
-        return ("ffprobe not found".to_owned(), None);
+        return ("ffprobe not found".to_owned(), None, false);
     };
     let start = std::time::Instant::now();
     log::debug!(target: "rfmetrics::probe", "probe ref: \"{}\" -show_format -show_streams \"{path}\"", exe.display());
@@ -516,15 +554,19 @@ pub fn reference_media_text(path: &str, ffprobe: Option<&Path>) -> (String, Opti
         Ok(info) => info,
         Err(ProbeFail::Spawn(e)) => {
             log::warn!(target: "rfmetrics::probe", "probe ref \"{path}\" spawn failed: {e}");
-            return (format!("Probe failed: {e}"), None);
+            return ("Probe failed: {e}".to_owned(), None, false);
+        }
+        Err(ProbeFail::Timeout) => {
+            log::warn!(target: "rfmetrics::probe", "probe ref \"{path}\" timed out after {:?} ({}ms)", crate::cmd::PROBE_TIMEOUT, start.elapsed().as_millis());
+            return ("Probe timed out".to_owned(), None, true);
         }
         Err(ProbeFail::InvalidJson(_)) => {
             log::warn!(target: "rfmetrics::probe", "probe ref \"{path}\" invalid output ({}ms)", start.elapsed().as_millis());
-            return ("Probe failed: invalid output".to_owned(), None);
+            return ("Probe failed: invalid output".to_owned(), None, false);
         }
         Err(ProbeFail::NoVideo) => {
             log::warn!(target: "rfmetrics::probe", "probe ref \"{path}\" no video stream ({}ms)", start.elapsed().as_millis());
-            return ("No video stream".to_owned(), None);
+            return ("No video stream".to_owned(), None, false);
         }
     };
 
@@ -562,11 +604,11 @@ pub fn reference_media_text(path: &str, ffprobe: Option<&Path>) -> (String, Opti
     }
     if parts.is_empty() {
         log::info!(target: "rfmetrics::probe", "probe ref \"{path}\" → no info ({}ms)", start.elapsed().as_millis());
-        ("—".to_owned(), Some(info))
+        ("—".to_owned(), Some(info), false)
     } else {
         let text = parts.join(", ");
         log::info!(target: "rfmetrics::probe", "probe ref \"{path}\" → {text} ({}ms)", start.elapsed().as_millis());
-        (text, Some(info))
+        (text, Some(info), false)
     }
 }
 #[cfg(test)]

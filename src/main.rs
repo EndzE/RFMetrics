@@ -1,5 +1,6 @@
 mod app;
 mod binaries;
+mod cmd;
 mod logging;
 mod metrics;
 mod plot;

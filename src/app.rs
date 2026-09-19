@@ -275,12 +275,16 @@ enum ProbeMsg {
         generation: u64,
         text: String,
         info: Option<crate::probe::MediaInfo>,
+        /// The ffprobe call timed out (the drain surfaces it as a toast).
+        timed_out: bool,
     },
     RowMedia {
         key: String,
         media: String,
         tip: String,
         info: Option<crate::probe::MediaInfo>,
+        /// The ffprobe call timed out (the drain surfaces it as a toast).
+        timed_out: bool,
     },
 }
 
@@ -420,6 +424,10 @@ pub struct RFMetricsApp {
     /// `selected` removal set (session-only, never persisted).
     selected_anchor: Option<usize>,
     toast: Option<Toast>,
+    /// A probe worker hit its timeout; the drain records the display name
+    /// here and the update loop toasts it once (single slot, like `toast`).
+    /// Session-only, never persisted.
+    probe_timeout_note: Option<String>,
     /// Pending CSV summary, set by the CsvReport drain arm and toasted
     /// with a real timestamp at the next UI frame (drain has none).
     /// `(files_written, error_strings)`.
@@ -552,6 +560,7 @@ impl Default for RFMetricsApp {
             include_anchor: None,
             selected_anchor: None,
             toast: None,
+            probe_timeout_note: None,
             csv_report: None,
             results_autosave_pending: false,
             probe_tx,
@@ -617,6 +626,7 @@ impl RFMetricsApp {
                     generation,
                     text,
                     info,
+                    timed_out,
                 } => {
                     if generation == self.ref_generation {
                         self.ref_info = text;
@@ -624,6 +634,10 @@ impl RFMetricsApp {
                         // No newer spawn happened since (same generation),
                         // so `last_spawned_ref` is the path this probed.
                         self.ref_info_path = self.last_spawned_ref.clone();
+                        if timed_out {
+                            self.probe_timeout_note =
+                                Some(Self::timeout_display(&self.last_spawned_ref));
+                        }
                     } else {
                         log::debug!(target: "rfmetrics::app", "discarded stale ref probe (gen {generation})");
                     }
@@ -633,11 +647,15 @@ impl RFMetricsApp {
                     media,
                     tip,
                     info,
+                    timed_out,
                 } => {
                     if let Some(row) = self.rows.iter_mut().find(|r| r.key == key) {
                         row.media = media;
                         row.media_tip = tip;
                         row.info = info;
+                        if timed_out {
+                            self.probe_timeout_note = Some(row.display.clone());
+                        }
                     }
                 }
             }
@@ -680,11 +698,12 @@ impl RFMetricsApp {
         let path = self.ref_path.clone();
         let exe = self.ffprobe.clone();
         std::thread::spawn(move || {
-            let (text, info) = crate::probe::reference_media_text(&path, exe.as_deref());
+            let (text, info, timed_out) = crate::probe::reference_media_text(&path, exe.as_deref());
             let _ = tx.send(ProbeMsg::Reference {
                 generation,
                 text,
                 info,
+                timed_out,
             });
         });
         activity
@@ -794,12 +813,14 @@ impl RFMetricsApp {
             .collect();
         std::thread::spawn(move || {
             for (key, s) in paths {
-                let (media, tip, info) = crate::probe::probe_table_text(&s, exe.as_deref());
+                let (media, tip, info, timed_out) =
+                    crate::probe::probe_table_text(&s, exe.as_deref());
                 let _ = tx.send(ProbeMsg::RowMedia {
                     key,
                     media,
                     tip,
                     info,
+                    timed_out,
                 });
             }
         });
@@ -854,12 +875,14 @@ impl RFMetricsApp {
         let exe = self.ffprobe.clone();
         std::thread::spawn(move || {
             for (key, s) in fresh {
-                let (media, tip, info) = crate::probe::probe_table_text(&s, exe.as_deref());
+                let (media, tip, info, timed_out) =
+                    crate::probe::probe_table_text(&s, exe.as_deref());
                 let _ = tx.send(ProbeMsg::RowMedia {
                     key,
                     media,
                     tip,
                     info,
+                    timed_out,
                 });
             }
         });
@@ -1148,6 +1171,16 @@ impl RFMetricsApp {
             until: now + TOAST_SECS,
             kind,
         });
+    }
+
+    /// Short display name for timeout toasts: filename when available,
+    /// full path otherwise (never empty — falls back to a placeholder).
+    fn timeout_display(path: &str) -> String {
+        std::path::Path::new(path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "(unknown file)".to_owned())
     }
 
     /// Parse a trim box; empty means no trim. `None` = invalid ("bad time").
@@ -1919,6 +1952,8 @@ impl RFMetricsApp {
 
     /// Signal the worker to stop and kill the in-flight ffmpeg, if any.
     /// Shared with `reset_psnr` so Reset never leaves an orphaned run.
+    /// The reap is bounded: a wedged child is detached onto a reaper
+    /// thread instead of blocking the UI.
     fn abort_worker(&self) {
         use std::sync::atomic::Ordering;
         self.abort.store(true, Ordering::SeqCst);
@@ -1926,7 +1961,15 @@ impl RFMetricsApp {
             && let Some(mut child) = slot.take()
         {
             let _ = child.kill();
-            let _ = child.wait();
+            match wait_timeout::ChildExt::wait_timeout(&mut child, crate::cmd::REAP_TIMEOUT) {
+                Ok(Some(_)) => {}
+                _ => {
+                    log::error!(target: "rfmetrics::app", "stop reap timed out after {:?} — detaching child", crate::cmd::REAP_TIMEOUT);
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                }
+            }
         }
     }
 
@@ -2729,6 +2772,11 @@ impl eframe::App for RFMetricsApp {
         // drain running. Spawns above stem from input frames, which repaint
         // on their own; thumb workers also wake the UI themselves.
         let live = self.refresh_ref_info();
+        // Probe timeouts surface once as a warning toast (the drain only
+        // records the name; the slot keeps the latest like `toast`).
+        if let Some(name) = self.probe_timeout_note.take() {
+            self.toast(now, format!("Probe timed out: {name}"), ToastKind::Warning);
+        }
         let ctx = ui.ctx().clone();
         let live = self.refresh_thumbnail(&ctx) | live;
         let live = self.drain_metric_results() | live;
