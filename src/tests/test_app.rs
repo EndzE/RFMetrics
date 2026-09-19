@@ -2856,3 +2856,111 @@ fn probe_timeout_note_recorded_once() {
     app.drain_probe_results();
     assert_eq!(app.probe_timeout_note.as_deref(), Some("a.mp4"));
 }
+
+/// Minimal queue row for sort tests: distinct display name plus an
+/// optional scored cell of one metric (everything else Idle).
+fn sort_test_row(
+    display: &str,
+    kind: crate::metrics::ffmpeg::MetricKind,
+    avg: Option<f64>,
+) -> QueueRow {
+    use crate::metrics::MetricCell;
+    let mut r = psnr_test_row(&format!("C:/vids/{display}"), true);
+    r.display = display.to_owned();
+    let cell = match avg {
+        Some(avg) => MetricCell::Done {
+            values: vec![avg],
+            avg,
+            exec_s: 1.0,
+            skip: None,
+            clip_dur: None,
+            vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
+            fps_mode: InputFpsMode::Reference,
+        },
+        None => MetricCell::Idle,
+    };
+    *r.cell_mut(kind) = cell;
+    r
+}
+
+/// Header-click cycle: fresh click starts best-first, repeat flips,
+/// third clears to insertion; switching columns restarts.
+#[test]
+fn sort_cycle_path_and_metrics() {
+    use super::{SortColumn, SortDir, cycle_sort, initial_dir};
+    use crate::metrics::ffmpeg::MetricKind;
+    assert_eq!(
+        cycle_sort(None, SortColumn::Path),
+        Some((SortColumn::Path, SortDir::Asc))
+    );
+    assert_eq!(
+        cycle_sort(None, SortColumn::Metric(MetricKind::Vmaf)),
+        Some((SortColumn::Metric(MetricKind::Vmaf), SortDir::Desc))
+    );
+    // Butteraugli is lower-better: best first is ascending.
+    assert_eq!(
+        initial_dir(SortColumn::Metric(MetricKind::But)),
+        SortDir::Asc
+    );
+    let first = cycle_sort(None, SortColumn::Metric(MetricKind::Vmaf)).unwrap();
+    let second = cycle_sort(Some(first), SortColumn::Metric(MetricKind::Vmaf)).unwrap();
+    assert_eq!(second.1, SortDir::Asc);
+    assert_eq!(
+        cycle_sort(Some(second), SortColumn::Metric(MetricKind::Vmaf)),
+        None
+    );
+    assert_eq!(
+        cycle_sort(Some(second), SortColumn::Path),
+        Some((SortColumn::Path, SortDir::Asc))
+    );
+}
+
+/// Display order: identity unsorted, A-Z paths, best-first scores with
+/// unscored rows always last in both directions, stable ties.
+#[test]
+fn sort_view_orders_and_restores() {
+    use super::{SortColumn, SortDir, sort_view};
+    use crate::metrics::ffmpeg::MetricKind;
+    let rows = vec![
+        sort_test_row("c.mp4", MetricKind::Vmaf, Some(30.0)),
+        sort_test_row("a.mp4", MetricKind::Vmaf, None),
+        sort_test_row("b.mp4", MetricKind::Vmaf, Some(40.0)),
+        sort_test_row("d.mp4", MetricKind::Vmaf, Some(40.0)),
+    ];
+    // Insertion identity when unsorted.
+    assert_eq!(sort_view(&rows, None), vec![0, 1, 2, 3]);
+    // Path A-Z.
+    assert_eq!(
+        sort_view(&rows, Some((SortColumn::Path, SortDir::Asc))),
+        vec![1, 2, 0, 3]
+    );
+    // VMAF best first: highest scored first, unscored last, ties stable.
+    assert_eq!(
+        sort_view(
+            &rows,
+            Some((SortColumn::Metric(MetricKind::Vmaf), SortDir::Desc))
+        ),
+        vec![2, 3, 0, 1]
+    );
+    // Reversed: lowest scored first, unscored still last.
+    assert_eq!(
+        sort_view(
+            &rows,
+            Some((SortColumn::Metric(MetricKind::Vmaf), SortDir::Asc))
+        ),
+        vec![0, 2, 3, 1]
+    );
+    // Butteraugli best first is ascending (lower wins).
+    let rows = vec![
+        sort_test_row("a.mp4", MetricKind::But, Some(2.0)),
+        sort_test_row("b.mp4", MetricKind::But, Some(1.0)),
+    ];
+    assert_eq!(
+        sort_view(
+            &rows,
+            Some((SortColumn::Metric(MetricKind::But), SortDir::Asc))
+        ),
+        vec![1, 0]
+    );
+}

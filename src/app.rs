@@ -423,6 +423,9 @@ pub struct RFMetricsApp {
     /// Shift+click range anchor: last free-space-clicked row for the
     /// `selected` removal set (session-only, never persisted).
     selected_anchor: Option<usize>,
+    /// Active table sort, if any (session-only, never persisted — the
+    /// state file and run order always keep insertion order).
+    sort_spec: Option<(SortColumn, SortDir)>,
     toast: Option<Toast>,
     /// A probe worker hit its timeout; the drain records the display name
     /// here and the update loop toasts it once (single slot, like `toast`).
@@ -559,6 +562,7 @@ impl Default for RFMetricsApp {
             hovered_now: None,
             include_anchor: None,
             selected_anchor: None,
+            sort_spec: None,
             toast: None,
             probe_timeout_note: None,
             csv_report: None,
@@ -2530,6 +2534,47 @@ fn vline(ui: &mut egui::Ui, color: egui::Color32) {
     );
 }
 
+/// Vector sort-direction mark: painted triangles, not text — the bundled
+/// UI font has no ▲▼⇅ glyphs (tofu squares). Active direction in text
+/// color, inactive as a faint up+down pair (sortable affordance).
+/// Returns the click response; the caller attaches hover text + action.
+fn sort_mark(ui: &mut egui::Ui, dir: Option<SortDir>) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let c = rect.center();
+        let visuals = ui.visuals();
+        // (pointing-up, y-offset, half-size).
+        let tris: &[(bool, f32, f32)] = match dir {
+            Some(SortDir::Asc) => &[(true, 0.0, 4.5)],
+            Some(SortDir::Desc) => &[(false, 0.0, 4.5)],
+            None => &[(true, -2.6, 3.0), (false, 2.6, 3.0)],
+        };
+        let color = match dir {
+            Some(_) => visuals.text_color(),
+            None => visuals.weak_text_color(),
+        };
+        for &(up, dy, r) in tris {
+            let cy = c.y + dy;
+            let pts = if up {
+                vec![
+                    egui::pos2(c.x - r, cy + r * 0.8),
+                    egui::pos2(c.x + r, cy + r * 0.8),
+                    egui::pos2(c.x, cy - r * 0.8),
+                ]
+            } else {
+                vec![
+                    egui::pos2(c.x - r, cy - r * 0.8),
+                    egui::pos2(c.x + r, cy - r * 0.8),
+                    egui::pos2(c.x, cy + r * 0.8),
+                ]
+            };
+            ui.painter()
+                .add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
+        }
+    }
+    resp
+}
+
 /// Panel frame with Python's drag-enter green (#2FA572) while hovered.
 fn panel_frame(ui: &egui::Ui, hovering: bool) -> egui::Frame {
     let mut frame = egui::Frame::group(ui.style());
@@ -2592,6 +2637,99 @@ fn shift_include_range(len: usize, anchor: usize, idx: usize) -> Option<(usize, 
         return None;
     }
     Some((anchor.min(idx), anchor.max(idx)))
+}
+
+/// Sortable table columns: queue path + the 7 metric columns (checkbox,
+/// play, and Media info columns stay unsorted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortColumn {
+    Path,
+    Metric(MetricKind),
+}
+
+/// Rendered direction: first click lands the initial direction (best
+/// first — ascending names, descending scores, ascending Butteraugli),
+/// second click flips it, third click clears back to insertion order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortDir {
+    Asc,
+    Desc,
+}
+
+impl SortDir {
+    fn flipped(self) -> SortDir {
+        match self {
+            SortDir::Asc => SortDir::Desc,
+            SortDir::Desc => SortDir::Asc,
+        }
+    }
+}
+
+/// First-click direction per column (best first).
+fn initial_dir(col: SortColumn) -> SortDir {
+    match col {
+        SortColumn::Path => SortDir::Asc,
+        // Butteraugli is lower-better (mirrors the rank logic).
+        SortColumn::Metric(MetricKind::But) => SortDir::Asc,
+        SortColumn::Metric(_) => SortDir::Desc,
+    }
+}
+
+/// Header-click cycle: new column starts at its initial direction, a
+/// repeat click flips, a third click clears to insertion order.
+fn cycle_sort(
+    current: Option<(SortColumn, SortDir)>,
+    col: SortColumn,
+) -> Option<(SortColumn, SortDir)> {
+    match current {
+        None => Some((col, initial_dir(col))),
+        Some((c, _)) if c != col => Some((col, initial_dir(col))),
+        Some((_, dir)) if dir == initial_dir(col) => Some((col, dir.flipped())),
+        Some(_) => None,
+    }
+}
+
+/// Scored average for sorting; unscored cells (Idle/Running/Error) sort
+/// after every scored row in both directions.
+fn sort_avg(row: &QueueRow, kind: MetricKind) -> Option<f64> {
+    match row.cell(kind) {
+        crate::metrics::MetricCell::Done { avg, .. } => Some(*avg),
+        _ => None,
+    }
+}
+
+fn cmp_rows(col: SortColumn, dir: SortDir, a: &QueueRow, b: &QueueRow) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match col {
+        SortColumn::Path => match dir {
+            SortDir::Asc => a.display.cmp(&b.display),
+            SortDir::Desc => b.display.cmp(&a.display),
+        },
+        SortColumn::Metric(kind) => match (sort_avg(a, kind), sort_avg(b, kind)) {
+            (Some(x), Some(y)) => {
+                let ord = x.total_cmp(&y);
+                match dir {
+                    SortDir::Asc => ord,
+                    SortDir::Desc => ord.reverse(),
+                }
+            }
+            // Scored rows always precede unscored ones, either direction.
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        },
+    }
+}
+
+/// Display order as underlying row indices (identity when unsorted).
+/// Stable sort, so ties keep insertion order. Rebuilt per frame while a
+/// sort is active — trivial at queue sizes, and `None` skips it entirely.
+fn sort_view(rows: &[QueueRow], spec: Option<(SortColumn, SortDir)>) -> Vec<usize> {
+    let mut view: Vec<usize> = (0..rows.len()).collect();
+    if let Some((col, dir)) = spec {
+        view.sort_by(|&a, &b| cmp_rows(col, dir, &rows[a], &rows[b]));
+    }
+    view
 }
 
 /// Table metric-column layout, left to right — MUST match the header
@@ -3383,6 +3521,13 @@ impl eframe::App for RFMetricsApp {
                     // flag borrows below so no shared borrow lives on.
                     let anchor = self.include_anchor.filter(|&a| a < self.rows.len());
                     let sel_anchor = self.selected_anchor.filter(|&a| a < self.rows.len());
+                    // Sorted display order as underlying indices (identity
+                    // when unsorted); anchors/toggles below stay underlying
+                    // so they survive re-sorts without invalidation.
+                    let view: Vec<usize> = sort_view(&self.rows, self.sort_spec);
+                    let sort_spec = self.sort_spec;
+                    // Header sort click, applied once below the loop.
+                    let mut sort_click: Option<SortColumn> = None;
                     table
                         .header(18.0, |mut header| {
                             header.col(|_| {});
@@ -3390,10 +3535,26 @@ impl eframe::App for RFMetricsApp {
                             header.col(|_| {});
                             header.col(|ui| vline(ui, egui::Color32::from_gray(0x8A)));
                             header.col(|ui| {
-                                ui.add(
-                                    egui::Label::new(egui::RichText::new("Path").strong())
-                                        .selectable(false),
-                                );
+                                // Sort click (3-state: A-Z → Z-A → insertion);
+                                // the mark is a painted vector triangle (see
+                                // `sort_mark` — the UI font lacks ▲▼⇅).
+                                let dir = match sort_spec {
+                                    Some((SortColumn::Path, d)) => Some(d),
+                                    _ => None,
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(egui::RichText::new("Path").strong())
+                                            .frame(false),
+                                    )
+                                    .on_hover_text("Sort by path (A-Z, Z-A, insertion order)")
+                                    .clicked()
+                                    || sort_mark(ui, dir)
+                                        .on_hover_text("Sort by path (A-Z, Z-A, insertion order)")
+                                        .clicked()
+                                {
+                                    sort_click = Some(SortColumn::Path);
+                                }
                             });
                             header.col(|ui| vline(ui, egui::Color32::from_gray(0x8A)));
                             header.col(|ui| {
@@ -3415,17 +3576,35 @@ impl eframe::App for RFMetricsApp {
                                     sup.contains(&MetricKind::Xpsnr),
                                 )
                             };
-                            for (flag, name, ok) in [
-                                (&mut self.m_psnr, "PSNR", psnr_ok),
-                                (&mut self.m_ssim, "SSIM", ssim_ok),
-                                (&mut self.m_vmaf, "VMAF", vmaf_ok),
-                                (&mut self.m_xpsnr, "XPSNR", xpsnr_ok),
-                                (&mut self.m_ssim2, "SSIM2", true),
-                                (&mut self.m_but, "BUTTER", true),
-                                (&mut self.m_cvvdp, "CVVDP", true),
+                            for (flag, name, ok, kind) in [
+                                (&mut self.m_psnr, "PSNR", psnr_ok, MetricKind::Psnr),
+                                (&mut self.m_ssim, "SSIM", ssim_ok, MetricKind::Ssim),
+                                (&mut self.m_vmaf, "VMAF", vmaf_ok, MetricKind::Vmaf),
+                                (&mut self.m_xpsnr, "XPSNR", xpsnr_ok, MetricKind::Xpsnr),
+                                (&mut self.m_ssim2, "SSIM2", true, MetricKind::Ssim2),
+                                (&mut self.m_but, "BUTTER", true, MetricKind::But),
+                                (&mut self.m_cvvdp, "CVVDP", true, MetricKind::Cvvdp),
                             ] {
                                 header.col(|ui| vline(ui, egui::Color32::from_gray(0x8A)));
                                 header.col(|ui| {
+                                    // Sort click (3-state: best first →
+                                    // reversed → insertion); the checkbox
+                                    // keeps its enable/disable job. The mark
+                                    // is a painted vector triangle (see
+                                    // `sort_mark` — the UI font lacks ▲▼⇅).
+                                    let col = SortColumn::Metric(kind);
+                                    let dir = match sort_spec {
+                                        Some((c, d)) if c == col => Some(d),
+                                        _ => None,
+                                    };
+                                    if sort_mark(ui, dir)
+                                        .on_hover_text(format!(
+                                            "Sort by {name} (best first, reversed, insertion order)"
+                                        ))
+                                        .clicked()
+                                    {
+                                        sort_click = Some(col);
+                                    }
                                     let resp = ui.add_enabled(
                                         ok && !run_locked,
                                         egui::Checkbox::new(flag, name),
@@ -3441,11 +3620,15 @@ impl eframe::App for RFMetricsApp {
                         .body(|body| {
                             body.rows(20.0, self.rows.len(), |mut row| {
                                 let i = row.index();
-                                row.set_selected(self.rows[i].selected);
+                                // Display position → underlying row: every
+                                // `vi` use below addresses the real row, so
+                                // selection/anchors survive re-sorts.
+                                let vi = view[i];
+                                row.set_selected(self.rows[vi].selected);
                                 // Delayed hover: only outline after the pointer
                                 // rests on the row, so passing over rows while
                                 // aiming at text doesn't flash each one.
-                                let hover_delayed = self.hover_row == Some(i)
+                                let hover_delayed = self.hover_row == Some(vi)
                                     && self.hover_since.is_some_and(|t| now - t >= ROW_HOVER_DELAY);
                                 row.set_hovered(hover_delayed);
                                 // Free-space click toggles selection; widget clicks
@@ -3455,47 +3638,55 @@ impl eframe::App for RFMetricsApp {
                                     let alt = ui.input(|i| i.modifiers.alt);
                                     let shift = ui.input(|i| i.modifiers.shift);
                                     let resp = ui
-                                        .checkbox(&mut self.rows[i].include, "")
+                                        .checkbox(&mut self.rows[vi].include, "")
                                         .on_hover_text("Include in run and plot");
                                     if resp.changed() {
                                         if alt {
                                             // Alt wins over Shift on combo.
-                                            alt_solo = Some(i);
+                                            alt_solo = Some(vi);
                                         } else if shift {
                                             // Gmail-style: the span takes
                                             // the clicked box's post-toggle
-                                            // value; stale anchor falls
-                                            // through to a plain toggle.
-                                            if let Some((lo, hi)) = anchor.and_then(|a| {
-                                                shift_include_range(self.rows.len(), a, i)
-                                            }) {
-                                                shift_range = Some((lo, hi, self.rows[i].include));
+                                            // value. The span is VIEW
+                                            // positions (`i` already is one;
+                                            // the underlying anchor maps
+                                            // through `view`) and is mapped
+                                            // back at apply time; a stale
+                                            // anchor falls through to a
+                                            // plain toggle.
+                                            if let Some((lo, hi)) = anchor
+                                                .and_then(|a| view.iter().position(|&u| u == a))
+                                                .and_then(|ap| {
+                                                    shift_include_range(view.len(), ap, i)
+                                                })
+                                            {
+                                                shift_range = Some((lo, hi, self.rows[vi].include));
                                             }
                                         }
                                         // Every click moves the anchor, so
                                         // chained Shift+clicks extend from
                                         // the last clicked row.
-                                        anchor_next = Some(i);
+                                        anchor_next = Some(vi);
                                     }
                                 });
                                 let (_, r) =
                                     row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
                                 if r.clicked() {
-                                    toggle_row = Some(i);
+                                    toggle_row = Some(vi);
                                 }
                                 row.col(|ui| {
                                     if ui.button("▶").clicked() {
-                                        open_path = Some(self.rows[i].path.clone());
+                                        open_path = Some(self.rows[vi].path.clone());
                                     }
                                 });
                                 let (_, r) =
                                     row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
                                 if r.clicked() {
-                                    toggle_row = Some(i);
+                                    toggle_row = Some(vi);
                                 }
                                 let (_, r) = row.col(|ui| {
                                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-                                    let row_data = &self.rows[i];
+                                    let row_data = &self.rows[vi];
                                     // Plain non-selectable text: no button hover
                                     // outline; copy lives in the right-click menu
                                     // and the full path shows as tooltip (Python parity).
@@ -3504,49 +3695,49 @@ impl eframe::App for RFMetricsApp {
                                 });
                                 r.context_menu(|ui| {
                                     if ui.button("Show in explorer").clicked() {
-                                        reveal_path = Some(self.rows[i].path.clone());
+                                        reveal_path = Some(self.rows[vi].path.clone());
                                         ui.close();
                                     }
                                     if ui.button("Copy path").clicked() {
-                                        ui.ctx().copy_text(self.rows[i].path.clone());
+                                        ui.ctx().copy_text(self.rows[vi].path.clone());
                                         ui.close();
                                     }
                                     if ui.button("Copy filename").clicked() {
-                                        let name = Path::new(&self.rows[i].path)
+                                        let name = Path::new(&self.rows[vi].path)
                                             .file_name()
                                             .map(|s| s.to_string_lossy().into_owned())
-                                            .unwrap_or_else(|| self.rows[i].display.clone());
+                                            .unwrap_or_else(|| self.rows[vi].display.clone());
                                         ui.ctx().copy_text(name);
                                         ui.close();
                                     }
                                 });
                                 if r.clicked() {
-                                    toggle_row = Some(i);
+                                    toggle_row = Some(vi);
                                 }
                                 let (_, r) =
                                     row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
                                 if r.clicked() {
-                                    toggle_row = Some(i);
+                                    toggle_row = Some(vi);
                                 }
                                 let (_, r) = row.col(|ui| {
-                                    let row_data = &self.rows[i];
+                                    let row_data = &self.rows[vi];
                                     ui.add(egui::Label::new(&row_data.media).selectable(false))
                                         .on_hover_text(&row_data.media_tip);
                                 });
                                 r.context_menu(|ui| {
                                     if ui.button("Copy summary").clicked() {
                                         ui.ctx().copy_text(crate::probe::table_media_text(
-                                            self.rows[i].info.as_ref(),
+                                            self.rows[vi].info.as_ref(),
                                         ));
                                         ui.close();
                                     }
                                     if ui.button("Copy details").clicked() {
-                                        ui.ctx().copy_text(self.rows[i].media_tip.clone());
+                                        ui.ctx().copy_text(self.rows[vi].media_tip.clone());
                                         ui.close();
                                     }
                                 });
                                 if r.clicked() {
-                                    toggle_row = Some(i);
+                                    toggle_row = Some(vi);
                                 }
                                 // Metric columns in METRIC_COLUMNS order: live state
                                 // text on a rank fill (best green, worst red,
@@ -3559,10 +3750,10 @@ impl eframe::App for RFMetricsApp {
                                     let (_, r) =
                                         row.col(|ui| vline(ui, egui::Color32::from_gray(0x38)));
                                     if r.clicked() {
-                                        toggle_row = Some(i);
+                                        toggle_row = Some(vi);
                                     }
                                     let (_, r) = row.col(|ui| {
-                                        let row_data = &self.rows[i];
+                                        let row_data = &self.rows[vi];
                                         let cell = row_data.cell(kind);
                                         let cached = row_data.cached(kind);
                                         // Idle borrows a static, Done borrows
@@ -3620,21 +3811,22 @@ impl eframe::App for RFMetricsApp {
                                     // summary = the whole tooltip stats block.
                                     r.context_menu(|ui| {
                                         if ui.button("Copy value").clicked() {
-                                            ui.ctx().copy_text(self.rows[i].cell(kind).cell_text());
+                                            ui.ctx()
+                                                .copy_text(self.rows[vi].cell(kind).cell_text());
                                             ui.close();
                                         }
                                         if ui.button("Copy summary").clicked() {
                                             ui.ctx()
-                                                .copy_text(self.rows[i].cell(kind).tooltip(title));
+                                                .copy_text(self.rows[vi].cell(kind).tooltip(title));
                                             ui.close();
                                         }
                                     });
                                     if r.clicked() {
-                                        toggle_row = Some(i);
+                                        toggle_row = Some(vi);
                                     }
                                 }
                                 if row.response().hovered() {
-                                    hovered_next = Some(i);
+                                    hovered_next = Some(vi);
                                 }
                             });
                         });
@@ -3664,18 +3856,22 @@ impl eframe::App for RFMetricsApp {
                             // Checkbox-style: the span takes the clicked
                             // row's post-toggle state — Shift+clicking a
                             // selected row unselects the range, an
-                            // unselected one selects it. Stale/missing
-                            // anchor falls through to a plain toggle.
-                            match sel_anchor
-                                .and_then(|a| shift_include_range(self.rows.len(), a, i))
-                            {
-                                Some((lo, hi)) => {
+                            // unselected one selects it. The span is VIEW
+                            // positions (mapped back through `view`);
+                            // stale/missing anchor falls through to a
+                            // plain toggle.
+                            let click_pos = view.iter().position(|&u| u == i);
+                            let anchor_pos =
+                                sel_anchor.and_then(|a| view.iter().position(|&u| u == a));
+                            match (anchor_pos, click_pos) {
+                                (Some(ap), Some(cp)) => {
+                                    let (lo, hi) = (ap.min(cp), ap.max(cp));
                                     let v = !self.rows[i].selected;
-                                    for r in &mut self.rows[lo..=hi] {
-                                        r.selected = v;
+                                    for &u in &view[lo..=hi] {
+                                        self.rows[u].selected = v;
                                     }
                                 }
-                                None => {
+                                _ => {
                                     self.rows[i].selected = !self.rows[i].selected;
                                 }
                             }
@@ -3700,16 +3896,23 @@ impl eframe::App for RFMetricsApp {
                         }
                     }
                     // Shift+click range fill skipped when Alt solo ran.
+                    // The span is VIEW positions, mapped back through `view`.
                     if alt_solo.is_none()
                         && let Some((lo, hi, v)) = shift_range
-                        && hi < self.rows.len()
+                        && hi < view.len()
                     {
-                        for r in &mut self.rows[lo..=hi] {
-                            r.include = v;
+                        for &u in &view[lo..=hi] {
+                            self.rows[u].include = v;
                         }
                     }
                     if let Some(a) = anchor_next {
                         self.include_anchor = Some(a);
+                    }
+                    // Header sort click: cycle best-first → reversed →
+                    // insertion order (session-only; run/state order stays
+                    // insertion).
+                    if let Some(col) = sort_click {
+                        self.sort_spec = cycle_sort(self.sort_spec, col);
                     }
                     if let Some(path) = open_path
                         && let Err(e) = open::that(&path)
