@@ -32,6 +32,10 @@ pub enum MetricCell {
         /// recomputes every ffmpeg-backed column (FFVship has no scale
         /// stage and ignores it).
         scaler: crate::metrics::ffmpeg::ScaleMethod,
+        /// Input framerate mode the run used; a rerun under a different
+        /// mode recomputes every ffmpeg-backed column (FFVship has no
+        /// `-r` stage and ignores it).
+        fps_mode: crate::metrics::ffmpeg::InputFpsMode,
     },
     Error {
         msg: String,

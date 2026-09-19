@@ -218,6 +218,7 @@ fn ssim_graph_differs_only_by_filter_name() {
         None,
         None,
         ScaleMethod::default(),
+        super::InputFpsMode::default(),
     );
     assert!(a.iter().any(|x| x.contains("[main][ref]ssim=")));
 }
@@ -234,6 +235,7 @@ fn args_order_is_dist_then_ref() {
         None,
         None,
         ScaleMethod::default(),
+        super::InputFpsMode::default(),
     );
     let i1 = a.iter().position(|x| x == "dist.mp4").unwrap();
     let i2 = a.iter().position(|x| x == "ref.mp4").unwrap();
@@ -482,6 +484,7 @@ fn args_start_with_probesize() {
         None,
         None,
         ScaleMethod::default(),
+        super::InputFpsMode::default(),
     );
     assert_eq!(&a[..4], &["-hide_banner", "-nostdin", "-probesize", "50M"]);
 }
@@ -534,4 +537,45 @@ fn graph_scaler_selects_flags() {
     );
     assert!(g.contains("scale=1920:1080[main]"));
     assert!(!g.contains("flags="));
+}
+
+#[test]
+fn fps_mode_labels_lookup_and_default() {
+    // Default is Reference (ref rate on both legs — #111-safe).
+    assert_eq!(InputFpsMode::default(), InputFpsMode::Reference);
+    assert_eq!(InputFpsMode::ALL.len(), 3);
+    for m in InputFpsMode::ALL {
+        assert_eq!(InputFpsMode::from_label(m.label()), Some(m));
+    }
+    assert_eq!(InputFpsMode::from_label("bogus"), None);
+}
+
+#[test]
+fn rate_args_modes_per_leg() {
+    use super::InputFpsMode;
+    let rf = ref_info();
+    let mut dist = ref_info();
+    dist.fps = Some(30.0);
+    let r = |m: InputFpsMode, for_dist: bool| rate_args(m, &rf, &dist, for_dist);
+    // Reference (default): ref rate on both legs, so one-sided VFR
+    // misdetection (FFMetrics #111) cannot desync the pair.
+    assert_eq!(r(InputFpsMode::Reference, true), ["-r", "25"]);
+    assert_eq!(r(InputFpsMode::Reference, false), ["-r", "25"]);
+    // PerInput: each leg its own detected rate (upstream 1.4.5 parity).
+    assert_eq!(r(InputFpsMode::PerInput, true), ["-r", "30"]);
+    assert_eq!(r(InputFpsMode::PerInput, false), ["-r", "25"]);
+    // Off: nothing on either leg.
+    assert!(r(InputFpsMode::Off, true).is_empty());
+    assert!(r(InputFpsMode::Off, false).is_empty());
+    // Unknown fps emits nothing in every mode; a missing ref rate
+    // falls back to the distorted one under Reference.
+    let no_fps = MediaInfo::default();
+    for m in InputFpsMode::ALL {
+        assert!(rate_args(m, &no_fps, &no_fps, true).is_empty());
+        assert!(rate_args(m, &no_fps, &no_fps, false).is_empty());
+    }
+    assert_eq!(
+        rate_args(InputFpsMode::Reference, &no_fps, &dist, true),
+        ["-r", "30"]
+    );
 }

@@ -28,6 +28,7 @@ fn round_trip() {
         },
         options: OptionsState {
             scaling: Some("Bicubic".to_owned()),
+            fps_mode: Some("Reference rate on both".to_owned()),
             plot_at_start: Some(true),
             plot_size: Some("3200×800".to_owned()),
             csv_export: Some(true),

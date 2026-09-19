@@ -3,6 +3,7 @@ use super::{
     CachedStats, DropAction, METRIC_COLUMNS, ProbeMsg, QueueRow, RFMetricsApp, display_names,
     norm_key, route_drop,
 };
+use crate::metrics::ffmpeg::InputFpsMode;
 
 #[test]
 fn metric_columns_keep_live_cells_under_their_headers() {
@@ -391,6 +392,7 @@ fn psnr_progress_keeps_max_and_done_clears() {
             clip_dur: Some(5.0),
             vmaf_cfg: None,
             scaler: ScaleMethod::Bicubic,
+            fps_mode: InputFpsMode::Reference,
         })
         .unwrap();
     app.drain_metric_results();
@@ -458,6 +460,7 @@ fn series_appends_in_order_and_done_replaces() {
             clip_dur: None,
             vmaf_cfg: None,
             scaler: ScaleMethod::Bicubic,
+            fps_mode: InputFpsMode::Reference,
         })
         .unwrap();
     app.drain_metric_results();
@@ -540,6 +543,7 @@ fn psnr_stale_generation_dropped() {
             clip_dur: None,
             vmaf_cfg: None,
             scaler: ScaleMethod::Bicubic,
+            fps_mode: InputFpsMode::Reference,
         })
         .unwrap();
     app.drain_metric_results();
@@ -577,6 +581,7 @@ fn drain_caches_stats_and_ranks_once() {
                 clip_dur: None,
                 vmaf_cfg: None,
                 scaler: ScaleMethod::Bicubic,
+                fps_mode: InputFpsMode::Reference,
             })
             .unwrap();
     }
@@ -607,6 +612,7 @@ fn refresh_ranks_single_row_stays_plain() {
         clip_dur: None,
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
     };
     let stats = app.rows[0].psnr.done_stats();
     app.rows[0].psnr_cache.stats = stats;
@@ -631,6 +637,7 @@ fn stop_keeps_done_and_settles_running_to_idle() {
         clip_dur: None,
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
     };
     app.rows[1].psnr = MetricCell::Running {
         frame: 12,
@@ -700,6 +707,7 @@ fn stop_settles_killed_cell_to_idle() {
             clip_dur: None,
             vmaf_cfg: None,
             scaler: ScaleMethod::Bicubic,
+            fps_mode: InputFpsMode::Reference,
         })
         .unwrap();
     app.drain_metric_results();
@@ -758,6 +766,7 @@ fn start_psnr_bad_time_marks_all_included() {
         clip_dur: None,
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
     };
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
@@ -794,6 +803,7 @@ fn start_psnr_all_done_toasts_without_running() {
         clip_dur: None,
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
     };
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
@@ -895,6 +905,7 @@ fn start_psnr_rerun_leaves_done_row_untouched() {
         clip_dur: None,
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
     };
     app.rows[0].info = Some(MediaInfo::default());
     app.rows[1].info = Some(MediaInfo::default());
@@ -954,6 +965,7 @@ fn start_psnr_changed_trim_recomputes_done_row() {
         clip_dur: Some(5.0),
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
     };
     app.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
@@ -1000,6 +1012,7 @@ fn start_psnr_matching_trim_still_skips() {
         clip_dur: Some(10.0),
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
     };
     app.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
@@ -1045,6 +1058,7 @@ fn start_run_vmaf_settings_change_recomputes_vmaf_only() {
         clip_dur: None,
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
     };
     app.rows[0].vmaf = MetricCell::Done {
         values: vec![90.0],
@@ -1061,6 +1075,7 @@ fn start_run_vmaf_settings_change_recomputes_vmaf_only() {
             n_threads: 4,
         }),
         scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
     };
     app.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
@@ -1117,6 +1132,7 @@ fn start_run_vmaf_matching_settings_still_skips() {
         clip_dur: None,
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
     };
     app.rows[0].vmaf = MetricCell::Done {
         values: vec![90.0],
@@ -1133,6 +1149,7 @@ fn start_run_vmaf_matching_settings_still_skips() {
             n_threads: 4,
         }),
         scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
     };
     app.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
@@ -1176,6 +1193,7 @@ fn start_run_scaler_change_recomputes_ffmpeg_only() {
         clip_dur: None,
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
     };
     app.rows[0].psnr = done(30.0);
     app.rows[0].ssim2 = done(80.0);
@@ -1191,6 +1209,67 @@ fn start_run_scaler_change_recomputes_ffmpeg_only() {
     assert!(
         matches!(&app.rows[0].ssim2, MetricCell::Done { .. }),
         "FFVship SSIM2 ignores the scaler, got {:?}",
+        app.rows[0].ssim2,
+    );
+    for _ in 0..200 {
+        app.drain_metric_results();
+        if !app.measuring {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(!app.measuring);
+    // Spawn fails headless (bogus binary): the cell records the error
+    // while SSIM2 still holds its skipped value.
+    assert!(matches!(&app.rows[0].psnr, MetricCell::Error { .. }));
+    assert!(matches!(&app.rows[0].ssim2, MetricCell::Done { .. }));
+}
+
+/// Fps-mode change recomputes ffmpeg-backed columns but leaves FFVship
+/// ones alone (no `-r` stage there): a Reference-stamped PSNR cell
+/// recomputes under Off while a Reference-stamped SSIM2 cell keeps
+/// skipping, no Reset needed.
+#[test]
+fn start_run_fps_mode_change_recomputes_ffmpeg_only() {
+    use crate::metrics::MetricCell;
+    use crate::probe::MediaInfo;
+    let p = std::env::temp_dir().join("rfmetrics-fpsmode-restamp.tmp");
+    std::fs::write(&p, b"x").unwrap();
+    let mut app = RFMetricsApp {
+        m_psnr: true,
+        m_vmaf: false,
+        m_ssim2: true,
+        ref_path: p.to_string_lossy().into_owned(),
+        ..RFMetricsApp::default()
+    };
+    app.fps_mode = InputFpsMode::Off;
+    app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+    app.ref_info_data = Some(MediaInfo::default());
+    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    let done = |avg: f64| MetricCell::Done {
+        values: vec![avg],
+        avg,
+        exec_s: 1.0,
+        skip: None,
+        clip_dur: None,
+        vmaf_cfg: None,
+        scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
+    };
+    app.rows[0].psnr = done(30.0);
+    app.rows[0].ssim2 = done(80.0);
+    app.rows[0].info = Some(MediaInfo::default());
+    app.start_run(0.0);
+    std::fs::remove_file(&p).ok();
+    assert!(app.measuring);
+    assert!(
+        matches!(&app.rows[0].psnr, MetricCell::Running { .. }),
+        "stale-stamped PSNR must recompute, got {:?}",
+        app.rows[0].psnr,
+    );
+    assert!(
+        matches!(&app.rows[0].ssim2, MetricCell::Done { .. }),
+        "FFVship SSIM2 ignores the fps mode, got {:?}",
         app.rows[0].ssim2,
     );
     for _ in 0..200 {
@@ -1229,6 +1308,7 @@ fn start_run_matching_scaler_still_skips() {
         clip_dur: None,
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
     };
     app.rows[0].info = Some(MediaInfo::default());
     app.ref_info_data = Some(MediaInfo::default());
@@ -1266,6 +1346,7 @@ fn start_run_skip_toast_lists_all_metrics() {
         clip_dur: None,
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
     };
     app.rows[0].psnr = done(30.0);
     app.rows[0].ssim = done(0.9);
@@ -1284,6 +1365,7 @@ fn start_run_skip_toast_lists_all_metrics() {
             n_threads: 4,
         }),
         scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
     };
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
@@ -1335,6 +1417,7 @@ fn start_run_skip_toast_merges_shared_rows() {
             n_threads: 4,
         }),
         scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
     };
     for i in 0..2 {
         app.rows[i].psnr = MetricCell::Done {
@@ -1345,6 +1428,7 @@ fn start_run_skip_toast_merges_shared_rows() {
             clip_dur: None,
             vmaf_cfg: None,
             scaler: ScaleMethod::Bicubic,
+            fps_mode: InputFpsMode::Reference,
         };
         app.rows[i].ssim = MetricCell::Done {
             values: vec![0.9],
@@ -1354,6 +1438,7 @@ fn start_run_skip_toast_merges_shared_rows() {
             clip_dur: None,
             vmaf_cfg: None,
             scaler: ScaleMethod::Bicubic,
+            fps_mode: InputFpsMode::Reference,
         };
         app.rows[i].vmaf = stale_vmaf();
         app.rows[i].info = Some(MediaInfo::default());
@@ -1445,6 +1530,7 @@ fn start_run_skips_done_psnr_but_runs_fresh_ssim() {
         clip_dur: None,
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
     };
     app.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
@@ -1535,6 +1621,7 @@ fn start_run_skips_done_xpsnr_but_runs_fresh_psnr() {
         clip_dur: None,
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
     };
     app.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
@@ -1649,6 +1736,7 @@ fn butter_rank_is_min_wins() {
             clip_dur: None,
             vmaf_cfg: None,
             scaler: ScaleMethod::Bicubic,
+            fps_mode: InputFpsMode::Reference,
         };
         let stats = app.rows[i].butter.done_stats();
         app.rows[i].butter_cache.stats = stats;
@@ -1676,6 +1764,7 @@ fn state_snapshot_apply_round_trip() {
         vmaf_pooling: "Harmonic Mean".to_owned(),
         vmaf_threads: "4".to_owned(),
         scale_method: ScaleMethod::Lanczos,
+        fps_mode: InputFpsMode::Off,
         plot_at_start: true,
         plot_size: crate::plot::PlotSize::S1600,
         ..RFMetricsApp::default()
@@ -1696,6 +1785,7 @@ fn state_snapshot_apply_round_trip() {
     assert_eq!(fresh.vmaf_pooling, "Harmonic Mean");
     assert_eq!(fresh.vmaf_threads, "4");
     assert_eq!(fresh.scale_method, ScaleMethod::Lanczos);
+    assert_eq!(fresh.fps_mode, InputFpsMode::Off);
     assert!(fresh.plot_at_start);
     assert_eq!(fresh.plot_size, crate::plot::PlotSize::S1600);
     // psnr_test_row paths don't exist on disk: only pre-existing rows
@@ -1885,6 +1975,7 @@ fn results_autosave_end_to_end() {
         clip_dur: Some(5.0),
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
     };
     for aborted in [false, true] {
         app.metric_tx
@@ -2120,6 +2211,7 @@ fn cell_text_cache_set_and_cleared() {
         clip_dur: None,
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
     };
     app.metric_tx.send(done(None)).unwrap();
     app.drain_metric_results();
@@ -2152,6 +2244,7 @@ fn vmaf_first_done_arms_follow() {
         clip_dur: None,
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
     };
     let mut app = RFMetricsApp {
         show_plot: true,
@@ -2197,6 +2290,7 @@ fn follow_arm_rules() {
         clip_dur: None,
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
     };
     // Live-feed metric never arms, even first on the shown tab.
     let mut app = RFMetricsApp {

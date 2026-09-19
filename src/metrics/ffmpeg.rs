@@ -412,10 +412,63 @@ pub(crate) fn trim_window(skip: Option<f64>, clip_dur: Option<f64>) -> Vec<Strin
     window
 }
 
-/// `-r` input flags shared by every ffmpeg invocation (Python parity: the
-/// same rate feeds both inputs).
-pub(crate) fn rate_args(ref_info: &MediaInfo, dist_info: &MediaInfo) -> Vec<String> {
-    match ref_info.fps.or(dist_info.fps) {
+/// Input framerate forcing for every `-i` the app emits (FFMetrics #111:
+/// a wrong per-input `-r` silently desyncs VFR legs, e.g. VMAF 6.86 vs 96).
+/// `Reference` forces the ref rate on both legs, so one-sided misdetection
+/// is impossible by construction and absolute-rate errors stay benign for
+/// frame-correspondence metrics; `PerInput` is upstream 1.4.5 parity (each
+/// leg its own detected rate); `Off` trusts container timestamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InputFpsMode {
+    #[default]
+    Reference,
+    PerInput,
+    Off,
+}
+
+impl InputFpsMode {
+    /// Combo order: the default first.
+    pub const ALL: [InputFpsMode; 3] = [
+        InputFpsMode::Reference,
+        InputFpsMode::PerInput,
+        InputFpsMode::Off,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Reference => "Reference rate on both",
+            Self::PerInput => "Detected rate per input",
+            Self::Off => "Off (trust timestamps)",
+        }
+    }
+
+    /// State-file validation (unknown labels keep the live default).
+    pub fn from_label(s: &str) -> Option<InputFpsMode> {
+        Self::ALL.into_iter().find(|m| m.label() == s)
+    }
+}
+
+/// `-r` input flags for one leg (Python parity shapes the default: the
+/// ref-first rate feeds both inputs). `for_dist` selects the leg; only
+/// `PerInput` differs per leg. Unknown fps emits nothing in every mode.
+pub(crate) fn rate_args(
+    mode: InputFpsMode,
+    ref_info: &MediaInfo,
+    dist_info: &MediaInfo,
+    for_dist: bool,
+) -> Vec<String> {
+    let fps = match mode {
+        InputFpsMode::Off => None,
+        InputFpsMode::Reference => ref_info.fps.or(dist_info.fps),
+        InputFpsMode::PerInput => {
+            if for_dist {
+                dist_info.fps
+            } else {
+                ref_info.fps
+            }
+        }
+    };
+    match fps {
         Some(fps) => vec!["-r".to_owned(), crate::probe::format_fps(fps)],
         None => Vec::new(),
     }
@@ -590,6 +643,7 @@ pub fn build_args(
     skip: Option<f64>,
     clip_dur: Option<f64>,
     scaler: ScaleMethod,
+    fps_mode: InputFpsMode,
 ) -> Vec<String> {
     let mut args = vec![
         "-hide_banner".to_owned(),
@@ -599,10 +653,10 @@ pub fn build_args(
         "-probesize".to_owned(),
         "50M".to_owned(),
     ];
-    args.extend(rate_args(ref_info, dist_info));
+    args.extend(rate_args(fps_mode, ref_info, dist_info, true));
     args.push("-i".to_owned());
     args.push(dist_path.to_owned());
-    args.extend(rate_args(ref_info, dist_info));
+    args.extend(rate_args(fps_mode, ref_info, dist_info, false));
     args.push("-i".to_owned());
     args.push(ref_path.to_owned());
     args.push("-filter_complex".to_owned());
@@ -626,6 +680,10 @@ pub struct RunInputs<'a> {
     /// Global scaling method; selects the `:flags=` on every `scale=`
     /// this run emits (FFVship jobs ignore it — no ffmpeg stage).
     pub scaler: ScaleMethod,
+    /// Input framerate mode the run used; stamped onto the `Done` cell like
+    /// `scaler` so a mode change recomputes every ffmpeg-backed column
+    /// (FFVship has no `-r` stage and ignores it at compare time).
+    pub fps_mode: InputFpsMode,
     /// Set by Stop; the run reports "aborted" and drops partial values.
     pub abort: &'a AtomicBool,
     /// Holds the live child so Stop can kill it; `None` when idle/reaped.
@@ -812,6 +870,7 @@ pub fn run_metric(
         skip,
         clip_dur,
         scaler,
+        fps_mode,
         abort,
         child_slot,
     } = *job;
@@ -831,7 +890,7 @@ pub fn run_metric(
         detail: FrameDetail::None,
     };
     let args = build_args(
-        kind, ref_path, dist_path, ref_info, dist_info, skip, clip_dur, scaler,
+        kind, ref_path, dist_path, ref_info, dist_info, skip, clip_dur, scaler, fps_mode,
     );
     // `info`: the exact repro command is the core artifact of an issue
     // report (FFMetrics.log parity) — one line per metric job.

@@ -110,6 +110,7 @@ fn cell_text_and_tooltip() {
             clip_dur: None,
             vmaf_cfg: None,
             scaler: crate::metrics::ffmpeg::ScaleMethod::Bicubic,
+            fps_mode: crate::metrics::ffmpeg::InputFpsMode::Reference,
         }
         .cell_text(),
         "30.1235"
@@ -123,6 +124,7 @@ fn cell_text_and_tooltip() {
             clip_dur: None,
             vmaf_cfg: None,
             scaler: crate::metrics::ffmpeg::ScaleMethod::Bicubic,
+            fps_mode: crate::metrics::ffmpeg::InputFpsMode::Reference,
         }
         .tooltip("PSNR")
         .starts_with("PSNR\nAvg: 30.000000")

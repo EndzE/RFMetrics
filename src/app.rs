@@ -350,6 +350,10 @@ enum MetricMsg {
         /// method change recomputes every ffmpeg-backed column (FFVship
         /// has no scale stage and ignores it at compare time).
         scaler: ScaleMethod,
+        /// Input framerate mode the run used; stamped like `scaler` so a
+        /// mode change recomputes every ffmpeg-backed column (FFVship
+        /// has no `-r` stage and ignores it at compare time).
+        fps_mode: crate::metrics::ffmpeg::InputFpsMode,
     },
     /// End of the worker loop; `aborted` settles still-Running cells to
     /// Idle while keeping finished (`Done`) results on screen.
@@ -383,6 +387,8 @@ pub struct RFMetricsApp {
     vmaf_models: Vec<String>,
     /// Global scaling method for every `scale=` the app emits.
     scale_method: ScaleMethod,
+    /// Input framerate mode for every `-i` the app emits (FFMetrics #111).
+    fps_mode: crate::metrics::ffmpeg::InputFpsMode,
     /// Open the plot viewport when a run starts (Options checkbox).
     plot_at_start: bool,
     /// Save per-frame metric CSVs on Done (Options checkbox).
@@ -525,6 +531,7 @@ impl Default for RFMetricsApp {
                 &crate::metrics::vmaf::vmaf_home().join("vmaf-models"),
             ),
             scale_method: ScaleMethod::default(),
+            fps_mode: crate::metrics::ffmpeg::InputFpsMode::default(),
             plot_at_start: false,
             csv_export: false,
             csv_dir: String::new(),
@@ -925,6 +932,7 @@ impl RFMetricsApp {
                     clip_dur,
                     vmaf_cfg,
                     scaler,
+                    fps_mode,
                 } => {
                     if generation != self.run_generation {
                         log::debug!(target: "rfmetrics::app", "discarded stale {} result", kind.name());
@@ -969,6 +977,7 @@ impl RFMetricsApp {
                                 clip_dur,
                                 vmaf_cfg,
                                 scaler,
+                                fps_mode,
                             },
                         };
                         // Cache the stats once (clone+sort lives here, not
@@ -1184,6 +1193,7 @@ impl RFMetricsApp {
             },
             options: crate::state::OptionsState {
                 scaling: Some(self.scale_method.label().to_owned()),
+                fps_mode: Some(self.fps_mode.label().to_owned()),
                 plot_at_start: Some(self.plot_at_start),
                 plot_size: Some(self.plot_size.label().to_owned()),
                 csv_export: Some(self.csv_export),
@@ -1295,6 +1305,11 @@ impl RFMetricsApp {
         {
             self.scale_method = m;
         }
+        if let Some(fps_mode) = s.options.fps_mode
+            && let Some(m) = crate::metrics::ffmpeg::InputFpsMode::from_label(&fps_mode)
+        {
+            self.fps_mode = m;
+        }
         if let Some(plot_at_start) = s.options.plot_at_start {
             self.plot_at_start = plot_at_start;
         }
@@ -1366,6 +1381,7 @@ impl RFMetricsApp {
         }
         let o = &s.options;
         if o.scaling.as_deref() != Some(self.scale_method.label())
+            || o.fps_mode.as_deref() != Some(self.fps_mode.label())
             || o.plot_at_start != Some(self.plot_at_start)
             || o.plot_size.as_deref() != Some(self.plot_size.label())
             || o.csv_export != Some(self.csv_export)
@@ -1514,6 +1530,7 @@ impl RFMetricsApp {
         // Pre-flight error cells above touch `targets` (settings
         // uncomparable there); everything below touches `fresh` only.
         let scaler = self.scale_method;
+        let fps_mode = self.fps_mode;
         let mut work: Vec<(MetricKind, Vec<usize>, Vec<String>)> = Vec::new();
         for &kind in &kinds {
             let mut skipped = Vec::new();
@@ -1524,12 +1541,14 @@ impl RFMetricsApp {
                     clip_dur: c,
                     vmaf_cfg: v,
                     scaler: sc,
+                    fps_mode: fm,
                     ..
                 } = self.rows[i].cell(kind)
                     && *s == skip
                     && *c == clip_dur
                     && (kind != MetricKind::Vmaf || v.as_ref() == Some(&vmaf_cfg))
                     && (kind.is_ffvship() || *sc == scaler)
+                    && (kind.is_ffvship() || *fm == fps_mode)
                 {
                     skipped.push(self.rows[i].display.clone());
                 } else {
@@ -1695,6 +1714,7 @@ impl RFMetricsApp {
                     skip,
                     clip_dur,
                     scaler,
+                    fps_mode,
                     abort: &abort,
                     child_slot: &child_slot,
                 };
@@ -1749,6 +1769,7 @@ impl RFMetricsApp {
                     skip,
                     clip_dur,
                     scaler,
+                    fps_mode,
                     vmaf_cfg: if kind == MetricKind::Vmaf {
                         Some(vmaf_cfg.clone())
                     } else {
@@ -3044,6 +3065,34 @@ impl eframe::App for RFMetricsApp {
                             ui.horizontal(|ui| {
                                 ui.add_sized(
                                     [70.0, 18.0],
+                                    egui::Label::new("Framerate").selectable(false),
+                                );
+                                let _ = egui::ComboBox::from_id_salt("fps_mode")
+                                    .width(220.0)
+                                    .selected_text(self.fps_mode.label())
+                                    .show_ui(ui, |ui| {
+                                        use crate::metrics::ffmpeg::InputFpsMode;
+                                        for m in InputFpsMode::ALL {
+                                            let _ = ui.selectable_value(
+                                                &mut self.fps_mode,
+                                                m,
+                                                m.label(),
+                                            );
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(
+                                        "which -r rate ffmpeg forces on each input, e.g. ref 23.98 / \
+                                         dist 23.81: Reference emits -r 23.98 before both inputs, so \
+                                         a one-sided VFR misread cannot desync the pair \
+                                         (FFMetrics #111); Per-input emits -r 23.81 then -r 23.98 \
+                                         (upstream 1.4.5 parity — disagreeing detections desync \
+                                         scores); Off emits no -r and trusts container timestamps",
+                                    );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [70.0, 18.0],
                                     egui::Label::new("Plot size").selectable(false),
                                 );
                                 let _ = egui::ComboBox::from_id_salt("plot_size")
@@ -3410,7 +3459,7 @@ impl eframe::App for RFMetricsApp {
                                         reveal_path = Some(self.rows[i].path.clone());
                                         ui.close();
                                     }
-                                    if ui.button("Copy Path").clicked() {
+                                    if ui.button("Copy path").clicked() {
                                         ui.ctx().copy_text(self.rows[i].path.clone());
                                         ui.close();
                                     }
@@ -3496,7 +3545,11 @@ impl eframe::App for RFMetricsApp {
                                         cell_frame.show(ui, |ui| {
                                             ui.set_width(ui.available_width());
                                             ui.centered_and_justified(|ui| {
-                                                let resp = ui.label(text);
+                                                // Plain non-selectable text, like the
+                                                // Path/Media columns (copy lives in
+                                                // the right-click menu).
+                                                let resp = ui
+                                                    .add(egui::Label::new(text).selectable(false));
                                                 match stats {
                                                     Some(stats) => {
                                                         resp.on_hover_ui(|ui| {
@@ -3513,6 +3566,20 @@ impl eframe::App for RFMetricsApp {
                                                 }
                                             });
                                         });
+                                    });
+                                    // Right-click copies (Media-column parity):
+                                    // value = the visible avg/text only,
+                                    // summary = the whole tooltip stats block.
+                                    r.context_menu(|ui| {
+                                        if ui.button("Copy value").clicked() {
+                                            ui.ctx().copy_text(self.rows[i].cell(kind).cell_text());
+                                            ui.close();
+                                        }
+                                        if ui.button("Copy summary").clicked() {
+                                            ui.ctx()
+                                                .copy_text(self.rows[i].cell(kind).tooltip(title));
+                                            ui.close();
+                                        }
                                     });
                                     if r.clicked() {
                                         toggle_row = Some(i);

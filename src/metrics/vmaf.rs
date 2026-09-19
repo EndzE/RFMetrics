@@ -397,6 +397,7 @@ pub fn run_vmaf(job: &RunInputs, cfg: &VmafCfg, on_progress: &(dyn Fn(u64) + Syn
         skip,
         clip_dur,
         scaler,
+        fps_mode,
         abort,
         child_slot,
         ..
@@ -442,10 +443,10 @@ pub fn run_vmaf(job: &RunInputs, cfg: &VmafCfg, on_progress: &(dyn Fn(u64) + Syn
         "-probesize".to_owned(),
         "50M".to_owned(),
     ];
-    args.extend(rate_args(ref_info, dist_info));
+    args.extend(rate_args(fps_mode, ref_info, dist_info, true));
     args.push("-i".to_owned());
     args.push(dist_path.to_owned());
-    args.extend(rate_args(ref_info, dist_info));
+    args.extend(rate_args(fps_mode, ref_info, dist_info, false));
     args.push("-i".to_owned());
     args.push(ref_path.to_owned());
     args.push("-filter_complex".to_owned());
