@@ -18,6 +18,8 @@ pub const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 pub const PACKET_COUNT_TIMEOUT: Duration = Duration::from_secs(60);
 pub const THUMB_TIMEOUT: Duration = Duration::from_secs(15);
+/// Single accurate-seek bad-frame extract (original `BadFrames.Timeout`).
+pub const BADFRAME_TIMEOUT: Duration = Duration::from_secs(60);
 /// Backstop for reaping an already-finished child (metric runs,
 /// Stop/Reset); a healthy reap returns in ms.
 pub const REAP_TIMEOUT: Duration = Duration::from_secs(5);

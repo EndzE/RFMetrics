@@ -99,6 +99,7 @@ pub struct OptionsState {
     pub plot_size: Option<String>,
     pub csv_export: Option<bool>,
     pub csv_dir: Option<String>,
+    pub badframes_count: Option<String>,
     pub results_autosave: Option<bool>,
     pub results_path: Option<String>,
 }

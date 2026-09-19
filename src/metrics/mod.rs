@@ -1,3 +1,4 @@
+pub mod badframes;
 pub mod csv;
 pub mod ffmpeg;
 pub mod ffvship;

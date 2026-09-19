@@ -35,6 +35,7 @@ fn round_trip() {
             csv_dir: Some("D:/csv".to_owned()),
             results_autosave: Some(true),
             results_path: Some("D:/r.csv".to_owned()),
+            ..Default::default()
         },
     };
     let back: AppState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();

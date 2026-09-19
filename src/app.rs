@@ -315,6 +315,31 @@ enum PlotExport {
     Copy,
 }
 
+/// Progress + summary from the bad-frames worker (one thread, sequential
+/// accurate seeks; abort stops between frames).
+#[derive(Debug)]
+enum BadframeMsg {
+    Progress { done: usize, total: usize },
+    Finished { ok: usize, errors: Vec<String> },
+}
+
+/// One PNG to extract (owned snapshot for the worker thread).
+struct BadframeJob {
+    kind: MetricKind,
+    dist_path: String,
+    dist_fps: f64,
+    frame: usize,
+    offset: f64,
+}
+
+/// Frozen-at-click export plan: no UI borrows cross into the thread.
+struct BadframePlan {
+    ffmpeg: std::path::PathBuf,
+    ref_path: String,
+    ref_fps: f64,
+    jobs: Vec<BadframeJob>,
+}
+
 /// Progress + results from the single sequential metric worker (Python
 /// `_worker` parity: one thread, checked metrics in order, never on the UI
 /// thread). `generation` drops late messages after a Reset starts a new run.
@@ -405,6 +430,9 @@ pub struct RFMetricsApp {
     results_path: String,
     /// Save PNG / Copy image size preset (Options combobox).
     plot_size: crate::plot::PlotSize,
+    /// Worst frames saved per metric/file by Extract bad frames (Options
+    /// combobox, original `BadFrames.Count` parity, default 5).
+    badframes_count: String,
     rows: Vec<QueueRow>,
     ffmpeg: crate::binaries::BinaryInfo,
     ffvship: crate::binaries::BinaryInfo,
@@ -510,6 +538,19 @@ pub struct RFMetricsApp {
     png_tx: Sender<PngSaveMsg>,
     png_rx: Receiver<PngSaveMsg>,
     png_saving: bool,
+    /// Bad-frames worker channel + state: `badframes_busy` while accurate
+    /// seeks run, `badframe_done/total` for the button label, `badframe_abort`
+    /// for Stop-between-frames (mid-seek ffmpeg is bounded by
+    /// `BADFRAME_TIMEOUT`, so no child kill needed).
+    badframe_tx: Sender<BadframeMsg>,
+    badframe_rx: Receiver<BadframeMsg>,
+    badframes_busy: bool,
+    badframe_done: usize,
+    badframe_total: usize,
+    badframe_abort: Arc<AtomicBool>,
+    /// Pending bad-frames summary, toasted at the next UI frame like
+    /// `csv_report` above. `(files_written, error_strings)`.
+    badframe_report: Option<(usize, Vec<String>)>,
 }
 
 impl Default for RFMetricsApp {
@@ -521,6 +562,7 @@ impl Default for RFMetricsApp {
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
         let (metric_tx, metric_rx) = std::sync::mpsc::channel();
         let (png_tx, png_rx) = std::sync::mpsc::channel();
+        let (badframe_tx, badframe_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             ref_path: String::new(),
             duration: String::new(),
@@ -549,6 +591,7 @@ impl Default for RFMetricsApp {
             results_autosave: false,
             results_path: String::new(),
             plot_size: crate::plot::PlotSize::default(),
+            badframes_count: "5".to_owned(),
             rows: Vec::new(),
             ffmpeg,
             ffvship,
@@ -600,6 +643,13 @@ impl Default for RFMetricsApp {
             png_tx,
             png_rx,
             png_saving: false,
+            badframe_tx,
+            badframe_rx,
+            badframes_busy: false,
+            badframe_done: 0,
+            badframe_total: 0,
+            badframe_abort: Arc::new(AtomicBool::new(false)),
+            badframe_report: None,
         };
         // Hermetic tests: the developer's own state file must not leak
         // into assertions about defaults.
@@ -1235,6 +1285,7 @@ impl RFMetricsApp {
                 plot_size: Some(self.plot_size.label().to_owned()),
                 csv_export: Some(self.csv_export),
                 csv_dir: Some(self.csv_dir.clone()),
+                badframes_count: Some(self.badframes_count.clone()),
                 results_autosave: Some(self.results_autosave),
                 results_path: Some(self.results_path.clone()),
             },
@@ -1361,6 +1412,11 @@ impl RFMetricsApp {
         if let Some(csv_dir) = s.options.csv_dir {
             self.csv_dir = csv_dir;
         }
+        if let Some(badframes_count) = s.options.badframes_count
+            && crate::metrics::badframes::COUNT_LABELS.contains(&badframes_count.as_str())
+        {
+            self.badframes_count = badframes_count;
+        }
         if let Some(results_autosave) = s.options.results_autosave {
             self.results_autosave = results_autosave;
         }
@@ -1423,6 +1479,7 @@ impl RFMetricsApp {
             || o.plot_size.as_deref() != Some(self.plot_size.label())
             || o.csv_export != Some(self.csv_export)
             || o.csv_dir.as_deref() != Some(self.csv_dir.as_str())
+            || o.badframes_count.as_deref() != Some(self.badframes_count.as_str())
             || o.results_autosave != Some(self.results_autosave)
             || o.results_path.as_deref() != Some(self.results_path.as_str())
         {
@@ -2002,6 +2059,184 @@ impl RFMetricsApp {
             }
         }
         log::info!(target: "rfmetrics::app", "metric results cleared");
+    }
+
+    /// Snapshot of one finished cell for the bad-frames worker (owned so
+    /// the thread never touches UI state).
+    fn badframe_jobs(&self) -> Option<BadframePlan> {
+        use crate::metrics::badframes;
+        let ffmpeg = self.ffmpeg.path.clone()?;
+        let ref_path = self.ref_path.clone();
+        if ref_path.trim().is_empty() || !std::path::Path::new(&ref_path).is_file() {
+            return None;
+        }
+        let skip = Self::trim_opt(&self.skip)?.unwrap_or(0.0);
+        let ref_fps = self
+            .ref_info_data
+            .as_ref()
+            .and_then(|m| m.fps)
+            .filter(|f| *f > 0.0);
+        let n: usize = self.badframes_count.parse().ok().filter(|n| *n >= 1)?;
+        let mut jobs: Vec<BadframeJob> = Vec::new();
+        for row in &self.rows {
+            if !row.include {
+                continue;
+            }
+            let dist_fps = row.info.as_ref().and_then(|m| m.fps).filter(|f| *f > 0.0);
+            let Some(fps) = ref_fps.or(dist_fps) else {
+                continue;
+            };
+            for kind in MetricKind::ALL {
+                let (values, vmaf_cfg) = match row.cell(kind) {
+                    crate::metrics::MetricCell::Done {
+                        values, vmaf_cfg, ..
+                    } if !values.is_empty() => (values.clone(), vmaf_cfg.clone()),
+                    _ => continue,
+                };
+                let worst_max = kind == MetricKind::But;
+                let stride = badframes::stride_for(kind, vmaf_cfg.as_ref());
+                let picks = badframes::worst_n(&values, n, worst_max);
+                for (idx, _) in picks {
+                    let frame = idx.saturating_mul(stride);
+                    let offset = badframes::frame_offset(skip, frame, fps);
+                    jobs.push(BadframeJob {
+                        kind,
+                        dist_path: row.path.clone(),
+                        dist_fps: dist_fps.unwrap_or(fps),
+                        frame,
+                        offset,
+                    });
+                }
+            }
+        }
+        if jobs.is_empty() {
+            return None;
+        }
+        Some(BadframePlan {
+            ffmpeg,
+            ref_path,
+            ref_fps: ref_fps.unwrap_or_else(|| {
+                self.rows
+                    .iter()
+                    .filter_map(|r| r.info.as_ref().and_then(|m| m.fps))
+                    .next()
+                    .unwrap_or(30.0)
+            }),
+            jobs,
+        })
+    }
+
+    /// Spawn the bad-frames worker: sequential accurate seeks, dist + ref
+    /// per frame, progress per extraction. Abort stops between frames
+    /// (mid-seek ffmpeg is bounded by `BADFRAME_TIMEOUT`).
+    /// ponytail: abort between frames, not mid-seek; a Stop click waits out
+    /// at most one single-frame extract.
+    fn start_badframes(&mut self, now: f64) {
+        use std::sync::atomic::Ordering;
+        if self.measuring || self.badframes_busy {
+            return;
+        }
+        let Some(plan) = self.badframe_jobs() else {
+            self.toast(
+                now,
+                "Nothing to export: run a metric first".to_owned(),
+                ToastKind::Info,
+            );
+            return;
+        };
+        let total = plan.jobs.len() * 2;
+        self.badframes_busy = true;
+        self.badframe_done = 0;
+        self.badframe_total = total;
+        self.badframe_abort.store(false, Ordering::SeqCst);
+        let tx = self.badframe_tx.clone();
+        let abort = self.badframe_abort.clone();
+        std::thread::spawn(move || {
+            use crate::metrics::badframes;
+            let mut ok = 0usize;
+            let mut errors: Vec<String> = Vec::new();
+            let mut done = 0usize;
+            for job in &plan.jobs {
+                for (src, fps, dest) in [
+                    (
+                        job.dist_path.as_str(),
+                        job.dist_fps,
+                        badframes::dest_for(&job.dist_path, job.kind.name(), job.frame),
+                    ),
+                    (
+                        plan.ref_path.as_str(),
+                        plan.ref_fps,
+                        badframes::dest_ref_for(&job.dist_path, job.kind.name(), job.frame),
+                    ),
+                ] {
+                    if abort.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let good = badframes::extract_one(&plan.ffmpeg, src, &dest, job.offset, fps);
+                    if good {
+                        ok += 1;
+                    } else {
+                        errors.push(format!("{} frame {}", job.kind.name(), job.frame));
+                    }
+                    done += 1;
+                    let _ = tx.send(BadframeMsg::Progress { done, total });
+                }
+                if abort.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
+            let _ = tx.send(BadframeMsg::Finished { ok, errors });
+        });
+        log::info!(target: "rfmetrics::app", "bad-frames started: {} extracts", total);
+    }
+
+    /// Stop an in-flight bad-frames export (checked between seeks).
+    fn stop_badframes(&mut self) {
+        use std::sync::atomic::Ordering;
+        if !self.badframes_busy {
+            return;
+        }
+        self.badframe_abort.store(true, Ordering::SeqCst);
+        log::info!(target: "rfmetrics::app", "bad-frames aborted by user");
+    }
+
+    /// Drain bad-frames progress; returns true on activity. The summary is
+    /// toasted here where `now` exists (drain has none).
+    fn drain_badframe_results(&mut self, now: f64) -> bool {
+        let mut activity = false;
+        while let Ok(msg) = self.badframe_rx.try_recv() {
+            activity = true;
+            match msg {
+                BadframeMsg::Progress { done, total } => {
+                    self.badframe_done = done;
+                    self.badframe_total = total;
+                }
+                BadframeMsg::Finished { ok, errors } => {
+                    self.badframes_busy = false;
+                    self.badframe_done = 0;
+                    self.badframe_total = 0;
+                    self.badframe_report = Some((ok, errors));
+                }
+            }
+        }
+        if let Some((ok, errors)) = self.badframe_report.take() {
+            if errors.is_empty() {
+                let s = if ok == 1 { "" } else { "s" };
+                self.toast(now, format!("Saved {ok} bad-frame PNG{s}"), ToastKind::Info);
+            } else {
+                let first = errors[0].clone();
+                let s = if errors.len() == 1 { "" } else { "s" };
+                self.toast(
+                    now,
+                    format!(
+                        "Bad frames: {ok} saved, {} failed{s} ({first})",
+                        errors.len()
+                    ),
+                    ToastKind::Error,
+                );
+            }
+        }
+        activity
     }
 
     /// Metric plots in their own OS window (Python `show_plot` parity,
@@ -2871,7 +3106,7 @@ impl eframe::App for RFMetricsApp {
         let now = ui.ctx().input(|i| i.time);
         // While the metric worker runs, run-scoped inputs lock: dimmed and
         // unclickable so paths, trim, queue, and toggles can't shift mid-run.
-        let run_locked = self.measuring;
+        let run_locked = self.measuring || self.badframes_busy;
 
         // Direct OS-cursor hit test; winit gives no position during OLE drags.
         let is_over_ref =
@@ -2937,9 +3172,10 @@ impl eframe::App for RFMetricsApp {
         }
         self.consume_autosave(now);
         let live = self.drain_png_results(&ctx, now) | live;
+        let live = self.drain_badframe_results(now) | live;
         if live {
             ui.ctx().request_repaint();
-        } else if self.measuring {
+        } else if self.measuring || self.badframes_busy {
             // Heartbeat: metric/probe workers never wake the UI, so without
             // a running frame their traffic would strand in the channel
             // (stuck `Frame: 0` until the next mouse move). 10Hz keeps
@@ -3079,6 +3315,30 @@ impl eframe::App for RFMetricsApp {
                     .clicked()
                 {
                     self.show_plot = true;
+                }
+                // Worst-frame PNGs (original Extract bad frames parity):
+                // busy shows progress and aborts; idle needs no run lock.
+                let bf_label = if self.badframes_busy {
+                    format!("Bad frames {}/{}", self.badframe_done, self.badframe_total)
+                } else {
+                    "Bad frames".to_owned()
+                };
+                let bf_enabled = !self.measuring && (self.badframes_busy || self.ffmpeg.path.is_some());
+                if ui
+                    .add_enabled_ui(bf_enabled, |ui| {
+                        ui.add_sized([130.0, 24.0], egui::Button::new(bf_label))
+                    })
+                    .inner
+                    .on_hover_text(
+                        "Save worst-N frame PNGs per finished metric beside each file (dist + -ref)",
+                    )
+                    .clicked()
+                {
+                    if self.badframes_busy {
+                        self.stop_badframes();
+                    } else {
+                        self.start_badframes(now);
+                    }
                 }
                 if ui
                     .add_enabled_ui(!run_locked, |ui| {
@@ -3296,6 +3556,29 @@ impl eframe::App for RFMetricsApp {
                                     .response
                                     .on_hover_text(
                                         "Image dimensions for Save PNG and Copy (current plot view)",
+                                    );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [70.0, 18.0],
+                                    egui::Label::new("Bad frames").selectable(false),
+                                );
+                                let _ = egui::ComboBox::from_id_salt("badframes_count")
+                                    .width(220.0)
+                                    .selected_text(self.badframes_count.as_str())
+                                    .show_ui(ui, |ui| {
+                                        for v in crate::metrics::badframes::COUNT_LABELS {
+                                            let _ = ui.selectable_value(
+                                                &mut self.badframes_count,
+                                                v.to_owned(),
+                                                v,
+                                            );
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(
+                                        "Worst frames saved per finished metric by Bad frames \
+                                         (dist + -ref PNGs beside each file)",
                                     );
                             });
                             let _ = ui
