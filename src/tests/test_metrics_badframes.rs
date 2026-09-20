@@ -55,6 +55,22 @@ fn wipe_split_clamps() {
 }
 
 #[test]
+fn export_dest_empty_dir_lands_beside_dist() {
+    let d = export_dest_for("", "C:/v/movie.mkv", "PSNR", 7, false);
+    assert_eq!(d, Path::new("C:/v/movie.mkv.PSNR.bf000007.png"));
+    let r = export_dest_for("   ", "C:/v/movie.mkv", "PSNR", 7, true);
+    assert_eq!(r, Path::new("C:/v/movie.mkv.PSNR.bf000007-ref.png"));
+}
+
+#[test]
+fn export_dest_set_dir_joins_stem() {
+    let d = export_dest_for("D:/out", "C:/v/movie.mkv", "VMAF", 12, false);
+    assert_eq!(d, Path::new("D:/out/movie.mkv.VMAF.bf000012.png"));
+    let r = export_dest_for("D:/out", "C:/v/movie.mkv", "VMAF", 12, true);
+    assert_eq!(r, Path::new("D:/out/movie.mkv.VMAF.bf000012-ref.png"));
+}
+
+#[test]
 fn wipe_layout_tiles_without_gap() {
     for f in [0.02, 0.25, 0.5, 0.9, 0.98] {
         let l = wipe_layout(200.0, f);

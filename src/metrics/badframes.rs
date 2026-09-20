@@ -155,6 +155,34 @@ pub fn tmp_dest_ref_for(tmp: &Path, dist_path: &str, kind_name: &str, frame: usi
     tmp.join(format!("{base}.{kind_name}.bf{frame:06}-ref.png"))
 }
 
+/// Final export destination for one PNG of a pair: `export_dir` when the
+/// browse line is set, else beside the distorted file. Same stems as tmp
+/// (dist basename + metric + frame), so pairs never collide.
+pub fn export_dest_for(
+    export_dir: &str,
+    dist_path: &str,
+    kind_name: &str,
+    frame: usize,
+    is_ref: bool,
+) -> PathBuf {
+    let base = Path::new(dist_path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dist_path.to_owned());
+    let name = if is_ref {
+        format!("{base}.{kind_name}.bf{frame:06}-ref.png")
+    } else {
+        format!("{base}.{kind_name}.bf{frame:06}.png")
+    };
+    if export_dir.trim().is_empty() {
+        Path::new(dist_path)
+            .parent()
+            .map_or_else(|| PathBuf::from(&name), |d| d.join(&name))
+    } else {
+        Path::new(export_dir).join(name)
+    }
+}
+
 /// Run one extraction; true iff ffmpeg exited 0 and `dest` exists.
 /// Failures log at warn with the repro argv (FFMetrics.log parity);
 /// a partial file is removed.

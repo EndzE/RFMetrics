@@ -341,6 +341,51 @@ struct BadframePlan {
     jobs: Vec<BadframeJob>,
 }
 
+/// Export scope for the bad-frames Export buttons (bf_opts row).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BadframeExportScope {
+    Pair,
+    Metric,
+    All,
+}
+
+/// One worst-frame pair to export (owned snapshot for the worker).
+struct BadframeExportPair {
+    kind: MetricKind,
+    dist_path: String,
+    dist_fps: f64,
+    frame: usize,
+    offset: f64,
+}
+
+/// Direct-to-destination extract (viewer tmp untouched, so no wipe and
+/// no stale-tmp risk; overwrites like the old Save-all copy).
+struct BadframeExportJob {
+    kind: MetricKind,
+    dist_src: String,
+    dist_fps: f64,
+    frame: usize,
+    offset: f64,
+    dest_dist: std::path::PathBuf,
+    dest_ref: std::path::PathBuf,
+}
+
+/// Frozen-at-click export plan: no UI borrows cross into the thread.
+struct BadframeExportPlan {
+    ffmpeg: std::path::PathBuf,
+    ref_src: String,
+    ref_fps: f64,
+    jobs: Vec<BadframeExportJob>,
+}
+
+/// Pending export summary: tmp copies already done; worker PNGs are added
+/// on Finished, then toasted (viewer tmp/textures untouched).
+struct BadframeExportPending {
+    copied: usize,
+    failed: Vec<String>,
+    dest_note: String,
+}
+
 /// Progress + results from the single sequential metric worker (Python
 /// `_worker` parity: one thread, checked metrics in order, never on the UI
 /// thread). `generation` drops late messages after a Reset starts a new run.
@@ -434,6 +479,8 @@ pub struct RFMetricsApp {
     /// Worst frames saved per metric/file by Extract bad frames (Options
     /// combobox, original `BadFrames.Count` parity, default 5).
     badframes_count: String,
+    /// Bad-frames export folder; empty = beside each distorted file.
+    badframes_export_dir: String,
     rows: Vec<QueueRow>,
     ffmpeg: crate::binaries::BinaryInfo,
     ffvship: crate::binaries::BinaryInfo,
@@ -583,8 +630,11 @@ pub struct RFMetricsApp {
     badframe_tex_key: Option<(String, MetricKind, usize)>,
     /// Tmp dir holding this run's viewer PNGs (per-process).
     badframe_tmp: std::path::PathBuf,
-    /// All tmp PNGs from the last viewer run (for save-all).
+    /// All tmp PNGs from the last Extract run.
     badframe_files: Vec<std::path::PathBuf>,
+    /// In-flight export summary (copies done, worker PNGs pending).
+    /// Session-only, never persisted.
+    badframe_export_pending: Option<BadframeExportPending>,
 }
 
 impl Default for RFMetricsApp {
@@ -626,6 +676,7 @@ impl Default for RFMetricsApp {
             results_path: String::new(),
             plot_size: crate::plot::PlotSize::default(),
             badframes_count: "5".to_owned(),
+            badframes_export_dir: String::new(),
             rows: Vec::new(),
             ffmpeg,
             ffvship,
@@ -699,6 +750,7 @@ impl Default for RFMetricsApp {
             badframe_tex_key: None,
             badframe_tmp: crate::metrics::badframes::tmp_dir(),
             badframe_files: Vec::new(),
+            badframe_export_pending: None,
         };
         // Hermetic tests: the developer's own state file must not leak
         // into assertions about defaults.
@@ -1335,6 +1387,7 @@ impl RFMetricsApp {
                 csv_export: Some(self.csv_export),
                 csv_dir: Some(self.csv_dir.clone()),
                 badframes_count: Some(self.badframes_count.clone()),
+                badframes_export_dir: Some(self.badframes_export_dir.clone()),
                 results_autosave: Some(self.results_autosave),
                 results_path: Some(self.results_path.clone()),
             },
@@ -1466,6 +1519,9 @@ impl RFMetricsApp {
         {
             self.badframes_count = badframes_count;
         }
+        if let Some(badframes_export_dir) = s.options.badframes_export_dir {
+            self.badframes_export_dir = badframes_export_dir;
+        }
         if let Some(results_autosave) = s.options.results_autosave {
             self.results_autosave = results_autosave;
         }
@@ -1529,6 +1585,7 @@ impl RFMetricsApp {
             || o.csv_export != Some(self.csv_export)
             || o.csv_dir.as_deref() != Some(self.csv_dir.as_str())
             || o.badframes_count.as_deref() != Some(self.badframes_count.as_str())
+            || o.badframes_export_dir.as_deref() != Some(self.badframes_export_dir.as_str())
             || o.results_autosave != Some(self.results_autosave)
             || o.results_path.as_deref() != Some(self.results_path.as_str())
         {
@@ -2320,9 +2377,253 @@ impl RFMetricsApp {
         log::info!(target: "rfmetrics::app", "bad-frames aborted by user");
     }
 
-    /// Drain bad-frames progress; returns true on activity. On finish the
-    /// tmp dir is scanned for save-all, textures are dropped, and the
-    /// viewer auto-selects the first file.
+    /// Worst-frame pairs for an export scope: Pair = the open pair only,
+    /// Metric = every file × worst-N of the current tab, All = every tab
+    /// with finished values. Rows without usable fps are skipped, like the
+    /// Extract worker.
+    fn export_pairs(&self, scope: BadframeExportScope) -> Vec<BadframeExportPair> {
+        let kinds: Vec<MetricKind> = match scope {
+            BadframeExportScope::Pair | BadframeExportScope::Metric => vec![self.badframe_tab],
+            BadframeExportScope::All => MetricKind::ALL.to_vec(),
+        };
+        let ref_fps = self
+            .ref_info_data
+            .as_ref()
+            .and_then(|m| m.fps)
+            .filter(|f| *f > 0.0);
+        let mut out = Vec::new();
+        for kind in kinds {
+            let keys: Vec<String> = match scope {
+                BadframeExportScope::Pair => self.badframe_file.clone().into_iter().collect(),
+                BadframeExportScope::Metric | BadframeExportScope::All => self
+                    .badframe_files_for(kind)
+                    .into_iter()
+                    .map(|(k, _)| k)
+                    .collect(),
+            };
+            for key in keys {
+                let Some(row) = self.rows.iter().find(|r| r.key == key) else {
+                    continue;
+                };
+                let picks = self.badframe_picks(kind, &key);
+                let frames: Vec<(usize, f64)> = match scope {
+                    BadframeExportScope::Pair => picks
+                        .get(self.badframe_frame_pos)
+                        .map(|(f, _, o)| (*f, *o))
+                        .into_iter()
+                        .collect(),
+                    BadframeExportScope::Metric | BadframeExportScope::All => {
+                        picks.into_iter().map(|(f, _, o)| (f, o)).collect()
+                    }
+                };
+                if frames.is_empty() {
+                    continue;
+                }
+                let dist_fps = row.info.as_ref().and_then(|m| m.fps).filter(|f| *f > 0.0);
+                let Some(dfps) = dist_fps.or(ref_fps) else {
+                    continue;
+                };
+                for (frame, offset) in frames {
+                    out.push(BadframeExportPair {
+                        kind,
+                        dist_path: row.path.clone(),
+                        dist_fps: dfps,
+                        frame,
+                        offset,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Toast an export outcome (PNG counts; worker PNGs + tmp copies).
+    fn toast_export(&mut self, now: f64, saved: usize, failed: Vec<String>, dest: &str) {
+        if failed.is_empty() {
+            self.toast(
+                now,
+                format!("Exported {saved} PNGs to {dest}"),
+                ToastKind::Info,
+            );
+        } else {
+            let first = failed[0].clone();
+            let s = if failed.len() == 1 { "" } else { "s" };
+            self.toast(
+                now,
+                format!(
+                    "Export: {saved} saved, {} failed{s} ({first}) → {dest}",
+                    failed.len()
+                ),
+                ToastKind::Error,
+            );
+        }
+    }
+
+    /// Export worst-frame PNGs: tmp copies when the pair is already
+    /// extracted (exports exactly what the viewer shows), otherwise a
+    /// background worker extracting straight to the destination (viewer
+    /// tmp untouched). Empty browse line = beside each distorted file.
+    fn start_export(&mut self, scope: BadframeExportScope, now: f64) {
+        use std::sync::atomic::Ordering;
+        if self.measuring || self.badframes_busy {
+            return;
+        }
+        let Some(ffmpeg) = self.ffmpeg.path.clone() else {
+            self.toast(now, "Export needs ffmpeg".to_owned(), ToastKind::Error);
+            return;
+        };
+        let ref_path = self.ref_path.clone();
+        if ref_path.trim().is_empty() || !std::path::Path::new(&ref_path).is_file() {
+            self.toast(
+                now,
+                "Export needs the reference file".to_owned(),
+                ToastKind::Error,
+            );
+            return;
+        }
+        let pairs = self.export_pairs(scope);
+        if pairs.is_empty() {
+            self.toast(
+                now,
+                "Nothing to export: run a metric first".to_owned(),
+                ToastKind::Info,
+            );
+            return;
+        }
+        let export_dir = self.badframes_export_dir.clone();
+        if !export_dir.trim().is_empty()
+            && let Err(e) = std::fs::create_dir_all(&export_dir)
+        {
+            self.toast(
+                now,
+                format!("Could not create export folder: {e}"),
+                ToastKind::Error,
+            );
+            return;
+        }
+        let ref_fps = self
+            .ref_info_data
+            .as_ref()
+            .and_then(|m| m.fps)
+            .filter(|f| *f > 0.0)
+            .unwrap_or_else(|| {
+                self.rows
+                    .iter()
+                    .filter_map(|r| r.info.as_ref().and_then(|m| m.fps))
+                    .next()
+                    .unwrap_or(30.0)
+            });
+        let mut copied = 0usize;
+        let mut failed: Vec<String> = Vec::new();
+        let mut jobs: Vec<BadframeExportJob> = Vec::new();
+        for p in pairs {
+            let name = p.kind.name();
+            let tmp_d = crate::metrics::badframes::tmp_dest_for(
+                &self.badframe_tmp,
+                &p.dist_path,
+                name,
+                p.frame,
+            );
+            let tmp_r = crate::metrics::badframes::tmp_dest_ref_for(
+                &self.badframe_tmp,
+                &p.dist_path,
+                name,
+                p.frame,
+            );
+            let dest_d = crate::metrics::badframes::export_dest_for(
+                &export_dir,
+                &p.dist_path,
+                name,
+                p.frame,
+                false,
+            );
+            let dest_r = crate::metrics::badframes::export_dest_for(
+                &export_dir,
+                &p.dist_path,
+                name,
+                p.frame,
+                true,
+            );
+            if tmp_d.is_file() && tmp_r.is_file() {
+                match (
+                    std::fs::copy(&tmp_d, &dest_d),
+                    std::fs::copy(&tmp_r, &dest_r),
+                ) {
+                    (Ok(_), Ok(_)) => copied += 2,
+                    _ => failed.push(format!("{name} frame {}", p.frame)),
+                }
+            } else {
+                jobs.push(BadframeExportJob {
+                    kind: p.kind,
+                    dist_src: p.dist_path,
+                    dist_fps: p.dist_fps,
+                    frame: p.frame,
+                    offset: p.offset,
+                    dest_dist: dest_d,
+                    dest_ref: dest_r,
+                });
+            }
+        }
+        let dest_note = if export_dir.trim().is_empty() {
+            "beside each file".to_owned()
+        } else {
+            export_dir
+        };
+        if jobs.is_empty() {
+            self.toast_export(now, copied, failed, &dest_note);
+            return;
+        }
+        let plan = BadframeExportPlan {
+            ffmpeg,
+            ref_src: ref_path,
+            ref_fps,
+            jobs,
+        };
+        let total = plan.jobs.len() * 2;
+        self.badframes_busy = true;
+        self.badframe_done = 0;
+        self.badframe_total = total;
+        self.badframe_abort.store(false, Ordering::SeqCst);
+        self.badframe_export_pending = Some(BadframeExportPending {
+            copied,
+            failed,
+            dest_note,
+        });
+        let tx = self.badframe_tx.clone();
+        let abort = self.badframe_abort.clone();
+        std::thread::spawn(move || {
+            use crate::metrics::badframes;
+            let mut ok = 0usize;
+            let mut errors: Vec<String> = Vec::new();
+            let mut done = 0usize;
+            for job in &plan.jobs {
+                for (src, fps, dest) in [
+                    (job.dist_src.as_str(), job.dist_fps, job.dest_dist.clone()),
+                    (plan.ref_src.as_str(), plan.ref_fps, job.dest_ref.clone()),
+                ] {
+                    if abort.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if badframes::extract_one(&plan.ffmpeg, src, &dest, job.offset, fps) {
+                        ok += 1;
+                    } else {
+                        errors.push(format!("{} frame {}", job.kind.name(), job.frame));
+                    }
+                    done += 1;
+                    let _ = tx.send(BadframeMsg::Progress { done, total });
+                }
+                if abort.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
+            let _ = tx.send(BadframeMsg::Finished { ok, errors });
+        });
+        log::info!(target: "rfmetrics::app", "bad-frames export started: {} extracts", total);
+    }
+
+    /// Drain bad-frames progress; returns true on activity. Viewer runs
+    /// rescan tmp, drop textures and auto-select the first file; export
+    /// runs toast the combined copy + extract outcome instead.
     fn drain_badframe_results(&mut self, now: f64) -> bool {
         let mut activity = false;
         while let Ok(msg) = self.badframe_rx.try_recv() {
@@ -2336,6 +2637,14 @@ impl RFMetricsApp {
                     self.badframes_busy = false;
                     self.badframe_done = 0;
                     self.badframe_total = 0;
+                    // Export extracts went straight to the destination:
+                    // toast the combined outcome, viewer tmp untouched.
+                    if let Some(pending) = self.badframe_export_pending.take() {
+                        let mut failed = pending.failed;
+                        failed.extend(errors);
+                        self.toast_export(now, pending.copied + ok, failed, &pending.dest_note);
+                        continue;
+                    }
                     self.badframe_files = std::fs::read_dir(&self.badframe_tmp)
                         .map(|entries| {
                             let mut v: Vec<std::path::PathBuf> = entries
@@ -2492,7 +2801,16 @@ impl RFMetricsApp {
                         {
                             self.stop_badframes();
                         }
-                        ui.label(format!("{}/{}", self.badframe_done, self.badframe_total));
+                        ui.label(format!(
+                            "{} {}/{}",
+                            if self.badframe_export_pending.is_some() {
+                                "Exporting"
+                            } else {
+                                "Extracting"
+                            },
+                            self.badframe_done,
+                            self.badframe_total
+                        ));
                     } else {
                         let can_run =
                             self.ffmpeg.path.is_some() && !self.badframe_files_for(kind).is_empty();
@@ -2588,6 +2906,95 @@ impl RFMetricsApp {
                         .on_hover_text("Before/after wipe — drag the divider");
                 });
             });
+            // Options box first: egui requires CentralPanel after all
+            // other panels, otherwise the bottom panel gets zero space.
+            egui::Panel::bottom("bf_opts").show(vui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Label::new("Bad frames").selectable(false));
+                    let _ = egui::ComboBox::from_id_salt("bf_count")
+                        .selected_text(self.badframes_count.as_str())
+                        .show_ui(ui, |ui| {
+                            for v in crate::metrics::badframes::COUNT_LABELS {
+                                let _ = ui.selectable_value(
+                                    &mut self.badframes_count,
+                                    v.to_owned(),
+                                    v,
+                                );
+                            }
+                        });
+                    let busy = self.badframes_busy || self.measuring;
+                    let can_pair = !busy
+                        && self.badframe_file.as_ref().is_some_and(|k| {
+                            self.badframe_picks(kind, k)
+                                .get(self.badframe_frame_pos)
+                                .is_some()
+                        });
+                    let can_metric =
+                        !busy && !self.badframe_files_for(kind).is_empty();
+                    let can_all = !busy
+                        && MetricKind::ALL
+                            .iter()
+                            .any(|k| !self.badframe_files_for(*k).is_empty());
+                    if ui
+                        .add_enabled(can_pair, egui::Button::new("Export pair"))
+                        .on_hover_text("Export the open pair (this tab, file and frame)")
+                        .clicked()
+                    {
+                        self.start_export(BadframeExportScope::Pair, vnow);
+                    }
+                    if ui
+                        .add_enabled(can_metric, egui::Button::new("Export metric"))
+                        .on_hover_text("Export all worst-frame pairs of this tab")
+                        .clicked()
+                    {
+                        self.start_export(BadframeExportScope::Metric, vnow);
+                    }
+                    if ui
+                        .add_enabled(can_all, egui::Button::new("Export all"))
+                        .on_hover_text(
+                            "Extract missing frames for every finished metric, then export all pairs",
+                        )
+                        .clicked()
+                    {
+                        self.start_export(BadframeExportScope::All, vnow);
+                    }
+                    ui.label(format!("{} PNGs in tmp", self.badframe_files.len()));
+                });
+                ui.horizontal(|ui| {
+                    ui.add(egui::Label::new("Export folder").selectable(false));
+                    // Bounded display (full path stays in the hover).
+                    let full = self.badframes_export_dir.clone();
+                    let shown = if full.trim().is_empty() {
+                        "Beside distorted files".to_owned()
+                    } else if full.chars().count() > 40 {
+                        format!(
+                            "…{}",
+                            full.chars().skip(full.chars().count() - 39).collect::<String>()
+                        )
+                    } else {
+                        full.clone()
+                    };
+                    ui.label(shown).on_hover_text(if full.trim().is_empty() {
+                        "Empty: each pair lands next to its distorted file".to_owned()
+                    } else {
+                        full
+                    });
+                    if ui.button("Browse…").clicked()
+                        && let Some(dir) = rfd::FileDialog::new()
+                            .set_title("Bad-frames export folder")
+                            .pick_folder()
+                    {
+                        self.badframes_export_dir = dir.to_string_lossy().into_owned();
+                    }
+                    if ui
+                        .button("Clear")
+                        .on_hover_text("Back to beside-the-distorted-file")
+                        .clicked()
+                    {
+                        self.badframes_export_dir.clear();
+                    }
+                });
+            });
             // Side-by-side pair as linked plots (shared zoom/pan): both
             // images centered at the origin at true pixel size, so one view
             // transform fits both. Stock plot gestures: drag pans, wheel
@@ -2607,7 +3014,7 @@ impl RFMetricsApp {
             }
             egui::CentralPanel::default().show(vui, |ui| {
                 // Overlay wipe as a single plot: UV-cropped halves tile
-                // exactly at the divider (dist left, ref right), so stock
+                // exactly at the divider (ref left, dist right), so stock
                 // plot gestures give pan (drag), zoom (scroll/box) and
                 // double-click fit. Divider drag suppresses pan via last
                 // frame's divider screen x. No default bounds: auto-bounds
@@ -2880,62 +3287,6 @@ impl RFMetricsApp {
                 if do_reset {
                     self.badframe_reset_once = false;
                 }
-            });
-            // Options box: count + save-all-to-folder.
-            egui::Panel::bottom("bf_opts").show(vui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add(egui::Label::new("Bad frames").selectable(false));
-                    let _ = egui::ComboBox::from_id_salt("bf_count")
-                        .selected_text(self.badframes_count.as_str())
-                        .show_ui(ui, |ui| {
-                            for v in crate::metrics::badframes::COUNT_LABELS {
-                                let _ = ui.selectable_value(
-                                    &mut self.badframes_count,
-                                    v.to_owned(),
-                                    v,
-                                );
-                            }
-                        });
-                    let can_save = !self.badframe_files.is_empty();
-                    if ui
-                        .add_enabled_ui(can_save, |ui| {
-                            ui.add(egui::Button::new("Save all to folder…"))
-                        })
-                        .inner
-                        .on_hover_text("Copy every tmp PNG of this run to a folder")
-                        .clicked()
-                        && let Some(dir) = rfd::FileDialog::new()
-                            .set_title("Save bad frames")
-                            .pick_folder()
-                    {
-                        let mut ok = 0usize;
-                        let mut fail = 0usize;
-                        for src in &self.badframe_files.clone() {
-                            let dest = dir.join(
-                                src.file_name().unwrap_or_default(),
-                            );
-                            match std::fs::copy(src, &dest) {
-                                Ok(_) => ok += 1,
-                                Err(e) => {
-                                    fail += 1;
-                                    log::warn!(target: "rfmetrics::app", "save bad frame {} failed: {e}", src.display());
-                                }
-                            }
-                        }
-                        let now = vnow;
-                        if fail == 0 {
-                            let s = if ok == 1 { "" } else { "s" };
-                            self.toast(now, format!("Saved {ok} bad-frame PNG{s}"), ToastKind::Info);
-                        } else {
-                            self.toast(
-                                now,
-                                format!("Bad frames: {ok} saved, {fail} failed"),
-                                ToastKind::Error,
-                            );
-                        }
-                    }
-                    ui.label(format!("{} PNGs in tmp", self.badframe_files.len()));
-                });
             });
             // Keep progress live while the worker runs (viewport repaints
             // with the parent only on input otherwise).
@@ -4250,29 +4601,6 @@ impl eframe::App for RFMetricsApp {
                                     .response
                                     .on_hover_text(
                                         "Image dimensions for Save PNG and Copy (current plot view)",
-                                    );
-                            });
-                            ui.horizontal(|ui| {
-                                ui.add_sized(
-                                    [70.0, 18.0],
-                                    egui::Label::new("Bad frames").selectable(false),
-                                );
-                                let _ = egui::ComboBox::from_id_salt("badframes_count")
-                                    .width(220.0)
-                                    .selected_text(self.badframes_count.as_str())
-                                    .show_ui(ui, |ui| {
-                                        for v in crate::metrics::badframes::COUNT_LABELS {
-                                            let _ = ui.selectable_value(
-                                                &mut self.badframes_count,
-                                                v.to_owned(),
-                                                v,
-                                            );
-                                        }
-                                    })
-                                    .response
-                                    .on_hover_text(
-                                        "Worst frames saved per finished metric by Bad frames \
-                                         (dist + -ref PNGs beside each file)",
                                     );
                             });
                             let _ = ui

@@ -100,6 +100,7 @@ pub struct OptionsState {
     pub csv_export: Option<bool>,
     pub csv_dir: Option<String>,
     pub badframes_count: Option<String>,
+    pub badframes_export_dir: Option<String>,
     pub results_autosave: Option<bool>,
     pub results_path: Option<String>,
 }

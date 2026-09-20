@@ -1952,6 +1952,22 @@ fn state_apply_restores_csv_options() {
     assert!(app.snapshot().options.csv_export == Some(true));
 }
 
+/// Bad-frames export dir persists and restores like the CSV dir.
+#[test]
+fn state_apply_restores_badframes_export_dir() {
+    let mut app = RFMetricsApp::default();
+    let state = crate::state::AppState {
+        options: crate::state::OptionsState {
+            badframes_export_dir: Some("D:/bf".to_owned()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    app.apply_state(Some(state));
+    assert_eq!(app.badframes_export_dir, "D:/bf");
+    assert!(app.snapshot().options.badframes_export_dir == Some("D:/bf".to_owned()));
+}
+
 /// Results auto-save: Finished (clean or aborted) arms the flag when
 /// opted in; consuming exports one row and disarms. Stale generations
 /// stay silent.
