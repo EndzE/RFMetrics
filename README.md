@@ -9,14 +9,14 @@ Desktop video quality metrics: compare distorted files against a reference (PSNR
 
 ## Run
 
-Download archive from Releases
-Extract it into folder
-Download ffmpeg binaries (https://github.com/GyanD/codexffmpeg/releases or https://github.com/BtbN/FFmpeg-Builds/releases)
-Put ffmpeg binaries into the folder "ffmpeg" next to exe or make them available in %PATH%
-Download ffvship binaries based on your GPU https://codeberg.org/Line-fr/Vship/releases
-Put ffvship binaries into the folder "ffvship" next to exe or make them available in %PATH%
-Run rfmetrics.exe
-Queue files (drag & drop works), set a reference, tick metric headers, Start.
+1. Download archive from Releases
+2. Extract it into folder
+3. Download ffmpeg binaries (https://github.com/GyanD/codexffmpeg/releases or https://github.com/BtbN/FFmpeg-Builds/releases)
+4. Put ffmpeg binaries into the folder "ffmpeg" next to exe or make them available in %PATH%
+5. Download ffvship binaries based on your GPU https://codeberg.org/Line-fr/Vship/releases
+6. Put ffvship binaries into the folder "ffvship" next to exe or make them available in %PATH%
+7. Run rfmetrics.exe
+8. Queue files (drag & drop works), set a reference, tick metric headers, Start.
 
 ## Notes
 
