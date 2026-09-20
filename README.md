@@ -53,4 +53,4 @@
 
 ## Original Inspiration
 
-[**FFMetrics**](https://github.com/fifonik/FFMetrics).
+[**fifonik/FFMetrics**](https://github.com/fifonik/FFMetrics)
