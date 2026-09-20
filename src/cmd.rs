@@ -24,6 +24,22 @@ pub const BADFRAME_TIMEOUT: Duration = Duration::from_secs(60);
 /// Stop/Reset); a healthy reap returns in ms.
 pub const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Windows: spawn CLI children (ffmpeg, ffprobe, FFVship) with
+/// `CREATE_NO_WINDOW` so version checks and probes don't each flash a
+/// console window (the app itself is already windowed in release).
+/// No-op on other platforms.
+pub fn hide_console(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(0x0800_0000);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
 /// `Command::output()` with a wall-clock bound: stdin is nulled like
 /// `.output()` does, pipes are captured the same way, but if the child
 /// neither exits nor fills its pipes within `timeout` it is killed and
@@ -31,6 +47,7 @@ pub const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 /// returned. Spawn failures pass through as their `io::Error`.
 pub fn output_timeout(mut cmd: Command, timeout: Duration) -> io::Result<Output> {
     // Match `.output()` plumbing (callers never set stdio themselves).
+    hide_console(&mut cmd);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

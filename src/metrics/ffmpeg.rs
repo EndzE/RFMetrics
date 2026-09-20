@@ -754,6 +754,7 @@ pub(crate) fn pump_process(
 ) -> Result<Pumped, String> {
     let start = std::time::Instant::now();
     let mut cmd = Command::new(exe);
+    crate::cmd::hide_console(&mut cmd);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
