@@ -337,6 +337,7 @@ struct BadframePlan {
     ffmpeg: std::path::PathBuf,
     ref_path: String,
     ref_fps: f64,
+    tmp: std::path::PathBuf,
     jobs: Vec<BadframeJob>,
 }
 
@@ -551,6 +552,29 @@ pub struct RFMetricsApp {
     /// Pending bad-frames summary, toasted at the next UI frame like
     /// `csv_report` above. `(files_written, error_strings)`.
     badframe_report: Option<(usize, Vec<String>)>,
+    /// Bad-frames viewer window (own OS viewport like the plot window).
+    /// Frames live as tmp PNGs (`badframe_tmp`); only the visible dist/ref
+    /// pair is uploaded as textures, keyed by `badframe_tex_key`.
+    show_badframes: bool,
+    badframe_tab: MetricKind,
+    /// Selected queue-row key for the viewer (None = auto-pick first).
+    badframe_file: Option<String>,
+    /// Position in the worst-N list for `(file, tab)`.
+    badframe_frame_pos: usize,
+    /// One-frame view reset for the viewer plots (Reset view button /
+    /// selection change): applies `Plot::reset()`, which also clears the
+    /// shared link-group bounds a fresh plot id alone would keep.
+    badframe_reset_once: bool,
+    /// Last selection the viewer plots were fit for; a change arms
+    /// `badframe_reset_once` so every tab/file/frame lands fit.
+    badframe_view_key: Option<(MetricKind, String, usize)>,
+    badframe_tex_dist: Option<egui::TextureHandle>,
+    badframe_tex_ref: Option<egui::TextureHandle>,
+    badframe_tex_key: Option<(String, MetricKind, usize)>,
+    /// Tmp dir holding this run's viewer PNGs (per-process).
+    badframe_tmp: std::path::PathBuf,
+    /// All tmp PNGs from the last viewer run (for save-all).
+    badframe_files: Vec<std::path::PathBuf>,
 }
 
 impl Default for RFMetricsApp {
@@ -650,6 +674,17 @@ impl Default for RFMetricsApp {
             badframe_total: 0,
             badframe_abort: Arc::new(AtomicBool::new(false)),
             badframe_report: None,
+            show_badframes: false,
+            badframe_tab: MetricKind::Psnr,
+            badframe_file: None,
+            badframe_frame_pos: 0,
+            badframe_reset_once: false,
+            badframe_view_key: None,
+            badframe_tex_dist: None,
+            badframe_tex_ref: None,
+            badframe_tex_key: None,
+            badframe_tmp: crate::metrics::badframes::tmp_dir(),
+            badframe_files: Vec::new(),
         };
         // Hermetic tests: the developer's own state file must not leak
         // into assertions about defaults.
@@ -2061,9 +2096,9 @@ impl RFMetricsApp {
         log::info!(target: "rfmetrics::app", "metric results cleared");
     }
 
-    /// Snapshot of one finished cell for the bad-frames worker (owned so
-    /// the thread never touches UI state).
-    fn badframe_jobs(&self) -> Option<BadframePlan> {
+    /// Snapshot of finished cells for the bad-frames worker (owned so
+    /// the thread never touches UI state). Current viewer tab only.
+    fn badframe_jobs_for(&self, kind: MetricKind) -> Option<BadframePlan> {
         use crate::metrics::badframes;
         let ffmpeg = self.ffmpeg.path.clone()?;
         let ref_path = self.ref_path.clone();
@@ -2086,27 +2121,23 @@ impl RFMetricsApp {
             let Some(fps) = ref_fps.or(dist_fps) else {
                 continue;
             };
-            for kind in MetricKind::ALL {
-                let (values, vmaf_cfg) = match row.cell(kind) {
-                    crate::metrics::MetricCell::Done {
-                        values, vmaf_cfg, ..
-                    } if !values.is_empty() => (values.clone(), vmaf_cfg.clone()),
-                    _ => continue,
-                };
-                let worst_max = kind == MetricKind::But;
-                let stride = badframes::stride_for(kind, vmaf_cfg.as_ref());
-                let picks = badframes::worst_n(&values, n, worst_max);
-                for (idx, _) in picks {
-                    let frame = idx.saturating_mul(stride);
-                    let offset = badframes::frame_offset(skip, frame, fps);
-                    jobs.push(BadframeJob {
-                        kind,
-                        dist_path: row.path.clone(),
-                        dist_fps: dist_fps.unwrap_or(fps),
-                        frame,
-                        offset,
-                    });
-                }
+            let (values, vmaf_cfg) = match row.cell(kind) {
+                crate::metrics::MetricCell::Done {
+                    values, vmaf_cfg, ..
+                } if !values.is_empty() => (values.clone(), vmaf_cfg.clone()),
+                _ => continue,
+            };
+            let picks = badframes::worst_n(&values, n, kind == MetricKind::But);
+            let stride = badframes::stride_for(kind, vmaf_cfg.as_ref());
+            for (idx, _) in picks {
+                let frame = idx.saturating_mul(stride);
+                jobs.push(BadframeJob {
+                    kind,
+                    dist_path: row.path.clone(),
+                    dist_fps: dist_fps.unwrap_or(fps),
+                    frame,
+                    offset: badframes::frame_offset(skip, frame, fps),
+                });
             }
         }
         if jobs.is_empty() {
@@ -2122,13 +2153,69 @@ impl RFMetricsApp {
                     .next()
                     .unwrap_or(30.0)
             }),
+            tmp: self.badframe_tmp.clone(),
             jobs,
         })
     }
 
-    /// Spawn the bad-frames worker: sequential accurate seeks, dist + ref
-    /// per frame, progress per extraction. Abort stops between frames
-    /// (mid-seek ffmpeg is bounded by `BADFRAME_TIMEOUT`).
+    /// Worst list for one viewer `(file key, tab)`: `(actual_frame, value,
+    /// offset)`, worst-first. Empty when the cell isn't Done or fps unknown.
+    fn badframe_picks(&self, kind: MetricKind, key: &str) -> Vec<(usize, f64, f64)> {
+        use crate::metrics::badframes;
+        let row = match self.rows.iter().find(|r| r.key == key) {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+        let skip = match Self::trim_opt(&self.skip) {
+            Some(v) => v.unwrap_or(0.0),
+            None => return Vec::new(),
+        };
+        let ref_fps = self
+            .ref_info_data
+            .as_ref()
+            .and_then(|m| m.fps)
+            .filter(|f| *f > 0.0);
+        let dist_fps = row.info.as_ref().and_then(|m| m.fps).filter(|f| *f > 0.0);
+        let Some(fps) = ref_fps.or(dist_fps) else {
+            return Vec::new();
+        };
+        let (values, vmaf_cfg) = match row.cell(kind) {
+            crate::metrics::MetricCell::Done {
+                values, vmaf_cfg, ..
+            } if !values.is_empty() => (values, vmaf_cfg),
+            _ => return Vec::new(),
+        };
+        let n: usize = self
+            .badframes_count
+            .parse()
+            .ok()
+            .filter(|n| *n >= 1)
+            .unwrap_or(5);
+        let stride = badframes::stride_for(kind, vmaf_cfg.as_ref());
+        badframes::worst_n(values, n, kind == MetricKind::But)
+            .into_iter()
+            .map(|(idx, v)| {
+                let frame = idx.saturating_mul(stride);
+                (frame, v, badframes::frame_offset(skip, frame, fps))
+            })
+            .collect()
+    }
+
+    /// Queue rows with a finished cell for the viewer tab (file picker).
+    fn badframe_files_for(&self, kind: MetricKind) -> Vec<(String, String)> {
+        self.rows
+            .iter()
+            .filter(|r| r.include)
+            .filter(|r| {
+                matches!(r.cell(kind), crate::metrics::MetricCell::Done { values, .. } if !values.is_empty())
+            })
+            .map(|r| (r.key.clone(), r.display.clone()))
+            .collect()
+    }
+
+    /// Spawn the bad-frames worker for the viewer tab: sequential accurate
+    /// seeks into the run tmp dir, dist + ref per frame. Abort stops between
+    /// frames (mid-seek ffmpeg is bounded by `BADFRAME_TIMEOUT`).
     /// ponytail: abort between frames, not mid-seek; a Stop click waits out
     /// at most one single-frame extract.
     fn start_badframes(&mut self, now: f64) {
@@ -2136,7 +2223,8 @@ impl RFMetricsApp {
         if self.measuring || self.badframes_busy {
             return;
         }
-        let Some(plan) = self.badframe_jobs() else {
+        let kind = self.badframe_tab;
+        let Some(plan) = self.badframe_jobs_for(kind) else {
             self.toast(
                 now,
                 "Nothing to export: run a metric first".to_owned(),
@@ -2144,6 +2232,15 @@ impl RFMetricsApp {
             );
             return;
         };
+        let _ = std::fs::remove_dir_all(&plan.tmp);
+        if let Err(e) = std::fs::create_dir_all(&plan.tmp) {
+            self.toast(
+                now,
+                format!("Could not create tmp dir: {e}"),
+                ToastKind::Error,
+            );
+            return;
+        }
         let total = plan.jobs.len() * 2;
         self.badframes_busy = true;
         self.badframe_done = 0;
@@ -2161,19 +2258,28 @@ impl RFMetricsApp {
                     (
                         job.dist_path.as_str(),
                         job.dist_fps,
-                        badframes::dest_for(&job.dist_path, job.kind.name(), job.frame),
+                        badframes::tmp_dest_for(
+                            &plan.tmp,
+                            &job.dist_path,
+                            job.kind.name(),
+                            job.frame,
+                        ),
                     ),
                     (
                         plan.ref_path.as_str(),
                         plan.ref_fps,
-                        badframes::dest_ref_for(&job.dist_path, job.kind.name(), job.frame),
+                        badframes::tmp_dest_ref_for(
+                            &plan.tmp,
+                            &job.dist_path,
+                            job.kind.name(),
+                            job.frame,
+                        ),
                     ),
                 ] {
                     if abort.load(Ordering::SeqCst) {
                         break;
                     }
-                    let good = badframes::extract_one(&plan.ffmpeg, src, &dest, job.offset, fps);
-                    if good {
+                    if badframes::extract_one(&plan.ffmpeg, src, &dest, job.offset, fps) {
                         ok += 1;
                     } else {
                         errors.push(format!("{} frame {}", job.kind.name(), job.frame));
@@ -2200,8 +2306,9 @@ impl RFMetricsApp {
         log::info!(target: "rfmetrics::app", "bad-frames aborted by user");
     }
 
-    /// Drain bad-frames progress; returns true on activity. The summary is
-    /// toasted here where `now` exists (drain has none).
+    /// Drain bad-frames progress; returns true on activity. On finish the
+    /// tmp dir is scanned for save-all, textures are dropped, and the
+    /// viewer auto-selects the first file.
     fn drain_badframe_results(&mut self, now: f64) -> bool {
         let mut activity = false;
         while let Ok(msg) = self.badframe_rx.try_recv() {
@@ -2215,6 +2322,31 @@ impl RFMetricsApp {
                     self.badframes_busy = false;
                     self.badframe_done = 0;
                     self.badframe_total = 0;
+                    self.badframe_files = std::fs::read_dir(&self.badframe_tmp)
+                        .map(|entries| {
+                            let mut v: Vec<std::path::PathBuf> = entries
+                                .filter_map(|e| e.ok().map(|e| e.path()))
+                                .filter(|p| p.extension().is_some_and(|x| x == "png"))
+                                .collect();
+                            v.sort();
+                            v
+                        })
+                        .unwrap_or_default();
+                    self.badframe_tex_dist = None;
+                    self.badframe_tex_ref = None;
+                    self.badframe_tex_key = None;
+                    self.badframe_frame_pos = 0;
+                    if self
+                        .badframe_file
+                        .as_ref()
+                        .is_none_or(|k| !self.rows.iter().any(|r| &r.key == k))
+                    {
+                        self.badframe_file = self
+                            .badframe_files_for(self.badframe_tab)
+                            .into_iter()
+                            .next()
+                            .map(|(k, _)| k);
+                    }
                     self.badframe_report = Some((ok, errors));
                 }
             }
@@ -2222,7 +2354,11 @@ impl RFMetricsApp {
         if let Some((ok, errors)) = self.badframe_report.take() {
             if errors.is_empty() {
                 let s = if ok == 1 { "" } else { "s" };
-                self.toast(now, format!("Saved {ok} bad-frame PNG{s}"), ToastKind::Info);
+                self.toast(
+                    now,
+                    format!("Extracted {ok} bad-frame PNG{s}"),
+                    ToastKind::Info,
+                );
             } else {
                 let first = errors[0].clone();
                 let s = if errors.len() == 1 { "" } else { "s" };
@@ -2237,6 +2373,356 @@ impl RFMetricsApp {
             }
         }
         activity
+    }
+
+    /// Upload the visible viewer pair as textures when the selection
+    /// changed. Full resolution (inspection needs detail); only two
+    /// textures are ever cached.
+    fn refresh_viewer_textures(&mut self, ctx: &egui::Context) {
+        let key = match &self.badframe_file {
+            Some(k) => (k.clone(), self.badframe_tab, self.badframe_frame_pos),
+            None => return,
+        };
+        if self.badframe_tex_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.badframe_tex_dist = None;
+        self.badframe_tex_ref = None;
+        let picks = self.badframe_picks(key.1, &key.0);
+        let Some((frame, _, _)) = picks.get(key.2).copied() else {
+            return;
+        };
+        let row_path = match self.rows.iter().find(|r| r.key == key.0) {
+            Some(r) => r.path.clone(),
+            None => return,
+        };
+        let load = |p: std::path::PathBuf| -> Option<egui::TextureHandle> {
+            let bytes = std::fs::read(&p).ok()?;
+            if bytes.len() <= 100 {
+                return None;
+            }
+            let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+            let (w, h) = (img.width(), img.height());
+            if w == 0 || h == 0 {
+                return None;
+            }
+            Some(ctx.load_texture(
+                p.to_string_lossy().into_owned(),
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &img.into_raw()),
+                egui::TextureOptions::LINEAR,
+            ))
+        };
+        self.badframe_tex_dist = load(crate::metrics::badframes::tmp_dest_for(
+            &self.badframe_tmp,
+            &row_path,
+            key.1.name(),
+            frame,
+        ));
+        self.badframe_tex_ref = load(crate::metrics::badframes::tmp_dest_ref_for(
+            &self.badframe_tmp,
+            &row_path,
+            key.1.name(),
+            frame,
+        ));
+        self.badframe_tex_key = Some(key);
+    }
+
+    /// Bad-frames viewer in its own OS window (mirrors `show_plots`):
+    /// per-metric tabs, file picker, worst-frame stepper, dist/ref pair
+    /// side by side with shared zoom + scroll-pan, current-tab extractor,
+    /// and an options box with count + save-all-to-folder.
+    fn show_badframes(&mut self, ctx: &egui::Context) {
+        if !self.show_badframes {
+            return;
+        }
+        let id = egui::ViewportId::from_hash_of("badframes_view");
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Bad frames")
+            .with_inner_size([1100.0, 700.0]);
+        ctx.show_viewport_immediate(id, builder, |vui, _class| {
+            if vui.input(|i| i.viewport().close_requested()) {
+                self.show_badframes = false;
+                // Best-effort tmp cleanup; save-all must happen while open.
+                let _ = std::fs::remove_dir_all(&self.badframe_tmp);
+                self.badframe_files.clear();
+                self.badframe_tex_dist = None;
+                self.badframe_tex_ref = None;
+                self.badframe_tex_key = None;
+                return;
+            }
+            let vnow = vui.input(|i| i.time);
+            let kind = self.badframe_tab;
+            // Tab strip (all 7, like the plot window).
+            egui::Panel::top("bf_tabs").show(vui, |ui| {
+                ui.horizontal(|ui| {
+                    for tab in MetricKind::ALL {
+                        let title = crate::plot::tab_title(tab);
+                        if ui
+                            .add(egui::Button::new(title).selected(self.badframe_tab == tab))
+                            .clicked()
+                        {
+                            self.badframe_tab = tab;
+                            self.badframe_frame_pos = 0;
+                            self.badframe_tex_key = None;
+                        }
+                    }
+                });
+            });
+            // Runner row: extract current tab / stop + progress.
+            egui::Panel::top("bf_run").show(vui, |ui| {
+                ui.horizontal(|ui| {
+                    if self.badframes_busy {
+                        if ui
+                            .add_sized([110.0, 24.0], egui::Button::new("Stop"))
+                            .clicked()
+                        {
+                            self.stop_badframes();
+                        }
+                        ui.label(format!("{}/{}", self.badframe_done, self.badframe_total));
+                    } else {
+                        let can_run =
+                            self.ffmpeg.path.is_some() && !self.badframe_files_for(kind).is_empty();
+                        if ui
+                            .add_enabled_ui(can_run, |ui| {
+                                ui.add_sized([110.0, 24.0], egui::Button::new("Extract"))
+                            })
+                            .inner
+                            .on_hover_text("Extract worst frames for this tab into tmp")
+                            .clicked()
+                        {
+                            self.start_badframes(vnow);
+                        }
+                        if self.badframe_files_for(kind).is_empty() {
+                            ui.label("Run a metric first");
+                        }
+                    }
+                });
+            });
+            // File + frame controls.
+            let files = self.badframe_files_for(kind);
+            if !files.iter().any(|(k, _)| Some(k) == self.badframe_file.as_ref()) {
+                self.badframe_file = files.first().map(|(k, _)| k.clone());
+                self.badframe_frame_pos = 0;
+                self.badframe_tex_key = None;
+            }
+            egui::Panel::top("bf_pick").show(vui, |ui| {
+                ui.horizontal(|ui| {
+                    let current = self
+                        .badframe_file
+                        .as_ref()
+                        .and_then(|k| files.iter().find(|(fk, _)| fk == k))
+                        .map(|(_, d)| d.clone())
+                        .unwrap_or_else(|| "No file".to_owned());
+                    egui::ComboBox::from_id_salt("bf_file")
+                        .selected_text(current)
+                        .show_ui(ui, |ui| {
+                            for (k, d) in &files {
+                                let _ = ui.selectable_value(
+                                    self.badframe_file.get_or_insert_with(|| k.clone()),
+                                    k.clone(),
+                                    d.as_str(),
+                                );
+                            }
+                        });
+                    let picks = self
+                        .badframe_file
+                        .as_ref()
+                        .map(|k| self.badframe_picks(kind, k))
+                        .unwrap_or_default();
+                    let max_pos = picks.len().saturating_sub(1);
+                    if self.badframe_frame_pos > max_pos {
+                        self.badframe_frame_pos = max_pos;
+                        self.badframe_tex_key = None;
+                    }
+                    if ui.add_enabled(self.badframe_frame_pos > 0, egui::Button::new("◀")).clicked() {
+                        self.badframe_frame_pos = self.badframe_frame_pos.saturating_sub(1);
+                        self.badframe_tex_key = None;
+                    }
+                    let mut pos = self.badframe_frame_pos;
+                    if !picks.is_empty() {
+                        ui.add(
+                            egui::Slider::new(&mut pos, 0..=max_pos)
+                                .show_value(false)
+                                .trailing_fill(true),
+                        );
+                        if pos != self.badframe_frame_pos {
+                            self.badframe_frame_pos = pos;
+                            self.badframe_tex_key = None;
+                        }
+                    }
+                    if ui
+                        .add_enabled(self.badframe_frame_pos < max_pos, egui::Button::new("▶"))
+                        .clicked()
+                    {
+                        self.badframe_frame_pos = self.badframe_frame_pos.saturating_add(1).min(max_pos);
+                        self.badframe_tex_key = None;
+                    }
+                    if let Some((frame, value, _)) = picks.get(self.badframe_frame_pos).copied() {
+                        ui.label(format!("Frame {frame} ({value:.4})"));
+                    }
+                    if ui
+                        .button("Reset view")
+                        .on_hover_text("Fit both images (zoom/pan stay linked)")
+                        .clicked()
+                    {
+                        self.badframe_reset_once = true;
+                    }
+                });
+            });
+            // Side-by-side pair as linked plots (shared zoom/pan): both
+            // images centered at the origin at true pixel size, so one view
+            // transform fits both. Stock plot gestures: drag pans, wheel
+            // zooms, box-select zooms.
+            self.refresh_viewer_textures(vui);
+            // Any selection change re-fits: `Plot::reset()` clears both the
+            // stored bounds and the shared link-group entry (a fresh plot id
+            // alone would inherit the group's zoom).
+            let view_key = (
+                kind,
+                self.badframe_file.clone().unwrap_or_default(),
+                self.badframe_frame_pos,
+            );
+            if self.badframe_view_key.as_ref() != Some(&view_key) {
+                self.badframe_view_key = Some(view_key);
+                self.badframe_reset_once = true;
+            }
+            egui::CentralPanel::default().show(vui, |ui| {
+                // Union-fit defaults (stored memory wins once the user
+                // pans/zooms within a selection).
+                let (dxmin, dxmax, dymin, dymax) =
+                    match (&self.badframe_tex_dist, &self.badframe_tex_ref) {
+                        (Some(d), Some(r)) => {
+                            let (ds, rs) = (d.size(), r.size());
+                            crate::metrics::badframes::viewer_fit(
+                                ds[0] as u32,
+                                ds[1] as u32,
+                                rs[0] as u32,
+                                rs[1] as u32,
+                            )
+                        }
+                        _ => (-1.0, 1.0, -1.0, 1.0),
+                    };
+                let do_reset = self.badframe_reset_once;
+                ui.columns(2, |cols| {
+                    if let Some(tex) = &self.badframe_tex_ref {
+                        let (w, h) = (tex.size()[0] as f32, tex.size()[1] as f32);
+                        cols[0].label("Reference");
+                        let plot = egui_plot::Plot::new("bf-ref")
+                            .link_axis("bf_img", true)
+                            .data_aspect(1.0)
+                            .show_grid(false)
+                            .show_axes(false)
+                            .show_crosshair(false)
+                            .default_x_bounds(dxmin, dxmax)
+                            .default_y_bounds(dymin, dymax);
+                        let plot = if do_reset { plot.reset() } else { plot };
+                        plot.show(&mut cols[0], |plot_ui| {
+                            plot_ui.image(
+                                egui_plot::PlotImage::new(
+                                    "bf-ref-img",
+                                    tex.id(),
+                                    egui_plot::PlotPoint::new(0.0, 0.0),
+                                    egui::Vec2::new(w, h),
+                                )
+                                .allow_hover(false),
+                            );
+                        });
+                    } else {
+                        cols[0].label("Reference — not extracted");
+                    }
+                    if let Some(tex) = &self.badframe_tex_dist {
+                        let (w, h) = (tex.size()[0] as f32, tex.size()[1] as f32);
+                        cols[1].label("Distorted");
+                        let plot = egui_plot::Plot::new("bf-dist")
+                            .link_axis("bf_img", true)
+                            .data_aspect(1.0)
+                            .show_grid(false)
+                            .show_axes(false)
+                            .show_crosshair(false)
+                            .default_x_bounds(dxmin, dxmax)
+                            .default_y_bounds(dymin, dymax);
+                        let plot = if do_reset { plot.reset() } else { plot };
+                        plot.show(&mut cols[1], |plot_ui| {
+                            plot_ui.image(
+                                egui_plot::PlotImage::new(
+                                    "bf-dist-img",
+                                    tex.id(),
+                                    egui_plot::PlotPoint::new(0.0, 0.0),
+                                    egui::Vec2::new(w, h),
+                                )
+                                .allow_hover(false),
+                            );
+                        });
+                    } else {
+                        cols[1].label("Distorted — not extracted");
+                    }
+                });
+                if do_reset {
+                    self.badframe_reset_once = false;
+                }
+            });
+            // Options box: count + save-all-to-folder.
+            egui::Panel::bottom("bf_opts").show(vui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Label::new("Bad frames").selectable(false));
+                    let _ = egui::ComboBox::from_id_salt("bf_count")
+                        .selected_text(self.badframes_count.as_str())
+                        .show_ui(ui, |ui| {
+                            for v in crate::metrics::badframes::COUNT_LABELS {
+                                let _ = ui.selectable_value(
+                                    &mut self.badframes_count,
+                                    v.to_owned(),
+                                    v,
+                                );
+                            }
+                        });
+                    let can_save = !self.badframe_files.is_empty();
+                    if ui
+                        .add_enabled_ui(can_save, |ui| {
+                            ui.add(egui::Button::new("Save all to folder…"))
+                        })
+                        .inner
+                        .on_hover_text("Copy every tmp PNG of this run to a folder")
+                        .clicked()
+                        && let Some(dir) = rfd::FileDialog::new()
+                            .set_title("Save bad frames")
+                            .pick_folder()
+                    {
+                        let mut ok = 0usize;
+                        let mut fail = 0usize;
+                        for src in &self.badframe_files.clone() {
+                            let dest = dir.join(
+                                src.file_name().unwrap_or_default(),
+                            );
+                            match std::fs::copy(src, &dest) {
+                                Ok(_) => ok += 1,
+                                Err(e) => {
+                                    fail += 1;
+                                    log::warn!(target: "rfmetrics::app", "save bad frame {} failed: {e}", src.display());
+                                }
+                            }
+                        }
+                        let now = vnow;
+                        if fail == 0 {
+                            let s = if ok == 1 { "" } else { "s" };
+                            self.toast(now, format!("Saved {ok} bad-frame PNG{s}"), ToastKind::Info);
+                        } else {
+                            self.toast(
+                                now,
+                                format!("Bad frames: {ok} saved, {fail} failed"),
+                                ToastKind::Error,
+                            );
+                        }
+                    }
+                    ui.label(format!("{} PNGs in tmp", self.badframe_files.len()));
+                });
+            });
+            // Keep progress live while the worker runs (viewport repaints
+            // with the parent only on input otherwise).
+            if self.badframes_busy {
+                vui.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        });
     }
 
     /// Metric plots in their own OS window (Python `show_plot` parity,
@@ -3316,29 +3802,17 @@ impl eframe::App for RFMetricsApp {
                 {
                     self.show_plot = true;
                 }
-                // Worst-frame PNGs (original Extract bad frames parity):
-                // busy shows progress and aborts; idle needs no run lock.
-                let bf_label = if self.badframes_busy {
-                    format!("Bad frames {}/{}", self.badframe_done, self.badframe_total)
-                } else {
-                    "Bad frames".to_owned()
-                };
-                let bf_enabled = !self.measuring && (self.badframes_busy || self.ffmpeg.path.is_some());
+                // Bad-frames viewer window (tmp-backed, tabs per metric).
+                let bf_enabled = !self.measuring && self.ffmpeg.path.is_some();
                 if ui
                     .add_enabled_ui(bf_enabled, |ui| {
-                        ui.add_sized([130.0, 24.0], egui::Button::new(bf_label))
+                        ui.add_sized([130.0, 24.0], egui::Button::new("Bad frames"))
                     })
                     .inner
-                    .on_hover_text(
-                        "Save worst-N frame PNGs per finished metric beside each file (dist + -ref)",
-                    )
+                    .on_hover_text("Open the worst-frame viewer (dist/ref side by side)")
                     .clicked()
                 {
-                    if self.badframes_busy {
-                        self.stop_badframes();
-                    } else {
-                        self.start_badframes(now);
-                    }
+                    self.show_badframes = true;
                 }
                 if ui
                     .add_enabled_ui(!run_locked, |ui| {
@@ -4312,6 +4786,8 @@ impl eframe::App for RFMetricsApp {
 
         // Metric plot viewport (own OS window while open).
         self.show_plots(ui.ctx());
+        // Bad-frames viewer viewport (own OS window while open).
+        self.show_badframes(ui.ctx());
     }
 }
 #[cfg(test)]

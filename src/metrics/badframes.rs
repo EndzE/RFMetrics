@@ -86,31 +86,38 @@ pub fn ffmpeg_args(src: &str, dest: &str, offset: f64, fps: f64) -> Vec<String> 
     ]
 }
 
-/// `<dist basename>.<METRIC>.bf<NNNNNN>.png` beside the distorted file
-/// (bare filename lands in cwd, like the CSV writer).
-pub fn dest_for(dist_path: &str, kind_name: &str, frame: usize) -> PathBuf {
+/// Union fit bounds for the viewer pair: both images centered at the
+/// origin at true pixel size, so linked plots share one view.
+/// Returns `(xmin, xmax, ymin, ymax)`.
+pub fn viewer_fit(w1: u32, h1: u32, w2: u32, h2: u32) -> (f64, f64, f64, f64) {
+    let hw = w1.max(w2) as f64 / 2.0;
+    let hh = h1.max(h2) as f64 / 2.0;
+    (-hw, hw, -hh, hh)
+}
+
+/// Run-scoped tmp dir for viewer PNGs (bounded memory: 1080p RGBA stays
+/// on disk, only the visible pair becomes textures). Per-process so two
+/// instances never share it; best-effort cleanup by the caller.
+pub fn tmp_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("rfmetrics-bf-{}", std::process::id()))
+}
+
+/// `<tmp>/<dist basename>.<METRIC>.bf<NNNNNN>.png` for viewer runs.
+pub fn tmp_dest_for(tmp: &Path, dist_path: &str, kind_name: &str, frame: usize) -> PathBuf {
     let base = Path::new(dist_path)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| dist_path.to_owned());
-    let name = format!("{base}.{kind_name}.bf{frame:06}.png");
-    match Path::new(dist_path).parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.join(&name),
-        _ => PathBuf::from(&name),
-    }
+    tmp.join(format!("{base}.{kind_name}.bf{frame:06}.png"))
 }
 
 /// Same with `-ref` before the extension (original parity).
-pub fn dest_ref_for(dist_path: &str, kind_name: &str, frame: usize) -> PathBuf {
+pub fn tmp_dest_ref_for(tmp: &Path, dist_path: &str, kind_name: &str, frame: usize) -> PathBuf {
     let base = Path::new(dist_path)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| dist_path.to_owned());
-    let name = format!("{base}.{kind_name}.bf{frame:06}-ref.png");
-    match Path::new(dist_path).parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.join(&name),
-        _ => PathBuf::from(&name),
-    }
+    tmp.join(format!("{base}.{kind_name}.bf{frame:06}-ref.png"))
 }
 
 /// Run one extraction; true iff ffmpeg exited 0 and `dest` exists.

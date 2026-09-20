@@ -1,4 +1,5 @@
 use super::*;
+use std::path::Path;
 
 #[test]
 fn worst_min_takes_lowest_first() {
@@ -41,15 +42,23 @@ fn argv_matches_original_template() {
 }
 
 #[test]
-fn dest_names_match_original() {
-    let d = dest_for("C:/v/movie.mkv", "PSNR", 123);
+fn viewer_fit_centers_union() {
+    assert_eq!(viewer_fit(100, 50, 80, 60), (-50.0, 50.0, -30.0, 30.0));
+    assert_eq!(viewer_fit(0, 0, 0, 0), (0.0, 0.0, 0.0, 0.0));
+}
+
+#[test]
+fn tmp_names_match_beside_file_stems() {
+    let tmp = Path::new("tmp");
+    let d = tmp_dest_for(tmp, "C:/v/movie.mkv", "PSNR", 7);
     assert_eq!(
         d.file_name().unwrap().to_str().unwrap(),
-        "movie.mkv.PSNR.bf000123.png"
+        "movie.mkv.PSNR.bf000007.png"
     );
-    let r = dest_ref_for("C:/v/movie.mkv", "PSNR", 123);
+    let r = tmp_dest_ref_for(tmp, "C:/v/movie.mkv", "PSNR", 7);
     assert_eq!(
         r.file_name().unwrap().to_str().unwrap(),
-        "movie.mkv.PSNR.bf000123-ref.png"
+        "movie.mkv.PSNR.bf000007-ref.png"
     );
+    assert!(tmp_dir().to_string_lossy().contains("rfmetrics-bf-"));
 }
