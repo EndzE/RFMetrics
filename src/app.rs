@@ -555,6 +555,12 @@ pub struct RFMetricsApp {
     /// Metric kind of the currently executing job (last kind seen on the
     /// Progress/Series feed); drives plot tab-follow while measuring.
     live_kind: Option<MetricKind>,
+    /// Queue key (`QueueRow::key`) of the currently executing job (last
+    /// key seen on the Progress/Series feed, cleared when its `Done`
+    /// lands). The worker runs jobs sequentially but every queued cell
+    /// is marked `Running` upfront, so the sweep animates only this
+    /// cell — the rest stay static until their turn.
+    live_key: Option<String>,
     /// PSNR plot viewport open (Python `plot["win"]` parity: closing the
     /// window withdraws it, Plot reopens it).
     show_plot: bool,
@@ -717,6 +723,7 @@ impl Default for RFMetricsApp {
             saved_snapshot: crate::state::AppState::default(),
             pending_save_since: None,
             live_kind: None,
+            live_key: None,
             show_plot: false,
             plot_tab: MetricKind::Psnr,
             plot_tabs_w: 0.0,
@@ -1062,8 +1069,10 @@ impl RFMetricsApp {
                         continue;
                     }
                     // The job emitting progress is the live one: the plot
-                    // tab follows it while measuring.
+                    // tab follows it while measuring, and only its cell
+                    // animates the sweep (the rest wait statically).
                     self.live_kind = Some(kind);
+                    self.live_key = Some(key.clone());
                     if let Some(row) = self.rows.iter_mut().find(|r| r.key == key)
                         && let crate::metrics::MetricCell::Running { frame: cur, .. } =
                             row.cell_mut(kind)
@@ -1082,6 +1091,7 @@ impl RFMetricsApp {
                         continue;
                     }
                     self.live_kind = Some(kind);
+                    self.live_key = Some(key.clone());
                     if let Some(row) = self.rows.iter_mut().find(|r| r.key == key)
                         && let crate::metrics::MetricCell::Running { values, .. } =
                             row.cell_mut(kind)
@@ -1115,6 +1125,15 @@ impl RFMetricsApp {
                     if generation != self.run_generation {
                         log::debug!(target: "rfmetrics::app", "discarded stale {} result", kind.name());
                         continue;
+                    }
+                    // The finished job stops being live; the next job
+                    // takes over on its first Progress/Series (until
+                    // then no cell sweeps — the gap shows static text).
+                    // `live_kind` stays for plot tab-follow.
+                    if self.live_kind == Some(kind)
+                        && self.live_key.as_deref() == Some(key.as_str())
+                    {
+                        self.live_key = None;
                     }
                     self.pending = self.pending.saturating_sub(1);
                     // First real data for a no-live-feed tab (VMAF): it sat
@@ -1214,6 +1233,7 @@ impl RFMetricsApp {
                     }
                     self.pending = 0;
                     self.measuring = false;
+                    self.live_key = None;
                 }
                 MetricMsg::CsvReport {
                     generation,
@@ -1878,6 +1898,7 @@ impl RFMetricsApp {
         self.measuring = true;
         // Fresh run: tab-follow restarts from the first live job.
         self.live_kind = None;
+        self.live_key = None;
         if self.plot_at_start {
             self.show_plot = true;
         }
@@ -2158,6 +2179,8 @@ impl RFMetricsApp {
         self.run_generation = self.run_generation.wrapping_add(1);
         self.pending = 0;
         self.measuring = false;
+        self.live_kind = None;
+        self.live_key = None;
         for row in &mut self.rows {
             for kind in MetricKind::ALL {
                 *row.cell_mut(kind) = crate::metrics::MetricCell::Idle;
@@ -3896,6 +3919,37 @@ fn rank_fill(rank: crate::metrics::StatRank) -> Option<egui::Color32> {
     }
 }
 
+/// Indeterminate bounce position for `Running` cells: triangle wave
+/// `0 → 1 → 0`, one leg per `LEG_S` seconds. Pure (no `Ui`) so tests
+/// cover the ping-pong without a GUI harness.
+fn running_sweep_pos(time_s: f64) -> f32 {
+    const LEG_S: f64 = 0.7;
+    let phase = (time_s / LEG_S).rem_euclid(2.0);
+    (if phase < 1.0 { phase } else { 2.0 - phase }) as f32
+}
+
+/// Bold green sweep behind a `Running` cell's text: a full-height
+/// translucent `#2FA572` segment bouncing left ↔ right. Painted before
+/// the label so the `Frame: N` text stays on top; driven by the
+/// existing ~10Hz measuring heartbeat, so no extra repaint cost.
+fn paint_running_sweep(ui: &mut egui::Ui) {
+    let rect = ui.available_rect_before_wrap();
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return;
+    }
+    let x01 = running_sweep_pos(ui.input(|i| i.time));
+    let seg_w = (rect.width() * 0.28).clamp(14.0, 24.0);
+    let bar = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + (rect.width() - seg_w) * x01, rect.top()),
+        egui::vec2(seg_w, rect.height()),
+    );
+    ui.painter().rect_filled(
+        bar,
+        3.0,
+        egui::Color32::from_rgba_unmultiplied(0x2F, 0xA5, 0x72, 110),
+    );
+}
+
 /// Alt+click solo/select-all for the first-column include checkboxes
 /// (egui_plot legend parity): operates on the POST-toggle flags — the
 /// single checkbox already flipped before this runs, and the other rows
@@ -5086,9 +5140,21 @@ impl eframe::App for RFMetricsApp {
                                         if let Some(fill) = rank_fill(ranks[0]) {
                                             cell_frame = cell_frame.fill(fill);
                                         }
+                                        // Only the job on the Progress/Series feed
+                                        // sweeps; queued `Running` cells wait
+                                        // statically until their turn.
+                                        let is_live = matches!(
+                                            cell,
+                                            crate::metrics::MetricCell::Running { .. }
+                                        ) && self.live_kind == Some(kind)
+                                            && self.live_key.as_deref()
+                                                == Some(row_data.key.as_str());
                                         cell_frame.show(ui, |ui| {
                                             ui.set_width(ui.available_width());
                                             ui.centered_and_justified(|ui| {
+                                                if is_live {
+                                                    paint_running_sweep(ui);
+                                                }
                                                 // Plain non-selectable text, like the
                                                 // Path/Media columns (copy lives in
                                                 // the right-click menu).

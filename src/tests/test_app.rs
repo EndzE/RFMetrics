@@ -528,6 +528,108 @@ fn progress_and_series_track_live_kind() {
 }
 
 #[test]
+fn live_key_tracks_executing_job() {
+    use super::MetricMsg;
+    use crate::metrics::MetricCell;
+    use crate::metrics::ffmpeg::MetricKind;
+    let mut app = RFMetricsApp::default();
+    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.rows.push(psnr_test_row("C:/vids/b.mp4", true));
+    for row in &mut app.rows {
+        row.psnr = MetricCell::Running {
+            frame: 0,
+            values: Vec::new(),
+        };
+    }
+    app.run_generation = 1;
+    let key_a = norm_key("C:/vids/a.mp4");
+    let key_b = norm_key("C:/vids/b.mp4");
+    assert_eq!(app.live_key, None);
+    // Stale generation touches nothing.
+    app.metric_tx
+        .send(MetricMsg::Progress {
+            generation: 0,
+            kind: MetricKind::Psnr,
+            key: key_a.clone(),
+            frame: 5,
+        })
+        .unwrap();
+    app.drain_metric_results();
+    assert_eq!(app.live_key, None);
+    // First job goes live…
+    app.metric_tx
+        .send(MetricMsg::Progress {
+            generation: 1,
+            kind: MetricKind::Psnr,
+            key: key_a.clone(),
+            frame: 5,
+        })
+        .unwrap();
+    app.drain_metric_results();
+    assert_eq!(app.live_key, Some(key_a.clone()));
+    // …then the worker moves to the next file: only that cell is live.
+    app.metric_tx
+        .send(MetricMsg::Progress {
+            generation: 1,
+            kind: MetricKind::Psnr,
+            key: key_b.clone(),
+            frame: 3,
+        })
+        .unwrap();
+    app.drain_metric_results();
+    assert_eq!(app.live_key, Some(key_b.clone()));
+    // Its Done clears the live slot (inter-job gap shows no sweep).
+    app.metric_tx
+        .send(MetricMsg::Done {
+            generation: 1,
+            kind: MetricKind::Psnr,
+            key: key_b.clone(),
+            values: vec![30.0],
+            avg: Some(30.0),
+            exec_s: 1.0,
+            error: None,
+            skip: None,
+            clip_dur: None,
+            vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
+            fps_mode: InputFpsMode::Reference,
+        })
+        .unwrap();
+    app.drain_metric_results();
+    assert_eq!(app.live_key, None);
+    // A Done for any other job never clears a live one (ordered
+    // channel, but the guard makes it robust).
+    app.metric_tx
+        .send(MetricMsg::Progress {
+            generation: 1,
+            kind: MetricKind::Psnr,
+            key: key_a.clone(),
+            frame: 9,
+        })
+        .unwrap();
+    app.drain_metric_results();
+    assert_eq!(app.live_key, Some(key_a.clone()));
+    app.metric_tx
+        .send(MetricMsg::Done {
+            generation: 1,
+            kind: MetricKind::Psnr,
+            key: key_b.clone(),
+            values: vec![31.0],
+            avg: Some(31.0),
+            exec_s: 1.0,
+            error: None,
+            skip: None,
+            clip_dur: None,
+            vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
+            fps_mode: InputFpsMode::Reference,
+        })
+        .unwrap();
+    app.drain_metric_results();
+    assert_eq!(app.live_key, Some(key_a.clone()));
+}
+
+#[test]
 fn psnr_stale_generation_dropped() {
     use super::MetricMsg;
     use crate::metrics::MetricCell;
@@ -2979,4 +3081,19 @@ fn sort_view_orders_and_restores() {
         ),
         vec![1, 0]
     );
+}
+
+#[test]
+fn running_sweep_ping_pongs() {
+    use super::running_sweep_pos;
+    // 0.7s per leg: 0 → 1 → 0 → 1 …
+    assert!((running_sweep_pos(0.0) - 0.0).abs() < 1e-6);
+    assert!((running_sweep_pos(0.35) - 0.5).abs() < 1e-6);
+    assert!((running_sweep_pos(0.7) - 1.0).abs() < 1e-6);
+    assert!((running_sweep_pos(1.05) - 0.5).abs() < 1e-6);
+    assert!((running_sweep_pos(1.4) - 0.0).abs() < 1e-6);
+    for t in [0.1, 0.5, 0.9, 1.3, 2.0, 10.0] {
+        let p = running_sweep_pos(t);
+        assert!((0.0..=1.0).contains(&p), "pos {p} out of range at t={t}");
+    }
 }
