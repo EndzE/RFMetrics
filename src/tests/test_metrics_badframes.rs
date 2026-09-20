@@ -48,6 +48,31 @@ fn viewer_fit_centers_union() {
 }
 
 #[test]
+fn wipe_split_clamps() {
+    assert_eq!(clamp_split(0.5), 0.5);
+    assert_eq!(clamp_split(-1.0), 0.02);
+    assert_eq!(clamp_split(2.0), 0.98);
+}
+
+#[test]
+fn wipe_layout_tiles_without_gap() {
+    for f in [0.02, 0.25, 0.5, 0.9, 0.98] {
+        let l = wipe_layout(200.0, f);
+        assert!((l.left_cx + l.left_w / 2.0 - l.div_x).abs() < 1e-9);
+        assert!((l.right_cx - l.right_w / 2.0 - l.div_x).abs() < 1e-9);
+        assert!(((l.left_w + l.right_w) - 200.0).abs() < 1e-9);
+    }
+    let l = wipe_layout(200.0, 0.5);
+    assert!((l.div_x).abs() < 1e-9);
+    assert!((l.left_cx + 50.0).abs() < 1e-9);
+    assert!((l.right_cx - 50.0).abs() < 1e-9);
+    assert_eq!(l.u, 0.5);
+    // Out-of-range splits clamp to the draggable band.
+    assert_eq!(wipe_layout(200.0, -5.0).u, 0.02);
+    assert_eq!(wipe_layout(200.0, 5.0).u, 0.98);
+}
+
+#[test]
 fn tmp_names_match_beside_file_stems() {
     let tmp = Path::new("tmp");
     let d = tmp_dest_for(tmp, "C:/v/movie.mkv", "PSNR", 7);

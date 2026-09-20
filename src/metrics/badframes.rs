@@ -95,6 +95,41 @@ pub fn viewer_fit(w1: u32, h1: u32, w2: u32, h2: u32) -> (f64, f64, f64, f64) {
     (-hw, hw, -hh, hh)
 }
 
+/// Wipe divider fraction clamped to a draggable interior band so the
+/// line never collapses fully to an edge (keeps a grab target).
+pub fn clamp_split(v: f32) -> f32 {
+    v.clamp(0.02, 0.98)
+}
+
+/// Wipe geometry for the slider view in plot units: both frames share a
+/// `w`-wide box centered at the origin (smaller frame stretches, matching
+/// the stretch-to-same-rect decision). `u` is the shared texture seam:
+/// left shows UV `[0, u]`, right shows `[u, 1]`, divider at `div_x`.
+/// (Callers put ref left / dist right, like the side-by-side view.)
+pub struct WipeLayout {
+    pub div_x: f64,
+    pub left_cx: f64,
+    pub left_w: f64,
+    pub right_cx: f64,
+    pub right_w: f64,
+    pub u: f32,
+}
+
+pub fn wipe_layout(w: f64, split: f32) -> WipeLayout {
+    let u = clamp_split(split);
+    let div_x = -w / 2.0 + w * f64::from(u);
+    let left_w = (div_x + w / 2.0).max(0.0);
+    let right_w = (w / 2.0 - div_x).max(0.0);
+    WipeLayout {
+        div_x,
+        left_cx: -w / 2.0 + left_w / 2.0,
+        left_w,
+        right_cx: div_x + right_w / 2.0,
+        right_w,
+        u,
+    }
+}
+
 /// Run-scoped tmp dir for viewer PNGs (bounded memory: 1080p RGBA stays
 /// on disk, only the visible pair becomes textures). Per-process so two
 /// instances never share it; best-effort cleanup by the caller.

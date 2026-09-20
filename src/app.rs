@@ -568,6 +568,16 @@ pub struct RFMetricsApp {
     /// Last selection the viewer plots were fit for; a change arms
     /// `badframe_reset_once` so every tab/file/frame lands fit.
     badframe_view_key: Option<(MetricKind, String, usize)>,
+    /// Overlay compare mode: false = side-by-side plots (default),
+    /// true = single wipe view with a draggable divider.
+    badframe_slider: bool,
+    /// Wipe divider fraction (0..1, ref on the left). Drag-only.
+    badframe_split: f32,
+    /// Last-frame divider screen x for pre-show pan suppression
+    /// (NaN until the wipe plot paints once).
+    badframe_div_sx: f32,
+    /// Divider drag in progress: keeps plot pan off while held.
+    badframe_div_drag: bool,
     badframe_tex_dist: Option<egui::TextureHandle>,
     badframe_tex_ref: Option<egui::TextureHandle>,
     badframe_tex_key: Option<(String, MetricKind, usize)>,
@@ -680,6 +690,10 @@ impl Default for RFMetricsApp {
             badframe_frame_pos: 0,
             badframe_reset_once: false,
             badframe_view_key: None,
+            badframe_slider: false,
+            badframe_split: 0.5,
+            badframe_div_sx: f32::NAN,
+            badframe_div_drag: false,
             badframe_tex_dist: None,
             badframe_tex_ref: None,
             badframe_tex_key: None,
@@ -2567,6 +2581,11 @@ impl RFMetricsApp {
                     {
                         self.badframe_reset_once = true;
                     }
+                    ui.separator();
+                    ui.selectable_value(&mut self.badframe_slider, false, "Side")
+                        .on_hover_text("Distorted and reference side by side");
+                    ui.selectable_value(&mut self.badframe_slider, true, "Slider")
+                        .on_hover_text("Before/after wipe — drag the divider");
                 });
             });
             // Side-by-side pair as linked plots (shared zoom/pan): both
@@ -2587,6 +2606,207 @@ impl RFMetricsApp {
                 self.badframe_reset_once = true;
             }
             egui::CentralPanel::default().show(vui, |ui| {
+                // Overlay wipe as a single plot: UV-cropped halves tile
+                // exactly at the divider (dist left, ref right), so stock
+                // plot gestures give pan (drag), zoom (scroll/box) and
+                // double-click fit. Divider drag suppresses pan via last
+                // frame's divider screen x. No default bounds: auto-bounds
+                // + expanding aspect contain-fits the pair (never crops),
+                // on first show, Reset view, double-click and selection
+                // change alike.
+                if self.badframe_slider {
+                    let dist = self.badframe_tex_dist.clone();
+                    let refr = self.badframe_tex_ref.clone();
+                    match (dist, refr) {
+                        (Some(d), Some(r)) => {
+                            ui.label("Reference (left) | Distorted (right) — drag divider to compare · drag to pan · scroll to zoom · double-click to fit");
+                            let (ds, rs) = (d.size(), r.size());
+                            let w = ds[0].max(rs[0]) as f64;
+                            let h = ds[1].max(rs[1]) as f64;
+                            let lay = crate::metrics::badframes::wipe_layout(
+                                w,
+                                self.badframe_split,
+                            );
+                            let hover_x = ui
+                                .ctx()
+                                .pointer_hover_pos()
+                                .map(|p| p.x)
+                                .unwrap_or(f32::NAN);
+                            let suppress = self.badframe_div_drag
+                                || (self.badframe_div_sx.is_finite()
+                                    && (hover_x - self.badframe_div_sx).abs() <= 10.0);
+                            let do_reset = self.badframe_reset_once;
+                            let plot = egui_plot::Plot::new("bf-wipe")
+                                .data_aspect(1.0)
+                                .show_grid(false)
+                                .show_axes(false)
+                                .show_crosshair(false)
+                                .allow_drag(!suppress);
+                            let plot = if do_reset { plot.reset() } else { plot };
+                            let u = lay.u;
+                            let resp = plot.show(ui, |plot_ui| {
+                                plot_ui.image(
+                                    egui_plot::PlotImage::new(
+                                        "bf-wipe-ref",
+                                        r.id(),
+                                        egui_plot::PlotPoint::new(lay.left_cx, 0.0),
+                                        egui::Vec2::new(lay.left_w as f32, h as f32),
+                                    )
+                                    .uv(egui::Rect::from_min_max(
+                                        egui::Pos2::new(0.0, 0.0),
+                                        egui::Pos2::new(u, 1.0),
+                                    ))
+                                    .allow_hover(false),
+                                );
+                                plot_ui.image(
+                                    egui_plot::PlotImage::new(
+                                        "bf-wipe-dist",
+                                        d.id(),
+                                        egui_plot::PlotPoint::new(lay.right_cx, 0.0),
+                                        egui::Vec2::new(lay.right_w as f32, h as f32),
+                                    )
+                                    .uv(egui::Rect::from_min_max(
+                                        egui::Pos2::new(u, 0.0),
+                                        egui::Pos2::new(1.0, 1.0),
+                                    ))
+                                    .allow_hover(false),
+                                );
+                                plot_ui.line(
+                                    egui_plot::Line::new(
+                                        "bf-wipe-div",
+                                        egui_plot::PlotPoints::new(vec![
+                                            [lay.div_x, -h / 2.0],
+                                            [lay.div_x, h / 2.0],
+                                        ]),
+                                    )
+                                    .color(egui::Color32::WHITE)
+                                    .width(2.0)
+                                    .allow_hover(false),
+                                );
+                            });
+                            let p0 = resp.transform.position_from_point(
+                                &egui_plot::PlotPoint::new(-w / 2.0, -h / 2.0),
+                            );
+                            let p1 = resp.transform.position_from_point(
+                                &egui_plot::PlotPoint::new(w / 2.0, h / 2.0),
+                            );
+                            let img = egui::Rect::from_two_pos(p0, p1);
+                            let sx = resp
+                                .transform
+                                .position_from_point(&egui_plot::PlotPoint::new(
+                                    lay.div_x, 0.0,
+                                ))
+                                .x;
+                            self.badframe_div_sx = sx;
+                            // Overlay follows the visible image area so tags,
+                            // handle and grab stay on screen while zoomed or
+                            // panned (half-centers drift off-screen).
+                            let frame = resp.response.rect;
+                            let vis = img.intersect(frame);
+                            let painter =
+                                ui.painter_at(frame).with_clip_rect(frame);
+                            let font = egui::TextStyle::Small.resolve(ui.style());
+                            if vis.is_positive() {
+                                let y = vis.min.y + 16.0;
+                                for (lo, hi, tag) in [
+                                    (img.min.x, sx, "REF"),
+                                    (sx, img.max.x, "DIST"),
+                                ] {
+                                    let (vlo, vhi) =
+                                        (lo.max(vis.min.x), hi.min(vis.max.x));
+                                    let galley = painter.layout_no_wrap(
+                                        tag.to_owned(),
+                                        font.clone(),
+                                        egui::Color32::WHITE,
+                                    );
+                                    let half = galley.size().x / 2.0 + 8.0;
+                                    if vhi - vlo < half * 2.0 + 4.0 {
+                                        continue;
+                                    }
+                                    let c = egui::Pos2::new((vlo + vhi) / 2.0, y);
+                                    let bg = egui::Rect::from_center_size(
+                                        c,
+                                        galley.size() + egui::Vec2::new(12.0, 4.0),
+                                    );
+                                    painter.rect_filled(
+                                        bg,
+                                        4.0,
+                                        egui::Color32::from_black_alpha(150),
+                                    );
+                                    painter.text(
+                                        c,
+                                        egui::Align2::CENTER_CENTER,
+                                        tag,
+                                        font.clone(),
+                                        egui::Color32::WHITE,
+                                    );
+                                }
+                                if sx >= vis.min.x && sx <= vis.max.x {
+                                    let hy = img
+                                        .center()
+                                        .y
+                                        .clamp(vis.min.y, vis.max.y);
+                                    painter.circle_filled(
+                                        egui::Pos2::new(sx, hy),
+                                        9.0,
+                                        egui::Color32::from_black_alpha(160),
+                                    );
+                                    painter.circle_stroke(
+                                        egui::Pos2::new(sx, hy),
+                                        9.0,
+                                        egui::Stroke::new(1.5, egui::Color32::WHITE),
+                                    );
+                                }
+                            }
+                            let grab = egui::Rect::from_x_y_ranges(
+                                (sx - 8.0)..=(sx + 8.0),
+                                vis.y_range(),
+                            )
+                            .intersect(frame);
+                            let grab = if grab.is_positive() {
+                                grab
+                            } else {
+                                egui::Rect::from_center_size(
+                                    frame.center(),
+                                    egui::Vec2::ZERO,
+                                )
+                            };
+                            let grab_resp = ui.interact(
+                                grab,
+                                ui.id().with("bf_wipe_grab"),
+                                egui::Sense::drag(),
+                            );
+                            if grab_resp.hovered() || grab_resp.dragged() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
+                            }
+                            if grab_resp.dragged()
+                                && let Some(pos) = grab_resp.interact_pointer_pos()
+                                && img.width() > 10.0
+                            {
+                                self.badframe_split =
+                                    crate::metrics::badframes::clamp_split(
+                                        (pos.x - img.min.x) / img.width(),
+                                    );
+                            }
+                            self.badframe_div_drag = grab_resp.dragged();
+                            if do_reset {
+                                self.badframe_reset_once = false;
+                            }
+                        }
+                        (Some(d), None) => {
+                            let _ = (d,);
+                            ui.label("Reference — not extracted");
+                        }
+                        (None, Some(r)) => {
+                            let _ = (r,);
+                            ui.label("Distorted — not extracted");
+                        }
+                        (None, None) => {
+                            ui.label("Extract frames to compare");
+                        }
+                    }
+                    return;
+                }
                 // Union-fit defaults (stored memory wins once the user
                 // pans/zooms within a selection).
                 let (dxmin, dxmax, dymin, dymax) =
