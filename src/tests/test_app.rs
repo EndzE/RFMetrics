@@ -57,10 +57,23 @@ fn drop_routing() {
     assert_eq!(route_drop(false, false, false, files()), DropAction::Ignore);
 }
 
+#[cfg(windows)]
 #[test]
 fn same_file_keys_equal() {
     assert_eq!(norm_key("C:/Vids/a.mp4"), norm_key("c:\\vids\\A.MP4"));
     assert_ne!(norm_key("C:/Vids/a.mp4"), norm_key("C:/Vids/b.mp4"));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn posix_keys_keep_separators_and_case() {
+    // `foo\bar` is a legal literal filename on Unix, distinct from `foo/bar`.
+    assert_ne!(
+        norm_key("/vids/foo/bar.mp4"),
+        norm_key("/vids/foo\\bar.mp4")
+    );
+    assert_ne!(norm_key("/vids/a.mp4"), norm_key("/vids/A.MP4"));
+    assert_ne!(norm_key("/vids/a.mp4"), norm_key("/vids/b.mp4"));
 }
 
 #[test]

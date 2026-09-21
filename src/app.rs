@@ -116,17 +116,29 @@ const VIDEO_EXTS: &[&str] = &[
 ];
 
 /// Python `normcase(abspath)` equivalent for the same-file guard rail.
+/// Windows: lowercase + `/` -> `\`. POSIX `normcase` is the identity, so
+/// Unix keeps separators and case as-is (`foo/bar` vs `foo\bar` are distinct).
 fn norm_key(p: &str) -> String {
     let path = Path::new(p);
     let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir().unwrap_or_default().join(path)
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(e) => {
+                log::warn!(target: "rfmetrics::app", "current_dir failed ({e}); norm_key falling back to relative path for \"{p}\"");
+                std::path::PathBuf::new().join(path)
+            }
+        }
     };
-    let s = abs.to_string_lossy().replace('/', "\\");
     #[cfg(windows)]
-    let s = s.to_lowercase();
-    s
+    {
+        abs.to_string_lossy().replace('/', "\\").to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        abs.to_string_lossy().into_owned()
+    }
 }
 
 /// Reveal a queued file in the OS file manager without blocking the UI.
@@ -370,6 +382,18 @@ struct BadframeExportJob {
     dest_ref: std::path::PathBuf,
 }
 
+/// Tmp-to-destination copy for an already-extracted pair (exports exactly
+/// what the viewer shows). Runs in the export worker, never on the UI
+/// thread — batch scopes copy hundreds of multi-MB PNGs.
+struct BadframeExportCopy {
+    tmp_dist: std::path::PathBuf,
+    tmp_ref: std::path::PathBuf,
+    dest_dist: std::path::PathBuf,
+    dest_ref: std::path::PathBuf,
+    name: &'static str,
+    frame: usize,
+}
+
 /// Frozen-at-click export plan: no UI borrows cross into the thread.
 struct BadframeExportPlan {
     ffmpeg: std::path::PathBuf,
@@ -378,8 +402,8 @@ struct BadframeExportPlan {
     jobs: Vec<BadframeExportJob>,
 }
 
-/// Pending export summary: tmp copies already done; worker PNGs are added
-/// on Finished, then toasted (viewer tmp/textures untouched).
+/// Pending export summary: worker copies + PNGs land here on Finished,
+/// then toasted (viewer tmp/textures untouched).
 struct BadframeExportPending {
     copied: usize,
     failed: Vec<String>,
@@ -1902,7 +1926,10 @@ impl RFMetricsApp {
         if self.plot_at_start {
             self.show_plot = true;
         }
-        self.abort.store(false, std::sync::atomic::Ordering::SeqCst);
+        // Fresh Arcs per run: a zombie from Reset keeps the old Arc
+        // (still aborted) instead of observing a shared store(false).
+        self.abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.current_child = Arc::new(Mutex::new(None));
         let tx = self.metric_tx.clone();
         let generation = self.run_generation;
         let ref_path = self.ref_path.clone();
@@ -2140,8 +2167,7 @@ impl RFMetricsApp {
 
     /// Signal the worker to stop and kill the in-flight ffmpeg, if any.
     /// Shared with `reset_psnr` so Reset never leaves an orphaned run.
-    /// The reap is bounded: a wedged child is detached onto a reaper
-    /// thread instead of blocking the UI.
+    /// Never blocks the UI: the reap runs on a detached thread.
     fn abort_worker(&self) {
         use std::sync::atomic::Ordering;
         self.abort.store(true, Ordering::SeqCst);
@@ -2149,15 +2175,15 @@ impl RFMetricsApp {
             && let Some(mut child) = slot.take()
         {
             let _ = child.kill();
-            match wait_timeout::ChildExt::wait_timeout(&mut child, crate::cmd::REAP_TIMEOUT) {
-                Ok(Some(_)) => {}
-                _ => {
-                    log::error!(target: "rfmetrics::app", "stop reap timed out after {:?} — detaching child", crate::cmd::REAP_TIMEOUT);
-                    std::thread::spawn(move || {
+            std::thread::spawn(move || {
+                match wait_timeout::ChildExt::wait_timeout(&mut child, crate::cmd::REAP_TIMEOUT) {
+                    Ok(Some(_)) => {}
+                    _ => {
+                        log::error!(target: "rfmetrics::app", "stop reap timed out after {:?} — child still alive", crate::cmd::REAP_TIMEOUT);
                         let _ = child.wait();
-                    });
+                    }
                 }
-            }
+            });
         }
     }
 
@@ -2536,8 +2562,7 @@ impl RFMetricsApp {
                     .next()
                     .unwrap_or(30.0)
             });
-        let mut copied = 0usize;
-        let mut failed: Vec<String> = Vec::new();
+        let mut copied = Vec::new();
         let mut jobs: Vec<BadframeExportJob> = Vec::new();
         for p in pairs {
             let name = p.kind.name();
@@ -2568,13 +2593,16 @@ impl RFMetricsApp {
                 true,
             );
             if tmp_d.is_file() && tmp_r.is_file() {
-                match (
-                    std::fs::copy(&tmp_d, &dest_d),
-                    std::fs::copy(&tmp_r, &dest_r),
-                ) {
-                    (Ok(_), Ok(_)) => copied += 2,
-                    _ => failed.push(format!("{name} frame {}", p.frame)),
-                }
+                // Collected for the worker below: batch scopes copy
+                // hundreds of multi-MB PNGs, never on the UI thread.
+                copied.push(BadframeExportCopy {
+                    tmp_dist: tmp_d,
+                    tmp_ref: tmp_r,
+                    dest_dist: dest_d,
+                    dest_ref: dest_r,
+                    name,
+                    frame: p.frame,
+                });
             } else {
                 jobs.push(BadframeExportJob {
                     kind: p.kind,
@@ -2592,8 +2620,8 @@ impl RFMetricsApp {
         } else {
             export_dir
         };
-        if jobs.is_empty() {
-            self.toast_export(now, copied, failed, &dest_note);
+        if jobs.is_empty() && copied.is_empty() {
+            self.toast_export(now, 0, Vec::new(), &dest_note);
             return;
         }
         let plan = BadframeExportPlan {
@@ -2602,14 +2630,14 @@ impl RFMetricsApp {
             ref_fps,
             jobs,
         };
-        let total = plan.jobs.len() * 2;
+        let total = copied.len() * 2 + plan.jobs.len() * 2;
         self.badframes_busy = true;
         self.badframe_done = 0;
         self.badframe_total = total;
         self.badframe_abort.store(false, Ordering::SeqCst);
         self.badframe_export_pending = Some(BadframeExportPending {
-            copied,
-            failed,
+            copied: 0,
+            failed: Vec::new(),
             dest_note,
         });
         let tx = self.badframe_tx.clone();
@@ -2619,6 +2647,19 @@ impl RFMetricsApp {
             let mut ok = 0usize;
             let mut errors: Vec<String> = Vec::new();
             let mut done = 0usize;
+            // Tmp copies first: local and quick, so no abort gate (Stop
+            // semantics today only interrupt extracts between frames).
+            for c in &copied {
+                match (
+                    std::fs::copy(&c.tmp_dist, &c.dest_dist),
+                    std::fs::copy(&c.tmp_ref, &c.dest_ref),
+                ) {
+                    (Ok(_), Ok(_)) => ok += 2,
+                    _ => errors.push(format!("{} frame {}", c.name, c.frame)),
+                }
+                done += 2;
+                let _ = tx.send(BadframeMsg::Progress { done, total });
+            }
             for job in &plan.jobs {
                 for (src, fps, dest) in [
                     (job.dist_src.as_str(), job.dist_fps, job.dest_dist.clone()),
@@ -2641,7 +2682,7 @@ impl RFMetricsApp {
             }
             let _ = tx.send(BadframeMsg::Finished { ok, errors });
         });
-        log::info!(target: "rfmetrics::app", "bad-frames export started: {} extracts", total);
+        log::info!(target: "rfmetrics::app", "bad-frames export started: {} files", total);
     }
 
     /// Drain bad-frames progress; returns true on activity. Viewer runs
