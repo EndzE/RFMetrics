@@ -1995,6 +1995,48 @@ fn state_apply_unticks_unsupported_filters() {
     assert!(!app.m_vmaf);
 }
 
+/// FFVship parity with Issue #7: restored ticks for the FFVship family are
+/// forced off when the binary is absent/unusable (their header checkboxes
+/// render disabled), while usable binaries keep restored ticks.
+#[test]
+fn state_apply_unticks_ffvship_when_unusable() {
+    use crate::metrics::ffmpeg::MetricKind;
+    let state = || crate::state::AppState {
+        metrics: crate::state::MetricsState {
+            psnr: Some(true),
+            ssim2: Some(true),
+            butteraugli: Some(true),
+            cvvdp: Some(true),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    // Unusable binary: family ticks cleared, ffmpeg ticks kept.
+    let mut app = RFMetricsApp::default();
+    app.ffmpeg.supported_metrics = vec![
+        MetricKind::Psnr,
+        MetricKind::Ssim,
+        MetricKind::Vmaf,
+        MetricKind::Xpsnr,
+    ];
+    app.ffvship.usable = false;
+    app.apply_state(Some(state()));
+    assert!(app.m_psnr);
+    assert!(!app.m_ssim2 && !app.m_but && !app.m_cvvdp);
+    // Usable binary: restored family ticks survive.
+    let mut app = RFMetricsApp::default();
+    app.ffmpeg.supported_metrics = vec![
+        MetricKind::Psnr,
+        MetricKind::Ssim,
+        MetricKind::Vmaf,
+        MetricKind::Xpsnr,
+    ];
+    app.ffvship.usable = true;
+    app.apply_state(Some(state()));
+    assert!(app.m_psnr);
+    assert!(app.m_ssim2 && app.m_but && app.m_cvvdp);
+}
+
 /// Issue #7 backstop: a ticked-but-unsupported metric never reaches
 /// the worker — with nothing runnable Start is a no-op toast.
 #[test]

@@ -1420,7 +1420,10 @@ impl RFMetricsApp {
 
     /// Issue #7: force off restored/default ticks for filters this ffmpeg
     /// build lacks (their header checkboxes are disabled, so they were
-    /// never ticked live). Session-only capability, never persisted.
+    /// never ticked live). Same for the FFVship family when the binary is
+    /// absent or unusable (wrong-GPU build): its header checkboxes render
+    /// disabled, so restored ticks are cleared too. Session-only
+    /// capability, never persisted.
     /// Idempotent: safe to run for both the no-file and restored paths.
     fn untick_unsupported_metrics(&mut self) {
         let supported = &self.ffmpeg.supported_metrics;
@@ -1435,6 +1438,11 @@ impl RFMetricsApp {
         }
         if !supported.contains(&MetricKind::Xpsnr) {
             self.m_xpsnr = false;
+        }
+        if !self.ffvship.usable {
+            self.m_ssim2 = false;
+            self.m_but = false;
+            self.m_cvvdp = false;
         }
     }
 
@@ -4930,8 +4938,11 @@ impl eframe::App for RFMetricsApp {
                             });
                             // Issue #7: copy support out first — the loop takes
                             // `&mut` flag borrows, so no shared `self` borrow
-                            // may live across it. FFVship metrics ride the
-                            // binary-level `usable` gate instead (start_run).
+                            // may live across it. FFVship readiness rides the
+                            // same pattern (`usable` covers absent + wrong-GPU
+                            // builds); its disabled hover shows the binary
+                            // detail (path / GPU-mismatch hint) instead of
+                            // the ffmpeg filter text below.
                             let (psnr_ok, ssim_ok, vmaf_ok, xpsnr_ok) = {
                                 let sup = &self.ffmpeg.supported_metrics;
                                 (
@@ -4941,14 +4952,16 @@ impl eframe::App for RFMetricsApp {
                                     sup.contains(&MetricKind::Xpsnr),
                                 )
                             };
+                            let ffvship_ok = self.ffvship.usable;
+                            let ffvship_detail = self.ffvship.detail.clone();
                             for (flag, name, ok, kind) in [
                                 (&mut self.m_psnr, "PSNR", psnr_ok, MetricKind::Psnr),
                                 (&mut self.m_ssim, "SSIM", ssim_ok, MetricKind::Ssim),
                                 (&mut self.m_vmaf, "VMAF", vmaf_ok, MetricKind::Vmaf),
                                 (&mut self.m_xpsnr, "XPSNR", xpsnr_ok, MetricKind::Xpsnr),
-                                (&mut self.m_ssim2, "SSIM2", true, MetricKind::Ssim2),
-                                (&mut self.m_but, "BUTTER", true, MetricKind::But),
-                                (&mut self.m_cvvdp, "CVVDP", true, MetricKind::Cvvdp),
+                                (&mut self.m_ssim2, "SSIM2", ffvship_ok, MetricKind::Ssim2),
+                                (&mut self.m_but, "BUTTER", ffvship_ok, MetricKind::But),
+                                (&mut self.m_cvvdp, "CVVDP", ffvship_ok, MetricKind::Cvvdp),
                             ] {
                                 header.col(|ui| vline(ui, egui::Color32::from_gray(0x8A)));
                                 header.col(|ui| {
@@ -4975,9 +4988,13 @@ impl eframe::App for RFMetricsApp {
                                         egui::Checkbox::new(flag, name),
                                     );
                                     if !ok {
-                                        resp.on_hover_text(format!(
-                                            "{name} filter not supported by this ffmpeg build"
-                                        ));
+                                        if kind.is_ffvship() {
+                                            resp.on_hover_text(&ffvship_detail);
+                                        } else {
+                                            resp.on_hover_text(format!(
+                                                "{name} filter not supported by this ffmpeg build"
+                                            ));
+                                        }
                                     }
                                 });
                             }
