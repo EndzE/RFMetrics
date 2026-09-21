@@ -181,11 +181,8 @@ fn follow_live_tab_switches_only_while_measuring() {
     );
 }
 
-fn dec_pts(ys: &[f64]) -> Vec<egui_plot::PlotPoint> {
-    ys.iter()
-        .enumerate()
-        .map(|(i, &y)| egui_plot::PlotPoint::new(i as f64 + 1.0, y))
-        .collect()
+fn xs(points: &egui_plot::PlotPoints) -> Vec<f64> {
+    points.points().iter().map(|p| p.x).collect()
 }
 
 fn ys(points: &egui_plot::PlotPoints) -> Vec<f64> {
@@ -194,8 +191,14 @@ fn ys(points: &egui_plot::PlotPoints) -> Vec<f64> {
 
 #[test]
 fn decimate_passes_through_small_series() {
-    let pts = dec_pts(&[1.0, 2.0, 3.0]);
-    assert_eq!(ys(&decimate_minmax(&pts, 512)), vec![1.0, 2.0, 3.0]);
+    assert_eq!(
+        ys(&decimate_minmax(&[1.0, 2.0, 3.0], 512)),
+        vec![1.0, 2.0, 3.0]
+    );
+    assert_eq!(
+        xs(&decimate_minmax(&[1.0, 2.0, 3.0], 512)),
+        vec![1.0, 2.0, 3.0]
+    );
     assert!(decimate_minmax(&[], 512).points().is_empty());
 }
 
@@ -215,7 +218,6 @@ fn per_frame_rebuild_budget() {
         })
         .collect();
     let borrowed: Vec<&[f64]> = raw.iter().map(Vec::as_slice).collect();
-    let points: Vec<Vec<egui_plot::PlotPoint>> = raw.iter().map(|v| dec_pts(v)).collect();
     let n = 100;
     let t0 = std::time::Instant::now();
     for _ in 0..n {
@@ -225,8 +227,8 @@ fn per_frame_rebuild_budget() {
     let t1 = std::time::Instant::now();
     let mut lens = 0;
     for _ in 0..n {
-        for p in &points {
-            lens += decimate_minmax(p, 1000).points().len();
+        for v in &raw {
+            lens += decimate_minmax(v, 1000).points().len();
         }
     }
     let dec = t1.elapsed();
@@ -251,8 +253,7 @@ fn decimate_keeps_endpoints_and_spikes() {
     let mut raw: Vec<f64> = (0..1001).map(|i| 40.0 + (i as f64 * 0.01).sin()).collect();
     raw[500] = 90.0;
     raw[700] = 10.0;
-    let pts = dec_pts(&raw);
-    let thin = decimate_minmax(&pts, 100);
+    let thin = decimate_minmax(&raw, 100);
     let got = thin.points();
     assert!(got.len() <= 104, "len {}", got.len());
     // Endpoints preserved (line meets the axes where it should).

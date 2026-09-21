@@ -42,13 +42,12 @@ struct QueueRow {
 /// Cached per-row stats + cross-row ranks for one metric column (H1: the
 /// values-vec clone+sort in `DoneStats::new` and the rank scan run on
 /// result arrival, not per frame; the render loop only reads).
-/// `points` is the same idea for the plot: built/extended on arrival,
-/// so the render loop never rebuilds `PlotPoints` per frame.
+/// Plot lines decimate directly from the cell `values` (`x = i+1.0`) at
+/// draw time, capped at ~8192 points — no full-res `PlotPoint` cache.
 #[derive(Debug, Clone, Default)]
 struct CachedStats {
     stats: Option<crate::metrics::DoneStats>,
     ranks: [crate::metrics::StatRank; 10],
-    points: Vec<egui_plot::PlotPoint>,
     /// Rendered Done text (`format!("{avg:.4}")`), frozen at Done arrival
     /// so the table loop never formats per frame. Cleared wherever `stats`
     /// is cleared (rerun start, Reset via wholesale `default()`).
@@ -1120,16 +1119,9 @@ impl RFMetricsApp {
                         && let crate::metrics::MetricCell::Running { values, .. } =
                             row.cell_mut(kind)
                     {
-                        // Points mirror values 1:1 (x = 1-based frame), so
-                        // the plot borrows them instead of rebuilding.
-                        let base = values.len() as f64;
+                        // Live curve feeds straight from `values` (plot
+                        // decimates at draw time, x = 1-based frame).
                         values.extend_from_slice(&new_values);
-                        row.cached_mut(kind).points.extend(
-                            new_values
-                                .iter()
-                                .enumerate()
-                                .map(|(i, &v)| egui_plot::PlotPoint::new(base + i as f64 + 1.0, v)),
-                        );
                     }
                 }
                 MetricMsg::Done {
@@ -1203,23 +1195,11 @@ impl RFMetricsApp {
                         };
                         // Cache the stats once (clone+sort lives here, not
                         // per frame); ranks refresh below for this metric.
-                        // Points likewise: the plot borrows them instead of
-                        // rebuilding `PlotPoints` every frame. Anything but
-                        // `Done` clears (stale partials must never render).
                         let stats = row.cell(kind).done_stats();
-                        let points = match row.cell(kind) {
-                            crate::metrics::MetricCell::Done { values, .. } => values
-                                .iter()
-                                .enumerate()
-                                .map(|(i, &v)| egui_plot::PlotPoint::new(i as f64 + 1.0, v))
-                                .collect(),
-                            _ => Vec::new(),
-                        };
                         // Rendered text frozen once per result (the table loop
                         // borrows it instead of formatting per frame).
                         let text = row.cell(kind).cell_text();
                         row.cached_mut(kind).stats = stats;
-                        row.cached_mut(kind).points = points;
                         row.cached_mut(kind).text = text;
                         row.cached_mut(kind).finished =
                             matches!(row.cell(kind), crate::metrics::MetricCell::Done { .. })
@@ -1893,10 +1873,8 @@ impl RFMetricsApp {
                         values: Vec::new(),
                     };
                     // Leaving the scored set: drop the cached stats now so
-                    // the refresh below can't rank a stale value, and drop
-                    // cached points (capacity kept for the rerun).
+                    // the refresh below can't rank a stale value.
                     self.rows[i].cached_mut(*kind).stats = None;
-                    self.rows[i].cached_mut(*kind).points.clear();
                     self.rows[i].cached_mut(*kind).text.clear();
                     self.rows[i].cached_mut(*kind).finished = None;
                 }
@@ -3395,10 +3373,8 @@ impl RFMetricsApp {
             // mid-run Plot click shows history; painting itself only
             // happens here, i.e. never unseen.
             let mut any_running = false;
-            // Names + values feed fit/hover; `points` feeds the lines
-            // directly from cache (built on arrival — zero per-frame
-            // allocs). Invariant: points mirrors values for Done/Running
-            // cells (drain maintains both; anything else is ignored).
+            // Names + values feed fit/hover and the drawn lines (decimated
+            // at draw time, x = 1-based frame — no full-res point cache).
             // First-column `include` doubles as plot visibility (#3):
             // unchecked rows are excluded from runs (start_run) and hidden
             // here, so fit/hover/export below re-fit to visible only.
@@ -3407,7 +3383,7 @@ impl RFMetricsApp {
             // `done` carries the row's permanent color slot alongside the
             // display name so lines/export use the stable per-file color
             // (hiding or removing one curve never recolors the rest).
-            let done: Vec<(&str, usize, &[f64], &[egui_plot::PlotPoint])> = self
+            let done: Vec<(&str, usize, &[f64])> = self
                 .rows
                 .iter()
                 .filter(|r| r.include)
@@ -3415,28 +3391,18 @@ impl RFMetricsApp {
                     crate::metrics::MetricCell::Done { values, .. }
                         if !values.is_empty() =>
                     {
-                        Some((
-                            r.display.as_str(),
-                            r.color_idx,
-                            values.as_slice(),
-                            r.cached(kind).points.as_slice(),
-                        ))
+                        Some((r.display.as_str(), r.color_idx, values.as_slice()))
                     }
                     crate::metrics::MetricCell::Running { values, .. }
                         if !values.is_empty() =>
                     {
                         any_running = true;
-                        Some((
-                            r.display.as_str(),
-                            r.color_idx,
-                            values.as_slice(),
-                            r.cached(kind).points.as_slice(),
-                        ))
+                        Some((r.display.as_str(), r.color_idx, values.as_slice()))
                     }
                     _ => None,
                 })
                 .collect();
-            let borrowed: Vec<&[f64]> = done.iter().map(|(_, _, v, _)| *v).collect();
+            let borrowed: Vec<&[f64]> = done.iter().map(|(_, _, v)| *v).collect();
             let fresh = crate::plot::fit_limits(&borrowed, def.lo, def.hi);
             // Grow-only live bounds: axes expand with arriving points but
             // never jump inward mid-run; cleared once all settle so the
@@ -3680,7 +3646,7 @@ impl RFMetricsApp {
                         // cannot borrow `done`/`self.rows`.
                         let owned: Vec<(String, usize, Vec<f64>)> = done
                             .iter()
-                            .map(|(n, s, v, _)| ((*n).to_owned(), *s, (*v).to_vec()))
+                            .map(|(n, s, v)| ((*n).to_owned(), *s, (*v).to_vec()))
                             .collect();
                         let title = crate::plot::tab_title(kind).to_owned();
                         let y_label = def.label.to_owned();
@@ -3768,14 +3734,13 @@ impl RFMetricsApp {
                     .default_x_bounds(xmin, xmax)
                     .default_y_bounds(ymin, ymax)
                     .show(ui, |plot_ui| {
-                        // Lines borrow cached points, min-max decimated to
-                        // ~2 px buckets (values still feed fit + hover at
-                        // full resolution).
+                        // Lines decimate from values to ~2 px buckets (fit +
+                        // hover still use full resolution).
                         // Stable per-file colors: keyed by permanent queue
                         // slot, so hiding/removing one curve never recolors
                         // the rest.
-                        for (name, slot, _, points) in &done {
-                            let thin = crate::plot::decimate_minmax(points, target);
+                        for (name, slot, values) in &done {
+                            let thin = crate::plot::decimate_minmax(values, target);
                             plot_ui.line(
                                 egui_plot::Line::new(*name, thin)
                                     .color(crate::plot::series_egui_color(*slot)),

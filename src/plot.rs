@@ -129,49 +129,59 @@ pub fn follow_live_tab(
     }
 }
 
-/// Min-max decimation for drawing: buckets the points and keeps each
-/// bucket's min and max (in index order), so spikes survive while the
-/// tessellator sees ~`target` points instead of the full series. Returns
-/// a borrow when already small. Hover/fit keep using the full values —
+/// Min-max decimation for drawing: buckets the values (x = 1-based
+/// frame) and keeps each bucket's min and max (in index order), so spikes
+/// survive while the tessellator sees ~`target` points instead of the full
+/// series. Builds the `PlotPoints` directly from the values — no full-res
+/// `Vec<PlotPoint>` cache needed. Hover/fit keep using the full values —
 /// only the drawn line is thinned.
-pub fn decimate_minmax(
-    points: &[egui_plot::PlotPoint],
-    target: usize,
-) -> egui_plot::PlotPoints<'_> {
+pub fn decimate_minmax(values: &[f64], target: usize) -> egui_plot::PlotPoints<'static> {
+    use egui_plot::{PlotPoint, PlotPoints};
     let target = target.max(4);
-    if points.len() <= target {
-        return egui_plot::PlotPoints::Borrowed(points);
+    let n = values.len();
+    if n == 0 {
+        return PlotPoints::Owned(Vec::new());
     }
-    let n = points.len();
+    if n <= target {
+        return PlotPoints::Owned(
+            values
+                .iter()
+                .enumerate()
+                .map(|(i, &y)| PlotPoint::new(i as f64 + 1.0, y))
+                .collect(),
+        );
+    }
     let buckets = target / 2;
     let mut out = Vec::with_capacity(target);
-    out.push(points[0]);
+    let pt = |i: usize| PlotPoint::new(i as f64 + 1.0, values[i]);
+    out.push(pt(0));
     for b in 0..buckets {
         let start = b * n / buckets;
         let end = ((b + 1) * n / buckets).max(start + 1).min(n);
         let (mut lo, mut hi) = (start, start);
         for i in start + 1..end {
-            if points[i].y < points[lo].y {
+            if values[i] < values[lo] {
                 lo = i;
             }
-            if points[i].y > points[hi].y {
+            if values[i] > values[hi] {
                 hi = i;
             }
         }
         if lo < hi {
-            out.push(points[lo]);
-            out.push(points[hi]);
+            out.push(pt(lo));
+            out.push(pt(hi));
         } else if hi < lo {
-            out.push(points[hi]);
-            out.push(points[lo]);
+            out.push(pt(hi));
+            out.push(pt(lo));
         } else {
-            out.push(points[lo]);
+            out.push(pt(lo));
         }
     }
-    if out.last() != Some(&points[n - 1]) {
-        out.push(points[n - 1]);
+    let last = pt(n - 1);
+    if out.last() != Some(&last) {
+        out.push(last);
     }
-    egui_plot::PlotPoints::Owned(out)
+    PlotPoints::Owned(out)
 }
 
 /// Clamp a view range into hard limits (snap-to-data lock): the view
@@ -446,16 +456,12 @@ pub fn render_rgba(
             let slice = &values[lo..hi];
             // Thin to ~1 point per pixel like the live view: a dense spiky
             // series at full resolution overpaints every column into a
-            // solid band. Hover/fit are unaffected.
-            let pts: Vec<egui_plot::PlotPoint> = slice
-                .iter()
-                .enumerate()
-                .map(|(j, &v)| egui_plot::PlotPoint::new(lo as f64 + j as f64 + 1.0, v))
-                .collect();
-            let thin = decimate_minmax(&pts, size.0 as usize);
+            // solid band. Hover/fit are unaffected. Decimation is index-
+            // relative, so shift x back to global frame numbers.
+            let thin = decimate_minmax(slice, size.0 as usize);
             chart
                 .draw_series(LineSeries::new(
-                    thin.points().iter().map(|p| (p.x, p.y)),
+                    thin.points().iter().map(|p| (p.x + lo as f64, p.y)),
                     color.stroke_width(fp(2)),
                 ))
                 .map_err(|e| e.to_string())?

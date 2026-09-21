@@ -449,8 +449,9 @@ fn series_appends_in_order_and_done_replaces() {
         &app.rows[0].psnr,
         MetricCell::Running { values, .. } if values == &[30.0, 31.0, 32.0]
     ));
-    // Cached points mirror values 1:1 (plot borrows them, no rebuild).
-    let pts = &app.rows[0].psnr_cache.points;
+    // Plot decimates straight from values (x = 1-based frame).
+    let thin = crate::plot::decimate_minmax(&[30.0, 31.0, 32.0], 512);
+    let pts = thin.points();
     assert_eq!(pts.len(), 3);
     assert_eq!((pts[0].x, pts[0].y), (1.0, 30.0));
     assert_eq!((pts[2].x, pts[2].y), (3.0, 32.0));
@@ -485,8 +486,9 @@ fn series_appends_in_order_and_done_replaces() {
         &app.rows[0].psnr,
         MetricCell::Done { values, .. } if values == &[29.0, 31.0]
     ));
-    // Done rebuilds points from the strict series (not the partials).
-    let pts = &app.rows[0].psnr_cache.points;
+    // Done draws from the strict series (not the partials).
+    let thin = crate::plot::decimate_minmax(&[29.0, 31.0], 512);
+    let pts = thin.points();
     assert_eq!(pts.len(), 2);
     assert_eq!((pts[0].x, pts[0].y), (1.0, 29.0));
     assert_eq!((pts[1].x, pts[1].y), (2.0, 31.0));
@@ -2562,15 +2564,6 @@ fn idle_heartbeat_budget() {
         })
         .collect();
     let borrowed: Vec<&[f64]> = raw.iter().map(Vec::as_slice).collect();
-    let points: Vec<Vec<egui_plot::PlotPoint>> = raw
-        .iter()
-        .map(|v| {
-            v.iter()
-                .enumerate()
-                .map(|(i, &y)| egui_plot::PlotPoint::new(i as f64 + 1.0, y))
-                .collect()
-        })
-        .collect();
     let n = 200;
     let t0 = std::time::Instant::now();
     let mut acc = 0usize;
@@ -2592,8 +2585,8 @@ fn idle_heartbeat_budget() {
             crate::plot::PSNR_LO,
             crate::plot::PSNR_HI,
         ));
-        for p in &points {
-            acc += crate::plot::decimate_minmax(p, 1000).points().len();
+        for v in &raw {
+            acc += crate::plot::decimate_minmax(v, 1000).points().len();
         }
     }
     let per_frame = t0.elapsed() / n;
@@ -2707,15 +2700,6 @@ fn fps_counter_budget() {
         })
         .collect();
     let borrowed: Vec<&[f64]> = raw.iter().map(Vec::as_slice).collect();
-    let points: Vec<Vec<egui_plot::PlotPoint>> = raw
-        .iter()
-        .map(|v| {
-            v.iter()
-                .enumerate()
-                .map(|(i, &y)| egui_plot::PlotPoint::new(i as f64 + 1.0, y))
-                .collect()
-        })
-        .collect();
     let n = 100;
     // Old frame: everything formatted per frame.
     let t0 = std::time::Instant::now();
@@ -2732,8 +2716,8 @@ fn fps_counter_budget() {
             crate::plot::PSNR_LO,
             crate::plot::PSNR_HI,
         ));
-        for p in &points {
-            acc += crate::plot::decimate_minmax(p, 1000).points().len();
+        for v in &raw {
+            acc += crate::plot::decimate_minmax(v, 1000).points().len();
         }
         acc += format!("FPS: {:.0}", black_box(59.7)).len();
     }
@@ -2754,8 +2738,8 @@ fn fps_counter_budget() {
             crate::plot::PSNR_LO,
             crate::plot::PSNR_HI,
         ));
-        for p in &points {
-            acc += crate::plot::decimate_minmax(p, 1000).points().len();
+        for v in &raw {
+            acc += crate::plot::decimate_minmax(v, 1000).points().len();
         }
         acc += format!("FPS: {:.0}", black_box(59.7)).len();
     }
