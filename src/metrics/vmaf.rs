@@ -52,12 +52,7 @@ pub fn system_threads() -> u32 {
 /// Home directory for models + temp logs: next to the exe (Python
 /// `app_dir` parity), falling back like the logger when unresolvable.
 pub(crate) fn vmaf_home() -> PathBuf {
-    if let Some(dir) = crate::binaries::exe_dir() {
-        return dir;
-    }
-    std::env::current_dir()
-        .ok()
-        .unwrap_or_else(std::env::temp_dir)
+    crate::binaries::app_dir()
 }
 
 /// `vmaf-models/*.json` sorted, or the Python `"No models found"` sentinel.

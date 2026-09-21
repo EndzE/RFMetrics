@@ -126,10 +126,7 @@ pub struct AppState {
 /// State file location: next to the exe (Python `app_dir` parity),
 /// falling back like the logger when unresolvable.
 pub fn state_path() -> PathBuf {
-    let dir = crate::binaries::exe_dir()
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(std::env::temp_dir);
-    dir.join(FILE_NAME)
+    crate::binaries::app_dir().join(FILE_NAME)
 }
 
 /// Tolerant load: missing/corrupt/non-object files behave as no file.

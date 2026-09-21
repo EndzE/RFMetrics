@@ -76,6 +76,14 @@ pub(crate) fn exe_dir() -> Option<PathBuf> {
         .and_then(|p| p.parent().map(Path::to_path_buf))
 }
 
+/// Writable app dir with Python `app_dir` parity: exe dir, then cwd,
+/// then temp dir when the exe dir is unresolvable.
+pub(crate) fn app_dir() -> PathBuf {
+    exe_dir()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 fn nearby(name: &str) -> Option<PathBuf> {
     let cand = exe_dir()?.join(name);
     if cand.is_file() { Some(cand) } else { None }

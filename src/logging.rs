@@ -8,12 +8,7 @@ const BASENAME: &str = "rfmetrics";
 /// Directory for the log file: next to the exe, falling back to the
 /// current dir and then the temp dir when the exe dir is unresolvable.
 fn log_dir() -> PathBuf {
-    if let Some(dir) = crate::binaries::exe_dir() {
-        return dir;
-    }
-    std::env::current_dir()
-        .ok()
-        .unwrap_or_else(std::env::temp_dir)
+    crate::binaries::app_dir()
 }
 
 /// Initialize file-only logging once per process. Safe to call from tests:

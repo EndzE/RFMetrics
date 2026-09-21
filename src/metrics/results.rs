@@ -23,10 +23,7 @@ pub fn default_results_path_in(dir: &Path) -> PathBuf {
 /// Default results path: next to the exe (Python `app_dir` parity),
 /// falling back like the state file when unresolvable.
 pub fn default_results_path() -> PathBuf {
-    let dir = crate::binaries::exe_dir()
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(std::env::temp_dir);
-    default_results_path_in(&dir)
+    default_results_path_in(&crate::binaries::app_dir())
 }
 
 /// Metrics in results-CSV column order (original PSNR/SSIM/VMAF/XPSNR
