@@ -756,6 +756,159 @@ fn reset_metric_clears_only_that_column() {
 }
 
 #[test]
+fn done_stale_marking_matches_recompute_rules() {
+    use super::done_is_stale;
+    use crate::metrics::MetricCell;
+    use crate::metrics::ffmpeg::MetricKind;
+    let app = RFMetricsApp::default();
+    // Default trim boxes are empty (no trim); the fixture stamps match.
+    let (skip, clip) = (None, None);
+    let cur_vmaf = app.current_vmaf_cfg();
+    let done_psnr = MetricCell::Done {
+        values: vec![30.0],
+        avg: 30.0,
+        exec_s: 1.0,
+        skip,
+        clip_dur: clip,
+        vmaf_cfg: None,
+        scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
+    };
+    let cur = || {
+        (
+            skip,
+            clip,
+            app.current_vmaf_cfg(),
+            app.scale_method,
+            app.fps_mode,
+        )
+    };
+    let (s, c, v, sc, fm) = cur();
+    // Matching stamps: fresh.
+    assert!(!done_is_stale(
+        MetricKind::Psnr,
+        &done_psnr,
+        s,
+        c,
+        &v,
+        sc,
+        fm
+    ));
+    // Non-Done cells are never stale.
+    assert!(!done_is_stale(
+        MetricKind::Psnr,
+        &MetricCell::Idle,
+        Some(5.0),
+        c,
+        &v,
+        sc,
+        fm
+    ));
+    assert!(!done_is_stale(
+        MetricKind::Psnr,
+        &MetricCell::Error {
+            msg: "x".to_owned()
+        },
+        Some(5.0),
+        c,
+        &v,
+        sc,
+        fm
+    ));
+    // Trim change stales every kind, including FFVship ones.
+    assert!(done_is_stale(
+        MetricKind::Psnr,
+        &done_psnr,
+        Some(5.0),
+        c,
+        &v,
+        sc,
+        fm
+    ));
+    assert!(done_is_stale(
+        MetricKind::Ssim2,
+        &done_psnr,
+        Some(5.0),
+        c,
+        &v,
+        sc,
+        fm
+    ));
+    // VMAF options change stales VMAF alone.
+    let vmaf_app = RFMetricsApp {
+        vmaf_subsample: "5".to_owned(),
+        ..RFMetricsApp::default()
+    };
+    let new_vmaf = vmaf_app.current_vmaf_cfg();
+    assert_ne!(cur_vmaf, new_vmaf);
+    assert!(done_is_stale(
+        MetricKind::Vmaf,
+        &done_psnr,
+        s,
+        c,
+        &new_vmaf,
+        sc,
+        fm
+    ));
+    assert!(!done_is_stale(
+        MetricKind::Psnr,
+        &done_psnr,
+        s,
+        c,
+        &new_vmaf,
+        sc,
+        fm
+    ));
+    // Scaler / fps-mode changes stale ffmpeg-backed columns only.
+    let other_scaler = if sc == ScaleMethod::Bicubic {
+        ScaleMethod::Lanczos
+    } else {
+        ScaleMethod::Bicubic
+    };
+    assert!(done_is_stale(
+        MetricKind::Psnr,
+        &done_psnr,
+        s,
+        c,
+        &v,
+        other_scaler,
+        fm
+    ));
+    assert!(!done_is_stale(
+        MetricKind::Ssim2,
+        &done_psnr,
+        s,
+        c,
+        &v,
+        other_scaler,
+        fm
+    ));
+    let other_fps = if fm == InputFpsMode::Reference {
+        InputFpsMode::Off
+    } else {
+        InputFpsMode::Reference
+    };
+    assert!(done_is_stale(
+        MetricKind::Ssim,
+        &done_psnr,
+        s,
+        c,
+        &v,
+        sc,
+        other_fps
+    ));
+    assert!(!done_is_stale(
+        MetricKind::But,
+        &done_psnr,
+        s,
+        c,
+        &v,
+        sc,
+        other_fps
+    ));
+}
+
+#[test]
 fn refresh_ranks_single_row_stays_plain() {
     use crate::metrics::ffmpeg::MetricKind;
     use crate::metrics::{MetricCell, StatRank};

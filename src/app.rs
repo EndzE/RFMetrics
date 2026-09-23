@@ -1371,6 +1371,29 @@ impl RFMetricsApp {
         }
     }
 
+    /// Validated VMAF settings snapshot (Python `vmaf_cfg`): subsample
+    /// parses to u32 with max(1, …), pooling maps the UI strings to the
+    /// enum. Single source for `start_run` and the stale-cell badge so
+    /// the two can never disagree on what "current settings" means.
+    fn current_vmaf_cfg(&self) -> crate::metrics::vmaf::VmafCfg {
+        crate::metrics::vmaf::VmafCfg {
+            model: self.vmaf_model.clone(),
+            phone: self.vmaf_phone,
+            scale: self.vmaf_scale,
+            pooling: if self.vmaf_pooling == "Harmonic Mean" {
+                crate::metrics::vmaf::Pooling::HarmonicMean
+            } else {
+                crate::metrics::vmaf::Pooling::Mean
+            },
+            subsample: self.vmaf_subsample.parse::<u32>().unwrap_or(1).max(1),
+            // "auto" (or garbage) follows the system CPU, as before.
+            n_threads: match self.vmaf_threads.parse::<u32>() {
+                Ok(n) => n.max(1),
+                Err(_) => crate::metrics::vmaf::system_threads(),
+            },
+        }
+    }
+
     /// Everything `ffmetrics-state.json` persists, read off the live UI.
     fn snapshot(&self) -> crate::state::AppState {
         crate::state::AppState {
@@ -1732,26 +1755,9 @@ impl RFMetricsApp {
             );
             return;
         };
-        // Validated VMAF snapshot (Python `vmaf_cfg`): subsample parses to
-        // u32 with max(1, …), pooling maps the UI strings to the enum.
-        // Snapshotted before the partition so VMAF `Done` stamps compare
-        // against the settings this run will use.
-        let vmaf_cfg = crate::metrics::vmaf::VmafCfg {
-            model: self.vmaf_model.clone(),
-            phone: self.vmaf_phone,
-            scale: self.vmaf_scale,
-            pooling: if self.vmaf_pooling == "Harmonic Mean" {
-                crate::metrics::vmaf::Pooling::HarmonicMean
-            } else {
-                crate::metrics::vmaf::Pooling::Mean
-            },
-            subsample: self.vmaf_subsample.parse::<u32>().unwrap_or(1).max(1),
-            // "auto" (or garbage) follows the system CPU, as before.
-            n_threads: match self.vmaf_threads.parse::<u32>() {
-                Ok(n) => n.max(1),
-                Err(_) => crate::metrics::vmaf::system_threads(),
-            },
-        };
+        // Validated VMAF snapshot: snapshotted before the partition so
+        // VMAF `Done` stamps compare against the settings this run uses.
+        let vmaf_cfg = self.current_vmaf_cfg();
         // Per metric: rows already holding a valid value sit the rerun out —
         // but only when the trim settings still match: a value computed
         // under a different skip/clip is stale and must recompute. VMAF
@@ -1768,20 +1774,18 @@ impl RFMetricsApp {
             let mut skipped = Vec::new();
             let mut fresh = Vec::new();
             for &i in &targets {
-                if let crate::metrics::MetricCell::Done {
-                    skip: s,
-                    clip_dur: c,
-                    vmaf_cfg: v,
-                    scaler: sc,
-                    fps_mode: fm,
-                    ..
-                } = self.rows[i].cell(kind)
-                    && *s == skip
-                    && *c == clip_dur
-                    && (kind != MetricKind::Vmaf || v.as_ref() == Some(&vmaf_cfg))
-                    && (kind.is_ffvship() || *sc == scaler)
-                    && (kind.is_ffvship() || *fm == fps_mode)
-                {
+                if !done_is_stale(
+                    kind,
+                    self.rows[i].cell(kind),
+                    skip,
+                    clip_dur,
+                    &vmaf_cfg,
+                    scaler,
+                    fps_mode,
+                ) && matches!(
+                    self.rows[i].cell(kind),
+                    crate::metrics::MetricCell::Done { .. }
+                ) {
                     skipped.push(self.rows[i].display.clone());
                 } else {
                     fresh.push(i);
@@ -3868,6 +3872,38 @@ fn skip_groups(work: &[(MetricKind, Vec<usize>, Vec<String>)]) -> Vec<(Vec<&str>
     groups
 }
 
+/// Whether a `Done` cell's stamped options no longer match the current
+/// settings — the same comparison `start_run` uses to decide recompute
+/// vs. skip. Pure so the badge and the partition can never disagree.
+/// Non-`Done` cells are never stale.
+fn done_is_stale(
+    kind: MetricKind,
+    cell: &crate::metrics::MetricCell,
+    skip: Option<f64>,
+    clip_dur: Option<f64>,
+    vmaf_cfg: &crate::metrics::vmaf::VmafCfg,
+    scaler: ScaleMethod,
+    fps_mode: crate::metrics::ffmpeg::InputFpsMode,
+) -> bool {
+    if let crate::metrics::MetricCell::Done {
+        skip: s,
+        clip_dur: c,
+        vmaf_cfg: v,
+        scaler: sc,
+        fps_mode: fm,
+        ..
+    } = cell
+    {
+        !(*s == skip
+            && *c == clip_dur
+            && (kind != MetricKind::Vmaf || v.as_ref() == Some(vmaf_cfg))
+            && (kind.is_ffvship() || *sc == scaler)
+            && (kind.is_ffvship() || *fm == fps_mode))
+    } else {
+        false
+    }
+}
+
 /// 1px vertical divider in an exact 3px grid column.
 fn vline(ui: &mut egui::Ui, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 18.0), egui::Sense::hover());
@@ -4920,6 +4956,23 @@ impl eframe::App for RFMetricsApp {
                     // (deferred so the `&mut` flag borrows above don't
                     // conflict with the `&mut self` reset call).
                     let mut reset_click: Option<MetricKind> = None;
+                    // Current-settings snapshot for the stale badge: one
+                    // trim parse per frame, then comparisons only per cell.
+                    // Invalid boxes ("bad time") disable the badge —
+                    // `start_run` reports those as errors instead.
+                    let stale_cur = match (
+                        Self::trim_opt(&self.skip),
+                        Self::trim_opt(&self.duration),
+                    ) {
+                        (Some(s), Some(c)) => Some((
+                            s,
+                            c,
+                            self.current_vmaf_cfg(),
+                            self.scale_method,
+                            self.fps_mode,
+                        )),
+                        _ => None,
+                    };
                     table
                         .header(18.0, |mut header| {
                             header.col(|_| {});
@@ -5169,6 +5222,16 @@ impl eframe::App for RFMetricsApp {
                                         let row_data = &self.rows[vi];
                                         let cell = row_data.cell(kind);
                                         let cached = row_data.cached(kind);
+                                        // Stale `Done` values (stamped options
+                                        // no longer match current settings)
+                                        // keep their value and rank fill —
+                                        // only struck-through (issue #92).
+                                        let stale = match &stale_cur {
+                                            Some((s, c, vmaf, scaler, fps)) => done_is_stale(
+                                                kind, cell, *s, *c, vmaf, *scaler, *fps,
+                                            ),
+                                            None => false,
+                                        };
                                         // Idle borrows a static, Done borrows
                                         // the arrival-frozen text, Error borrows
                                         // its message; only live Running frames
@@ -5211,12 +5274,21 @@ impl eframe::App for RFMetricsApp {
                                                 }
                                                 // Plain non-selectable text, like the
                                                 // Path/Media columns (copy lives in
-                                                // the right-click menu).
+                                                // the right-click menu); stale
+                                                // values strike through.
+                                                let rich = if stale {
+                                                    egui::RichText::new(text).strikethrough()
+                                                } else {
+                                                    egui::RichText::new(text)
+                                                };
                                                 let resp = ui
-                                                    .add(egui::Label::new(text).selectable(false));
+                                                    .add(egui::Label::new(rich).selectable(false));
                                                 match stats {
                                                     Some(stats) => {
                                                         resp.on_hover_ui(|ui| {
+                                                            if stale {
+                                                                ui.label("Stale settings - rerun to refresh");
+                                                            }
                                                             metric_stat_tooltip(
                                                                 ui, title, stats, &ranks,
                                                             );
