@@ -452,6 +452,11 @@ enum MetricMsg {
         /// mode change recomputes every ffmpeg-backed column (FFVship
         /// has no `-r` stage and ignores it at compare time).
         fps_mode: crate::metrics::ffmpeg::InputFpsMode,
+        /// Reference pixel-format target the run used; stamped like
+        /// `scaler` so a target change recomputes every ffmpeg-backed
+        /// column (FFVship has no `format=` stage and ignores it at
+        /// compare time).
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt,
     },
     /// End of the worker loop; `aborted` settles still-Running cells to
     /// Idle while keeping finished (`Done`) results on screen.
@@ -493,6 +498,10 @@ pub struct RFMetricsApp {
     /// Decimals for metric cell display + Copy value (Options combobox,
     /// default 4). Frozen Avg texts re-freeze on change (see below).
     cell_precision: u8,
+    /// Pixel format both legs converge on (Skip-row combobox, default No
+    /// conversion = legacy dist→ref-native legs). Run input: locked
+    /// mid-run, stamped onto `Done` cells like `scaler`.
+    ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt,
     /// Open the plot viewport when a run starts (Options checkbox).
     plot_at_start: bool,
     /// Save per-frame metric CSVs on Done (Options checkbox).
@@ -706,6 +715,7 @@ impl Default for RFMetricsApp {
             fps_mode: crate::metrics::ffmpeg::InputFpsMode::default(),
             cell_stat: crate::metrics::CellStat::default(),
             cell_precision: crate::metrics::DEFAULT_PRECISION as u8,
+            ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::default(),
             plot_at_start: false,
             csv_export: false,
             csv_dir: String::new(),
@@ -1145,6 +1155,7 @@ impl RFMetricsApp {
                     vmaf_cfg,
                     scaler,
                     fps_mode,
+                    ref_pixfmt,
                 } => {
                     if generation != self.run_generation {
                         log::debug!(target: "rfmetrics::app", "discarded stale {} result", kind.name());
@@ -1199,6 +1210,7 @@ impl RFMetricsApp {
                                 vmaf_cfg,
                                 scaler,
                                 fps_mode,
+                                ref_pixfmt,
                             },
                         };
                         // Cache the stats once (clone+sort lives here, not
@@ -1439,6 +1451,7 @@ impl RFMetricsApp {
                 fps_mode: Some(self.fps_mode.label().to_owned()),
                 cell_stat: Some(self.cell_stat.label().to_owned()),
                 cell_precision: Some(self.cell_precision.to_string()),
+                ref_pixfmt: Some(self.ref_pixfmt.label().to_owned()),
                 plot_at_start: Some(self.plot_at_start),
                 plot_size: Some(self.plot_size.label().to_owned()),
                 csv_export: Some(self.csv_export),
@@ -1570,6 +1583,11 @@ impl RFMetricsApp {
         {
             self.cell_stat = m;
         }
+        if let Some(ref_pixfmt) = s.options.ref_pixfmt
+            && let Some(m) = crate::metrics::ffmpeg::RefPixFmt::from_label(&ref_pixfmt)
+        {
+            self.ref_pixfmt = m;
+        }
         if let Some(cell_precision) = s.options.cell_precision
             && let Ok(p) = cell_precision.parse::<u8>()
             && p as usize <= crate::metrics::MAX_PRECISION
@@ -1661,6 +1679,7 @@ impl RFMetricsApp {
                 .as_deref()
                 .and_then(|s| s.parse::<u8>().ok())
                 != Some(self.cell_precision)
+            || o.ref_pixfmt.as_deref() != Some(self.ref_pixfmt.label())
             || o.plot_at_start != Some(self.plot_at_start)
             || o.plot_size.as_deref() != Some(self.plot_size.label())
             || o.csv_export != Some(self.csv_export)
@@ -1795,6 +1814,7 @@ impl RFMetricsApp {
         // uncomparable there); everything below touches `fresh` only.
         let scaler = self.scale_method;
         let fps_mode = self.fps_mode;
+        let ref_pixfmt = self.ref_pixfmt;
         let mut work: Vec<(MetricKind, Vec<usize>, Vec<String>)> = Vec::new();
         for &kind in &kinds {
             let mut skipped = Vec::new();
@@ -1808,6 +1828,7 @@ impl RFMetricsApp {
                     &vmaf_cfg,
                     scaler,
                     fps_mode,
+                    ref_pixfmt,
                 ) && matches!(
                     self.rows[i].cell(kind),
                     crate::metrics::MetricCell::Done { .. }
@@ -1979,6 +2000,7 @@ impl RFMetricsApp {
                     clip_dur,
                     scaler,
                     fps_mode,
+                    ref_pixfmt,
                     abort: &abort,
                     child_slot: &child_slot,
                 };
@@ -2034,6 +2056,7 @@ impl RFMetricsApp {
                     clip_dur,
                     scaler,
                     fps_mode,
+                    ref_pixfmt,
                     vmaf_cfg: if kind == MetricKind::Vmaf {
                         Some(vmaf_cfg.clone())
                     } else {
@@ -3916,6 +3939,7 @@ fn skip_groups(work: &[(MetricKind, Vec<usize>, Vec<String>)]) -> Vec<(Vec<&str>
 /// settings — the same comparison `start_run` uses to decide recompute
 /// vs. skip. Pure so the badge and the partition can never disagree.
 /// Non-`Done` cells are never stale.
+#[allow(clippy::too_many_arguments)]
 fn done_is_stale(
     kind: MetricKind,
     cell: &crate::metrics::MetricCell,
@@ -3924,6 +3948,7 @@ fn done_is_stale(
     vmaf_cfg: &crate::metrics::vmaf::VmafCfg,
     scaler: ScaleMethod,
     fps_mode: crate::metrics::ffmpeg::InputFpsMode,
+    ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt,
 ) -> bool {
     if let crate::metrics::MetricCell::Done {
         skip: s,
@@ -3931,6 +3956,7 @@ fn done_is_stale(
         vmaf_cfg: v,
         scaler: sc,
         fps_mode: fm,
+        ref_pixfmt: pf,
         ..
     } = cell
     {
@@ -3938,7 +3964,8 @@ fn done_is_stale(
             && *c == clip_dur
             && (kind != MetricKind::Vmaf || v.as_ref() == Some(vmaf_cfg))
             && (kind.is_ffvship() || *sc == scaler)
-            && (kind.is_ffvship() || *fm == fps_mode))
+            && (kind.is_ffvship() || *fm == fps_mode)
+            && (kind.is_ffvship() || *pf == ref_pixfmt))
     } else {
         false
     }
@@ -4524,6 +4551,28 @@ impl eframe::App for RFMetricsApp {
                                         .desired_width(110.0),
                                 )
                                 .on_hover_text("Skip from start: seconds (5) or hh:mm:ss (.000)");
+                            ui.add(egui::Label::new("Pixel Format:").selectable(false));
+                            ui.add_enabled_ui(!run_locked, |ui| {
+                                let _ = egui::ComboBox::from_id_salt("ref_pixfmt")
+                                    .width(150.0)
+                                    .selected_text(self.ref_pixfmt.label())
+                                    .show_ui(ui, |ui| {
+                                        for m in crate::metrics::ffmpeg::RefPixFmt::ALL {
+                                            let _ = ui.selectable_value(
+                                                &mut self.ref_pixfmt,
+                                                m,
+                                                m.label(),
+                                            );
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(
+                                        "Pixel format the reference is converted to (both legs converge on it; \
+                                         No conversion keeps the legacy distorted-to-reference legs). The selection \
+                                         is ignored for metrics that don't support it (e.g. VMAF requires YUV); \
+                                         FFVship metrics always compare unconverted inputs",
+                                    );
+                            });
                         });
                     });
                     // Reference thumbnail 136x76 (black box parity with Python).
@@ -5124,6 +5173,7 @@ impl eframe::App for RFMetricsApp {
                             self.current_vmaf_cfg(),
                             self.scale_method,
                             self.fps_mode,
+                            self.ref_pixfmt,
                         )),
                         _ => None,
                     };
@@ -5347,13 +5397,19 @@ impl eframe::App for RFMetricsApp {
                                     // normalizes nothing at all), so a row
                                     // whose probe differs from the reference
                                     // ambers with the conversions listed in
-                                    // its tooltip. Comparisons only when
-                                    // matched; strings alloc on mismatch.
+                                    // its tooltip. Suppressed while a pixel
+                                    // format target is selected (the
+                                    // convergence is explicitly requested).
+                                    // Comparisons only when matched; strings
+                                    // alloc on mismatch.
                                     let warns = match (
                                         self.ref_info_data.as_ref(),
                                         row_data.info.as_ref(),
                                     ) {
-                                        (Some(r), Some(d)) => {
+                                        (Some(r), Some(d))
+                                            if self.ref_pixfmt
+                                                == crate::metrics::ffmpeg::RefPixFmt::NoConversion =>
+                                        {
                                             crate::metrics::ffmpeg::conversion_warnings(r, d)
                                         }
                                         _ => Vec::new(),
@@ -5421,8 +5477,8 @@ impl eframe::App for RFMetricsApp {
                                         // keep their value and rank fill —
                                         // only struck-through (issue #92).
                                         let stale = match &stale_cur {
-                                            Some((s, c, vmaf, scaler, fps)) => done_is_stale(
-                                                kind, cell, *s, *c, vmaf, *scaler, *fps,
+                                            Some((s, c, vmaf, scaler, fps, pf)) => done_is_stale(
+                                                kind, cell, *s, *c, vmaf, *scaler, *fps, *pf,
                                             ),
                                             None => false,
                                         };

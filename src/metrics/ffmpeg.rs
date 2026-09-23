@@ -378,6 +378,330 @@ pub fn scale_filter(w: i64, h: i64, method: ScaleMethod) -> String {
     }
 }
 
+/// Reference pixel-format target (Skip-row combobox): the format both
+/// legs converge on. `NoConversion` keeps the legacy dist→ref-native
+/// legs; anything else puts `format=` on the ref leg too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RefPixFmt {
+    #[default]
+    NoConversion,
+    Rgb24,
+    Rgb48,
+    Yuv420p,
+    Yuv422p,
+    Yuv444p,
+    Yuv420p10,
+    Yuv422p10,
+    Yuv444p10,
+    Yuv420p16,
+    Yuv422p16,
+    Yuv444p16,
+}
+
+impl RefPixFmt {
+    /// Combo order: the default first, then RGB, then YUV by subsampling
+    /// (8-bit, 10-bit, 16-bit).
+    pub const ALL: [RefPixFmt; 12] = [
+        RefPixFmt::NoConversion,
+        RefPixFmt::Rgb24,
+        RefPixFmt::Rgb48,
+        RefPixFmt::Yuv420p,
+        RefPixFmt::Yuv422p,
+        RefPixFmt::Yuv444p,
+        RefPixFmt::Yuv420p10,
+        RefPixFmt::Yuv422p10,
+        RefPixFmt::Yuv444p10,
+        RefPixFmt::Yuv420p16,
+        RefPixFmt::Yuv422p16,
+        RefPixFmt::Yuv444p16,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NoConversion => "No conversion",
+            Self::Rgb24 => "RGB",
+            Self::Rgb48 => "RGB 16 bits",
+            Self::Yuv420p => "YUV 420p",
+            Self::Yuv422p => "YUV 422p",
+            Self::Yuv444p => "YUV 444p",
+            Self::Yuv420p10 => "YUV 420p 10 bits",
+            Self::Yuv422p10 => "YUV 422p 10 bits",
+            Self::Yuv444p10 => "YUV 444p 10 bits",
+            Self::Yuv420p16 => "YUV 420p 16 bits",
+            Self::Yuv422p16 => "YUV 422p 16 bits",
+            Self::Yuv444p16 => "YUV 444p 16 bits",
+        }
+    }
+
+    /// ffmpeg `format=` token, or `None` for "No conversion".
+    pub fn token(self) -> Option<&'static str> {
+        match self {
+            Self::NoConversion => None,
+            Self::Rgb24 => Some("rgb24"),
+            // LE (x86-native; upstream #203 used rgb48le for 16-bit RGB).
+            Self::Rgb48 => Some("rgb48le"),
+            Self::Yuv420p => Some("yuv420p"),
+            Self::Yuv422p => Some("yuv422p"),
+            Self::Yuv444p => Some("yuv444p"),
+            Self::Yuv420p10 => Some("yuv420p10le"),
+            Self::Yuv422p10 => Some("yuv422p10le"),
+            Self::Yuv444p10 => Some("yuv444p10le"),
+            Self::Yuv420p16 => Some("yuv420p16le"),
+            Self::Yuv422p16 => Some("yuv422p16le"),
+            Self::Yuv444p16 => Some("yuv444p16le"),
+        }
+    }
+
+    /// Whether `kind` can score this target. VMAF requires YUV (verified
+    /// upstream); PSNR/SSIM/XPSNR score every token (rgb24, rgb48le and
+    /// yuv444p16le verified live, 8-bit YUV trivially). Unsupported
+    /// selections are ignored for that metric (VMAF falls back to the
+    /// `PIXFMT_MAP` canonicalization below).
+    pub fn supports(self, kind: MetricKind) -> bool {
+        match (self.token(), kind) {
+            (Some(t), MetricKind::Vmaf) => t.starts_with("yuv"),
+            _ => true,
+        }
+    }
+
+    /// State-file validation (unknown labels keep the live default).
+    pub fn from_label(s: &str) -> Option<RefPixFmt> {
+        Self::ALL.into_iter().find(|m| m.label() == s)
+    }
+}
+
+/// Upstream `PixelFormatMap` (VMAF section of `FFMetrics.conf.example`)
+/// verbatim port: canonical working format → input formats that convert
+/// to it. Only VMAF carries a map upstream (PSNR/SSIM/XPSNR are `null`),
+/// so only VMAF consults it. Grouping kept identical to the conf for
+/// diffability (including its duplicated `"rgb4"` entry — harmless).
+const PIXFMT_MAP: &[(&str, &[&str])] = &[
+    (
+        "yuv420p",
+        &[
+            "gray", "nv12", "nv21", "yuv410p", "yuv420p", "yuva420p", "yuvj420p",
+        ],
+    ),
+    (
+        "yuv420p10le",
+        &[
+            "gray9be",
+            "gray9le",
+            "gray10be",
+            "gray10le",
+            "yuv420p9be",
+            "yuv420p9le",
+            "yuv420p10le",
+            "yuv420p10be",
+            "yuva420p10be",
+            "yuva420p10le",
+            "yuva420p9be",
+            "yuva420p9le",
+        ],
+    ),
+    (
+        "yuv420p12le",
+        &[
+            "gray12be",
+            "gray12le",
+            "yuv420p12le",
+            "yuv420p12be",
+            "yuva420p12be",
+            "yuva420p12le",
+        ],
+    ),
+    (
+        "yuv420p16le",
+        &[
+            "gray16be",
+            "gray16le",
+            "grayf16be",
+            "grayf16le",
+            "yuv420p14be",
+            "yuv420p14le",
+            "yuv420p16be",
+            "yuv420p16le",
+            "yuva420p14be",
+            "yuva420p14le",
+            "yuva420p16be",
+            "yuva420p16le",
+        ],
+    ),
+    (
+        "yuv422p",
+        &[
+            "nv16", "nv20", "nv61", "yuv411p", "yuv422p", "yuva422p", "yuvj411p", "yuvj422p",
+            "uyvy422", "yvyu422", "yuyv422",
+        ],
+    ),
+    (
+        "yuv422p10le",
+        &[
+            "yuv422p9be",
+            "yuv422p9le",
+            "yuv422p10be",
+            "yuv422p10le",
+            "yuva422p10be",
+            "yuva422p10le",
+            "yuva422p9be",
+            "yuva422p9le",
+        ],
+    ),
+    (
+        "yuv422p12le",
+        &["yuv422p12be", "yuv422p12le", "yuva422p12be", "yuva422p12le"],
+    ),
+    (
+        "yuv422p16le",
+        &[
+            "yuv422p14be",
+            "yuv422p14le",
+            "yuv422p16be",
+            "yuv422p16le",
+            "yuva422p16be",
+            "yuva422p16le",
+        ],
+    ),
+    (
+        "yuv444p",
+        &[
+            "0bgr",
+            "0rgb",
+            "abgr",
+            "argb",
+            "ayuv",
+            "bgr0",
+            "bgr4",
+            "bgr4_byte",
+            "bgr8",
+            "bgr24",
+            "bgr444be",
+            "bgr444le",
+            "bgr565be",
+            "bgr565le",
+            "bgr555be",
+            "bgr555le",
+            "bgra",
+            "gbrp",
+            "gbrap",
+            "nv24",
+            "nv42",
+            "rgb0",
+            "rgb4",
+            "rgb4",
+            "rgb4_byte",
+            "rgb8",
+            "rgb24",
+            "rgb444be",
+            "rgb444le",
+            "rgb565be",
+            "rgb565le",
+            "rgb555be",
+            "rgb555le",
+            "rgba",
+            "yuv440p",
+            "yuv444p",
+            "yuva444p",
+            "yuvj440p",
+            "yuvj444p",
+            "uyvy422",
+            "yvyu422",
+            "yuyv422",
+        ],
+    ),
+    (
+        "yuv444p10le",
+        &[
+            "gbrp9be",
+            "gbrp9le",
+            "gbrp10be",
+            "gbrp10le",
+            "gbrp10msbbe",
+            "gbrp10msble",
+            "gbrap10be",
+            "gbrap10le",
+            "yuv440p10be",
+            "yuv440p10le",
+            "yuv444p9be",
+            "yuv444p9le",
+            "yuv444p10be",
+            "yuv444p10le",
+            "yuv444p10msbbe",
+            "yuv444p10msble",
+            "yuva444p9be",
+            "yuva444p9le",
+            "yuva444p10be",
+            "yuva444p10le",
+        ],
+    ),
+    (
+        "yuv444p12le",
+        &[
+            "gbrp12msbbe",
+            "gbrp12msble",
+            "gbrp12be",
+            "gbrp12le",
+            "gbrap12be",
+            "gbrap12le",
+            "yuv440p12be",
+            "yuv440p12le",
+            "yuv444p12be",
+            "yuv444p12le",
+            "yuv444p12msbbe",
+            "yuv444p12msble",
+            "yuva444p12be",
+            "yuva444p12le",
+        ],
+    ),
+];
+
+/// Upstream `PixelFormatDefault` (VMAF section): fallback when the probed
+/// format matches no map list. Doubles as the `yuv444p16le` key, which the
+/// upstream map omits (a native `yuv444p16le` ref resolves to itself, so
+/// no legs are emitted — correctly).
+const PIXFMT_DEFAULT: &str = "yuv444p16le";
+
+/// Canonical working format for a probed pixfmt (upstream map lookup):
+/// the key whose list contains it, the default when unlisted, `None`
+/// when unknown (no leg can be built without a source format).
+fn canonical_pixfmt(native: Option<&str>) -> Option<&'static str> {
+    let native = native?;
+    for (canonical, members) in PIXFMT_MAP {
+        if members.contains(&native) {
+            return Some(canonical);
+        }
+    }
+    Some(PIXFMT_DEFAULT)
+}
+
+/// `format=` legs converging both sides on one format: an explicitly
+/// selected, supported target wins; otherwise VMAF canonicalizes the
+/// reference through `PIXFMT_MAP` (RGB refs converge on `yuv444p` instead
+/// of failing libvmaf); everything else keeps the legacy dist→ref-native
+/// pair. Returns `(dist_leg, ref_leg)`: the legacy case reduces exactly
+/// to the old conditions, so existing graphs stay byte-identical.
+pub(crate) fn format_legs(
+    ref_native: Option<&str>,
+    dist_native: Option<&str>,
+    target: RefPixFmt,
+    kind: MetricKind,
+) -> (Option<String>, Option<String>) {
+    let eff = match target.token() {
+        Some(t) if target.supports(kind) => Some(t),
+        _ if kind == MetricKind::Vmaf => canonical_pixfmt(ref_native),
+        _ => ref_native,
+    };
+    let dist_leg = match eff {
+        Some(e) if dist_native != Some(e) => Some(format!("format={e}")),
+        _ => None,
+    };
+    let ref_leg = match eff {
+        Some(e) if ref_native != Some(e) => Some(format!("format={e}")),
+        _ => None,
+    };
+    (dist_leg, ref_leg)
+}
+
 /// Timestamp reset shared by every filtergraph leg.
 pub(crate) const NORM: &str = "settb=AVTB,setpts=PTS-STARTPTS";
 
@@ -478,7 +802,8 @@ pub(crate) fn rate_args(
 /// inverted vs. the arg order: `-i dist` is `[0:v]`/main, `-i ref` is
 /// `[1:v]`/ref, and the filter is `[main][ref]<filter>=…` (same order for
 /// PSNR and SSIM; only XPSNR inverts). The distorted leg is scaled/converted
-/// up to the reference when they differ; the reference leg only gets trim.
+/// up to the reference when they differ; the reference leg only gets trim —
+/// unless a pixel-format target converges both legs on one format.
 pub fn filtergraph(
     kind: MetricKind,
     ref_info: &MediaInfo,
@@ -486,6 +811,7 @@ pub fn filtergraph(
     skip: Option<f64>,
     clip_dur: Option<f64>,
     scaler: ScaleMethod,
+    ref_pixfmt: RefPixFmt,
 ) -> String {
     // Python `if skip or clip_dur:` — 0.0 is falsy, so a zero skip/clip
     // disables trim instead of producing an empty `trim=start=0:end=0`.
@@ -503,12 +829,21 @@ pub fn filtergraph(
     if range_differs && let Some(s) = setrange_segment(dist_info.range_tag.as_deref()) {
         pre.push(s);
     }
-    if ref_info.pix_fmt.is_some() && dist_info.pix_fmt != ref_info.pix_fmt {
-        pre.push(format!("format={}", ref_info.pix_fmt.as_deref().unwrap()));
+    let (dist_fmt, ref_fmt) = format_legs(
+        ref_info.pix_fmt.as_deref(),
+        dist_info.pix_fmt.as_deref(),
+        ref_pixfmt,
+        kind,
+    );
+    if let Some(s) = dist_fmt {
+        pre.push(s);
     }
     let mut ref_leg: Vec<String> = window;
     ref_leg.push(NORM.to_owned());
     if range_differs && let Some(s) = setrange_segment(ref_info.range_tag.as_deref()) {
+        ref_leg.push(s);
+    }
+    if let Some(s) = ref_fmt {
         ref_leg.push(s);
     }
     format!(
@@ -720,6 +1055,7 @@ pub fn build_args(
     clip_dur: Option<f64>,
     scaler: ScaleMethod,
     fps_mode: InputFpsMode,
+    ref_pixfmt: RefPixFmt,
 ) -> Vec<String> {
     let mut args = vec![
         "-hide_banner".to_owned(),
@@ -737,7 +1073,7 @@ pub fn build_args(
     args.push(ref_path.to_owned());
     args.push("-filter_complex".to_owned());
     args.push(filtergraph(
-        kind, ref_info, dist_info, skip, clip_dur, scaler,
+        kind, ref_info, dist_info, skip, clip_dur, scaler, ref_pixfmt,
     ));
     args.extend(["-f".to_owned(), "null".to_owned(), "-".to_owned()]);
     args
@@ -760,6 +1096,12 @@ pub struct RunInputs<'a> {
     /// `scaler` so a mode change recomputes every ffmpeg-backed column
     /// (FFVship has no `-r` stage and ignores it at compare time).
     pub fps_mode: InputFpsMode,
+    /// Reference pixel-format target the run used; stamped onto the `Done`
+    /// cell like `scaler` so a target change recomputes every
+    /// ffmpeg-backed column (FFVship has no `format=` stage and ignores
+    /// it at compare time; unsupported selections fall back to legacy
+    /// legs for that metric).
+    pub ref_pixfmt: RefPixFmt,
     /// Set by Stop; the run reports "aborted" and drops partial values.
     pub abort: &'a AtomicBool,
     /// Holds the live child so Stop can kill it; `None` when idle/reaped.
@@ -962,14 +1304,20 @@ pub fn run_metric(
         clip_dur,
         scaler,
         fps_mode,
+        ref_pixfmt,
         abort,
         child_slot,
     } = *job;
     let name = kind.name();
-    // XPSNR weights come from the reference (pix_fmt, then dims), with the
-    // distorted pix_fmt as fallback — computed once per run, not per line.
+    // XPSNR weights come from the effective reference format (the target
+    // when one converges the legs, else the probed formats), then dims —
+    // computed once per run, not per line.
+    let eff_fmt = match ref_pixfmt.token() {
+        Some(t) if ref_pixfmt.supports(kind) => Some(t),
+        _ => ref_info.pix_fmt.as_deref(),
+    };
     let weights = xpsnr_weights(
-        ref_info.pix_fmt.as_deref().or(dist_info.pix_fmt.as_deref()),
+        eff_fmt.or(dist_info.pix_fmt.as_deref()),
         ref_info.width,
         ref_info.height,
     );
@@ -982,6 +1330,7 @@ pub fn run_metric(
     };
     let args = build_args(
         kind, ref_path, dist_path, ref_info, dist_info, skip, clip_dur, scaler, fps_mode,
+        ref_pixfmt,
     );
     // `info`: the exact repro command is the core artifact of an issue
     // report (FFMetrics.log parity) — one line per metric job.

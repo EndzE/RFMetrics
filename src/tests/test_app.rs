@@ -410,6 +410,7 @@ fn psnr_progress_keeps_max_and_done_clears() {
             vmaf_cfg: None,
             scaler: ScaleMethod::Bicubic,
             fps_mode: InputFpsMode::Reference,
+            ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
         })
         .unwrap();
     app.drain_metric_results();
@@ -479,6 +480,7 @@ fn series_appends_in_order_and_done_replaces() {
             vmaf_cfg: None,
             scaler: ScaleMethod::Bicubic,
             fps_mode: InputFpsMode::Reference,
+            ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
         })
         .unwrap();
     app.drain_metric_results();
@@ -608,6 +610,7 @@ fn live_key_tracks_executing_job() {
             vmaf_cfg: None,
             scaler: ScaleMethod::Bicubic,
             fps_mode: InputFpsMode::Reference,
+            ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
         })
         .unwrap();
     app.drain_metric_results();
@@ -638,6 +641,7 @@ fn live_key_tracks_executing_job() {
             vmaf_cfg: None,
             scaler: ScaleMethod::Bicubic,
             fps_mode: InputFpsMode::Reference,
+            ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
         })
         .unwrap();
     app.drain_metric_results();
@@ -665,6 +669,7 @@ fn psnr_stale_generation_dropped() {
             vmaf_cfg: None,
             scaler: ScaleMethod::Bicubic,
             fps_mode: InputFpsMode::Reference,
+            ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
         })
         .unwrap();
     app.drain_metric_results();
@@ -703,6 +708,7 @@ fn drain_caches_stats_and_ranks_once() {
                 vmaf_cfg: None,
                 scaler: ScaleMethod::Bicubic,
                 fps_mode: InputFpsMode::Reference,
+                ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
             })
             .unwrap();
     }
@@ -734,6 +740,7 @@ fn reset_metric_clears_only_that_column() {
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     app.rows[0].psnr = done(30.0);
     app.rows[0].ssim = done(0.95);
@@ -777,6 +784,7 @@ fn done_stale_marking_matches_recompute_rules() {
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     let cur = || {
         (
@@ -785,9 +793,10 @@ fn done_stale_marking_matches_recompute_rules() {
             app.current_vmaf_cfg(),
             app.scale_method,
             app.fps_mode,
+            app.ref_pixfmt,
         )
     };
-    let (s, c, v, sc, fm) = cur();
+    let (s, c, v, sc, fm, pf) = cur();
     // Matching stamps: fresh.
     assert!(!done_is_stale(
         MetricKind::Psnr,
@@ -796,7 +805,8 @@ fn done_stale_marking_matches_recompute_rules() {
         c,
         &v,
         sc,
-        fm
+        fm,
+        pf
     ));
     // Non-Done cells are never stale.
     assert!(!done_is_stale(
@@ -806,7 +816,8 @@ fn done_stale_marking_matches_recompute_rules() {
         c,
         &v,
         sc,
-        fm
+        fm,
+        pf
     ));
     assert!(!done_is_stale(
         MetricKind::Psnr,
@@ -817,7 +828,8 @@ fn done_stale_marking_matches_recompute_rules() {
         c,
         &v,
         sc,
-        fm
+        fm,
+        pf
     ));
     // Trim change stales every kind, including FFVship ones.
     assert!(done_is_stale(
@@ -827,7 +839,8 @@ fn done_stale_marking_matches_recompute_rules() {
         c,
         &v,
         sc,
-        fm
+        fm,
+        pf
     ));
     assert!(done_is_stale(
         MetricKind::Ssim2,
@@ -836,7 +849,8 @@ fn done_stale_marking_matches_recompute_rules() {
         c,
         &v,
         sc,
-        fm
+        fm,
+        pf
     ));
     // VMAF options change stales VMAF alone.
     let vmaf_app = RFMetricsApp {
@@ -852,7 +866,8 @@ fn done_stale_marking_matches_recompute_rules() {
         c,
         &new_vmaf,
         sc,
-        fm
+        fm,
+        pf
     ));
     assert!(!done_is_stale(
         MetricKind::Psnr,
@@ -861,7 +876,8 @@ fn done_stale_marking_matches_recompute_rules() {
         c,
         &new_vmaf,
         sc,
-        fm
+        fm,
+        pf
     ));
     // Scaler / fps-mode changes stale ffmpeg-backed columns only.
     let other_scaler = if sc == ScaleMethod::Bicubic {
@@ -876,7 +892,8 @@ fn done_stale_marking_matches_recompute_rules() {
         c,
         &v,
         other_scaler,
-        fm
+        fm,
+        pf
     ));
     assert!(!done_is_stale(
         MetricKind::Ssim2,
@@ -885,7 +902,8 @@ fn done_stale_marking_matches_recompute_rules() {
         c,
         &v,
         other_scaler,
-        fm
+        fm,
+        pf
     ));
     let other_fps = if fm == InputFpsMode::Reference {
         InputFpsMode::Off
@@ -899,7 +917,8 @@ fn done_stale_marking_matches_recompute_rules() {
         c,
         &v,
         sc,
-        other_fps
+        other_fps,
+        pf
     ));
     assert!(!done_is_stale(
         MetricKind::But,
@@ -908,7 +927,8 @@ fn done_stale_marking_matches_recompute_rules() {
         c,
         &v,
         sc,
-        other_fps
+        other_fps,
+        pf
     ));
 }
 
@@ -927,6 +947,7 @@ fn refresh_ranks_single_row_stays_plain() {
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     let stats = app.rows[0].psnr.done_stats();
     app.rows[0].psnr_cache.stats = stats;
@@ -952,6 +973,7 @@ fn stop_keeps_done_and_settles_running_to_idle() {
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     app.rows[1].psnr = MetricCell::Running {
         frame: 12,
@@ -1022,6 +1044,7 @@ fn stop_settles_killed_cell_to_idle() {
             vmaf_cfg: None,
             scaler: ScaleMethod::Bicubic,
             fps_mode: InputFpsMode::Reference,
+            ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
         })
         .unwrap();
     app.drain_metric_results();
@@ -1081,6 +1104,7 @@ fn start_psnr_bad_time_marks_all_included() {
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
@@ -1118,6 +1142,7 @@ fn start_psnr_all_done_toasts_without_running() {
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
@@ -1220,6 +1245,7 @@ fn start_psnr_rerun_leaves_done_row_untouched() {
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     app.rows[0].info = Some(MediaInfo::default());
     app.rows[1].info = Some(MediaInfo::default());
@@ -1280,6 +1306,7 @@ fn start_psnr_changed_trim_recomputes_done_row() {
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     app.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
@@ -1327,6 +1354,7 @@ fn start_psnr_matching_trim_still_skips() {
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     app.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
@@ -1373,6 +1401,7 @@ fn start_run_vmaf_settings_change_recomputes_vmaf_only() {
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     app.rows[0].vmaf = MetricCell::Done {
         values: vec![90.0],
@@ -1390,6 +1419,7 @@ fn start_run_vmaf_settings_change_recomputes_vmaf_only() {
         }),
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     app.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
@@ -1447,6 +1477,7 @@ fn start_run_vmaf_matching_settings_still_skips() {
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     app.rows[0].vmaf = MetricCell::Done {
         values: vec![90.0],
@@ -1464,6 +1495,7 @@ fn start_run_vmaf_matching_settings_still_skips() {
         }),
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     app.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
@@ -1508,6 +1540,7 @@ fn start_run_scaler_change_recomputes_ffmpeg_only() {
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     app.rows[0].psnr = done(30.0);
     app.rows[0].ssim2 = done(80.0);
@@ -1569,6 +1602,7 @@ fn start_run_fps_mode_change_recomputes_ffmpeg_only() {
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     app.rows[0].psnr = done(30.0);
     app.rows[0].ssim2 = done(80.0);
@@ -1600,6 +1634,159 @@ fn start_run_fps_mode_change_recomputes_ffmpeg_only() {
     assert!(matches!(&app.rows[0].ssim2, MetricCell::Done { .. }));
 }
 
+/// Pixel-format target change recomputes ffmpeg-backed columns but leaves
+/// FFVship ones alone (no `format=` stage there): a NoConversion-stamped
+/// PSNR cell recomputes under YUV 444p while an equally-stamped SSIM2
+/// cell keeps skipping, no Reset needed.
+#[test]
+fn start_run_pixfmt_change_recomputes_ffmpeg_only() {
+    use crate::metrics::MetricCell;
+    use crate::metrics::ffmpeg::RefPixFmt;
+    use crate::probe::MediaInfo;
+    let p = std::env::temp_dir().join("rfmetrics-pixfmt-restamp.tmp");
+    std::fs::write(&p, b"x").unwrap();
+    let mut app = RFMetricsApp {
+        m_psnr: true,
+        m_vmaf: false,
+        m_ssim2: true,
+        ref_path: p.to_string_lossy().into_owned(),
+        ..RFMetricsApp::default()
+    };
+    app.ref_pixfmt = RefPixFmt::Yuv444p;
+    app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+    app.ref_info_data = Some(MediaInfo::default());
+    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    let done = |avg: f64| MetricCell::Done {
+        values: vec![avg],
+        avg,
+        exec_s: 1.0,
+        skip: None,
+        clip_dur: None,
+        vmaf_cfg: None,
+        scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: RefPixFmt::NoConversion,
+    };
+    app.rows[0].psnr = done(30.0);
+    app.rows[0].ssim2 = done(80.0);
+    app.rows[0].info = Some(MediaInfo::default());
+    app.start_run(0.0);
+    std::fs::remove_file(&p).ok();
+    assert!(app.measuring);
+    assert!(
+        matches!(&app.rows[0].psnr, MetricCell::Running { .. }),
+        "stale-stamped PSNR must recompute, got {:?}",
+        app.rows[0].psnr,
+    );
+    assert!(
+        matches!(&app.rows[0].ssim2, MetricCell::Done { .. }),
+        "FFVship SSIM2 ignores the pixel-format target, got {:?}",
+        app.rows[0].ssim2,
+    );
+    for _ in 0..200 {
+        app.drain_metric_results();
+        if !app.measuring {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(!app.measuring);
+    // Spawn fails headless (bogus binary): the cell records the error
+    // while SSIM2 still holds its skipped value.
+    assert!(matches!(&app.rows[0].psnr, MetricCell::Error { .. }));
+    assert!(matches!(&app.rows[0].ssim2, MetricCell::Done { .. }));
+}
+
+/// RGB targets are ignored for VMAF (requires YUV): an RGB-stamped VMAF
+/// cell keeps skipping under an RGB selection (legacy legs both times),
+/// and a matching PSNR cell skips too.
+#[test]
+fn start_run_rgb_target_ignored_for_vmaf_only() {
+    use crate::metrics::MetricCell;
+    use crate::metrics::ffmpeg::RefPixFmt;
+    use crate::metrics::vmaf::{Pooling, VmafCfg};
+    use crate::probe::MediaInfo;
+    let p = std::env::temp_dir().join("rfmetrics-pixfmt-vmafignore.tmp");
+    std::fs::write(&p, b"x").unwrap();
+    let mut app = RFMetricsApp {
+        m_psnr: true,
+        m_vmaf: true,
+        ref_path: p.to_string_lossy().into_owned(),
+        ..RFMetricsApp::default()
+    };
+    app.ref_pixfmt = RefPixFmt::Rgb24;
+    app.vmaf_subsample = "1".to_owned();
+    app.vmaf_threads = "4".to_owned();
+    app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+    app.ref_info_data = Some(MediaInfo::default());
+    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    let vmaf_cfg = VmafCfg {
+        model: "vmaf_v0.6.1.json".to_owned(),
+        phone: false,
+        scale: false,
+        pooling: Pooling::Mean,
+        subsample: 1,
+        n_threads: 4,
+    };
+    app.rows[0].psnr = MetricCell::Done {
+        values: vec![30.0],
+        avg: 30.0,
+        exec_s: 1.0,
+        skip: None,
+        clip_dur: None,
+        vmaf_cfg: None,
+        scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: RefPixFmt::Rgb24,
+    };
+    app.rows[0].vmaf = MetricCell::Done {
+        values: vec![90.0],
+        avg: 90.0,
+        exec_s: 1.0,
+        skip: None,
+        clip_dur: None,
+        vmaf_cfg: Some(vmaf_cfg),
+        scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: RefPixFmt::Rgb24,
+    };
+    app.rows[0].info = Some(MediaInfo::default());
+    app.start_run(0.0);
+    std::fs::remove_file(&p).ok();
+    // Matching RGB stamps: both skip (VMAF ignores the target, so its
+    // legs match; PSNR's stamped target matches the selection too).
+    assert!(!app.measuring);
+    assert!(matches!(&app.rows[0].psnr, MetricCell::Done { .. }));
+    assert!(matches!(&app.rows[0].vmaf, MetricCell::Done { .. }));
+}
+
+/// Pixel-format target persists and restores; unknown labels keep live.
+#[test]
+fn state_apply_restores_ref_pixfmt() {
+    use crate::metrics::ffmpeg::RefPixFmt;
+    let mut app = RFMetricsApp::default();
+    assert_eq!(app.ref_pixfmt, RefPixFmt::NoConversion);
+    let state = crate::state::AppState {
+        options: crate::state::OptionsState {
+            ref_pixfmt: Some("YUV 444p".to_owned()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    app.apply_state(Some(state));
+    assert_eq!(app.ref_pixfmt, RefPixFmt::Yuv444p);
+    assert!(app.snapshot().options.ref_pixfmt == Some("YUV 444p".to_owned()));
+    let state = crate::state::AppState {
+        options: crate::state::OptionsState {
+            ref_pixfmt: Some("yuv444p".to_owned()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    app.apply_state(Some(state));
+    assert_eq!(app.ref_pixfmt, RefPixFmt::Yuv444p);
+}
+
 /// Matching scaler stamp still skips: unchanged method recomputes nothing.
 #[test]
 fn start_run_matching_scaler_still_skips() {
@@ -1623,6 +1810,7 @@ fn start_run_matching_scaler_still_skips() {
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     app.rows[0].info = Some(MediaInfo::default());
     app.ref_info_data = Some(MediaInfo::default());
@@ -1661,6 +1849,7 @@ fn start_run_skip_toast_lists_all_metrics() {
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     app.rows[0].psnr = done(30.0);
     app.rows[0].ssim = done(0.9);
@@ -1680,6 +1869,7 @@ fn start_run_skip_toast_lists_all_metrics() {
         }),
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
@@ -1732,6 +1922,7 @@ fn start_run_skip_toast_merges_shared_rows() {
         }),
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     for i in 0..2 {
         app.rows[i].psnr = MetricCell::Done {
@@ -1743,6 +1934,7 @@ fn start_run_skip_toast_merges_shared_rows() {
             vmaf_cfg: None,
             scaler: ScaleMethod::Bicubic,
             fps_mode: InputFpsMode::Reference,
+            ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
         };
         app.rows[i].ssim = MetricCell::Done {
             values: vec![0.9],
@@ -1753,6 +1945,7 @@ fn start_run_skip_toast_merges_shared_rows() {
             vmaf_cfg: None,
             scaler: ScaleMethod::Bicubic,
             fps_mode: InputFpsMode::Reference,
+            ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
         };
         app.rows[i].vmaf = stale_vmaf();
         app.rows[i].info = Some(MediaInfo::default());
@@ -1845,6 +2038,7 @@ fn start_run_skips_done_psnr_but_runs_fresh_ssim() {
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     app.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
@@ -1936,6 +2130,7 @@ fn start_run_skips_done_xpsnr_but_runs_fresh_psnr() {
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     app.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
@@ -2051,6 +2246,7 @@ fn butter_rank_is_min_wins() {
             vmaf_cfg: None,
             scaler: ScaleMethod::Bicubic,
             fps_mode: InputFpsMode::Reference,
+            ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
         };
         let stats = app.rows[i].butter.done_stats();
         app.rows[i].butter_cache.stats = stats;
@@ -2348,6 +2544,7 @@ fn results_autosave_end_to_end() {
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     for aborted in [false, true] {
         app.metric_tx
@@ -2584,6 +2781,7 @@ fn cell_text_cache_set_and_cleared() {
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     app.metric_tx.send(done(None)).unwrap();
     app.drain_metric_results();
@@ -2622,6 +2820,7 @@ fn vmaf_first_done_arms_follow() {
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     let mut app = RFMetricsApp {
         show_plot: true,
@@ -2668,6 +2867,7 @@ fn follow_arm_rules() {
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     // Live-feed metric never arms, even first on the shown tab.
     let mut app = RFMetricsApp {
@@ -3235,6 +3435,7 @@ fn sort_test_row(
             vmaf_cfg: None,
             scaler: ScaleMethod::Bicubic,
             fps_mode: InputFpsMode::Reference,
+            ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
         },
         None => MetricCell::Idle,
     };
@@ -3367,6 +3568,7 @@ fn sort_view_follows_cell_stat_selector() {
             vmaf_cfg: None,
             scaler: ScaleMethod::Bicubic,
             fps_mode: InputFpsMode::Reference,
+            ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
         };
         if cache {
             let stats = r.psnr.done_stats();
@@ -3462,6 +3664,7 @@ fn refreeze_cell_texts_updates_all_done_cells() {
         vmaf_cfg: None,
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     app.rows[0].psnr = done(30.123_456);
     app.rows[0].ssim = done(0.987_654);

@@ -111,6 +111,7 @@ fn cell_text_and_tooltip() {
             vmaf_cfg: None,
             scaler: crate::metrics::ffmpeg::ScaleMethod::Bicubic,
             fps_mode: crate::metrics::ffmpeg::InputFpsMode::Reference,
+            ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
         }
         .cell_text_prec(DEFAULT_PRECISION),
         "30.1235"
@@ -125,6 +126,7 @@ fn cell_text_and_tooltip() {
             vmaf_cfg: None,
             scaler: crate::metrics::ffmpeg::ScaleMethod::Bicubic,
             fps_mode: crate::metrics::ffmpeg::InputFpsMode::Reference,
+            ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
         }
         .tooltip("PSNR")
         .starts_with("PSNR\nAvg: 30.000000")
@@ -209,6 +211,7 @@ fn cell_stat_text_formats_selected_stat() {
         vmaf_cfg: None,
         scaler: crate::metrics::ffmpeg::ScaleMethod::Bicubic,
         fps_mode: crate::metrics::ffmpeg::InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     assert_eq!(
         done.cell_stat_text_prec(CellStat::Avg, DEFAULT_PRECISION),
@@ -254,6 +257,7 @@ fn cell_precision_formats_at_given_decimals() {
         vmaf_cfg: None,
         scaler: crate::metrics::ffmpeg::ScaleMethod::Bicubic,
         fps_mode: crate::metrics::ffmpeg::InputFpsMode::Reference,
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     assert_eq!(done.cell_text_prec(0), "21");
     assert_eq!(done.cell_text_prec(2), "21.00");

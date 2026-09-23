@@ -143,6 +143,7 @@ fn filter_baseline_matches_python_shape() {
         "vmaf_log_1.json",
         8,
         ScaleMethod::Bicubic,
+        crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     )
     .unwrap();
     assert_eq!(
@@ -177,6 +178,7 @@ fn filter_phone_scale_pool_subsample() {
         "v.json",
         0,
         ScaleMethod::Bicubic,
+        crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     )
     .unwrap();
     // Two backslashes before the colon (Python parity): the outer
@@ -201,6 +203,7 @@ fn filter_phone_scale_pool_subsample() {
         "v.json",
         4,
         ScaleMethod::Bicubic,
+        crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     )
     .unwrap();
     assert!(f.contains(":n_subsample=1:n_threads=4:"));
@@ -231,6 +234,7 @@ fn scale_follows_model_height_threshold() {
         "v.json",
         0,
         ScaleMethod::Bicubic,
+        crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     )
     .unwrap();
     assert!(!f.contains("scale="), "must not upscale: {f}");
@@ -247,6 +251,7 @@ fn scale_follows_model_height_threshold() {
         "v.json",
         0,
         ScaleMethod::Bicubic,
+        crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     )
     .unwrap();
     assert!(!f.contains("scale="), "must not rescale in place: {f}");
@@ -262,6 +267,7 @@ fn scale_follows_model_height_threshold() {
         "v.json",
         0,
         ScaleMethod::Bicubic,
+        crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     )
     .unwrap();
     assert!(!f.contains("scale="), "within threshold: {f}");
@@ -277,6 +283,7 @@ fn scale_follows_model_height_threshold() {
         "v.json",
         0,
         ScaleMethod::Bicubic,
+        crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     )
     .unwrap();
     assert!(
@@ -301,6 +308,7 @@ fn scale_follows_model_height_threshold() {
         "v.json",
         0,
         ScaleMethod::Bicubic,
+        crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     )
     .unwrap();
     assert!(f.contains("scale=1599:1080:flags=bicubic"), "{f}");
@@ -315,6 +323,7 @@ fn scale_follows_model_height_threshold() {
         "v.json",
         0,
         ScaleMethod::Bicubic,
+        crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     )
     .unwrap();
     assert!(f.contains("scale=1920:785:flags=bicubic"), "{f}");
@@ -331,6 +340,7 @@ fn scale_follows_model_height_threshold() {
         "v.json",
         0,
         ScaleMethod::Bicubic,
+        crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     )
     .unwrap();
     assert!(
@@ -359,7 +369,8 @@ fn phone_guard_rejects_neg_and_4k() {
             &dir,
             "v.json",
             0,
-            ScaleMethod::Bicubic
+            ScaleMethod::Bicubic,
+            crate::metrics::ffmpeg::RefPixFmt::NoConversion
         ),
         Err("Model 'vmaf_v0.6.1neg.json' has no Phone transform (use v0.6.1)".to_owned())
     );
@@ -374,7 +385,8 @@ fn phone_guard_rejects_neg_and_4k() {
             &dir,
             "v.json",
             0,
-            ScaleMethod::Bicubic
+            ScaleMethod::Bicubic,
+            crate::metrics::ffmpeg::RefPixFmt::NoConversion
         )
         .is_err()
     );
@@ -408,7 +420,8 @@ fn phone_guard_rejects_any_v1_model() {
                 &dir,
                 "v.json",
                 0,
-                ScaleMethod::Bicubic
+                ScaleMethod::Bicubic,
+                crate::metrics::ffmpeg::RefPixFmt::NoConversion
             ),
             Err(format!(
                 "Model '{m}' has no Phone transform (v1 uses the separate 5d0h phone file)"
@@ -433,12 +446,77 @@ fn filter_trims_and_scales_dist_only() {
         "v.json",
         0,
         ScaleMethod::Bicubic,
+        crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     )
     .unwrap();
     assert!(f.contains(
             "[0:v]trim=start=5:end=15,settb=AVTB,setpts=PTS-STARTPTS,scale=1920:1080:flags=bicubic[main]"
         ));
     assert!(f.contains("[1:v]trim=start=5:end=15,settb=AVTB,setpts=PTS-STARTPTS[ref]"));
+}
+
+#[test]
+fn filter_target_converges_and_ignores_rgb() {
+    use crate::metrics::ffmpeg::RefPixFmt;
+    let (_g, dir) = models_dir(&["vmaf_v0.6.1.json"]);
+    let mut dist = ref_info();
+    dist.pix_fmt = Some("yuv422p".to_owned());
+    let f = build_filter(
+        &ref_info(),
+        &dist,
+        None,
+        None,
+        &cfg(),
+        &dir,
+        "v.json",
+        0,
+        ScaleMethod::Bicubic,
+        RefPixFmt::Yuv444p,
+    )
+    .unwrap();
+    assert!(f.contains("[0:v]settb=AVTB,setpts=PTS-STARTPTS,format=yuv444p[main]"));
+    assert!(f.contains("[1:v]settb=AVTB,setpts=PTS-STARTPTS,format=yuv444p[ref]"));
+    // RGB targets are ignored for VMAF (requires YUV): legacy legs.
+    let f = build_filter(
+        &ref_info(),
+        &dist,
+        None,
+        None,
+        &cfg(),
+        &dir,
+        "v.json",
+        0,
+        ScaleMethod::Bicubic,
+        RefPixFmt::Rgb24,
+    )
+    .unwrap();
+    assert!(f.contains("[0:v]settb=AVTB,setpts=PTS-STARTPTS,format=yuv420p[main]"));
+    assert!(f.contains("[1:v]settb=AVTB,setpts=PTS-STARTPTS[ref]"));
+}
+
+#[test]
+fn filter_rgb_ref_converges_on_yuv444p() {
+    use crate::metrics::ffmpeg::RefPixFmt;
+    let (_g, dir) = models_dir(&["vmaf_v0.6.1.json"]);
+    let mut rgb = ref_info();
+    rgb.pix_fmt = Some("rgb24".to_owned());
+    // An RGB reference no longer fails libvmaf: both legs converge on
+    // the map canonical format (upstream PixelFormatMap parity).
+    let f = build_filter(
+        &rgb,
+        &rgb,
+        None,
+        None,
+        &cfg(),
+        &dir,
+        "v.json",
+        0,
+        ScaleMethod::Bicubic,
+        RefPixFmt::NoConversion,
+    )
+    .unwrap();
+    assert!(f.contains("[0:v]settb=AVTB,setpts=PTS-STARTPTS,format=yuv444p[main]"));
+    assert!(f.contains("[1:v]settb=AVTB,setpts=PTS-STARTPTS,format=yuv444p[ref]"));
 }
 
 #[test]
@@ -512,6 +590,7 @@ fn setrange_tags_differing_ranges() {
         "v.json",
         0,
         ScaleMethod::Bicubic,
+        crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     )
     .unwrap();
     assert!(f.contains("[0:v]settb=AVTB,setpts=PTS-STARTPTS,setrange=range=pc[main]"));
@@ -527,6 +606,7 @@ fn setrange_tags_differing_ranges() {
         "v.json",
         0,
         ScaleMethod::Bicubic,
+        crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     )
     .unwrap();
     assert!(!f.contains("setrange"));
@@ -553,6 +633,7 @@ fn model_scale_legs_follow_scaler() {
         "v.json",
         0,
         ScaleMethod::Lanczos,
+        crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     )
     .unwrap();
     assert!(
@@ -574,6 +655,7 @@ fn model_scale_legs_follow_scaler() {
         "v.json",
         0,
         ScaleMethod::FfmpegDefault,
+        crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     )
     .unwrap();
     assert!(f.contains("scale=1920:1080[main]"), "{f}");

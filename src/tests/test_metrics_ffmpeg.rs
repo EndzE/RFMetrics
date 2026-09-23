@@ -109,7 +109,15 @@ fn graph_scales_dist_to_ref() {
     dist.width = Some(1280);
     dist.height = Some(720);
     dist.pix_fmt = Some("yuv444p".to_owned());
-    let g = filtergraph(Psnr, &ref_info(), &dist, None, None, ScaleMethod::default());
+    let g = filtergraph(
+        Psnr,
+        &ref_info(),
+        &dist,
+        None,
+        None,
+        ScaleMethod::default(),
+        RefPixFmt::NoConversion,
+    );
     assert_eq!(
         g,
         "[0:v]settb=AVTB,setpts=PTS-STARTPTS,scale=1920:1080:flags=bicubic,format=yuv420p[main];\
@@ -128,6 +136,7 @@ fn graph_matching_streams_have_no_scale() {
         Some(5.0),
         Some(10.0),
         ScaleMethod::default(),
+        RefPixFmt::NoConversion,
     );
     assert!(g.contains("[0:v]trim=start=5:end=15,"));
     assert!(g.contains("[1:v]trim=start=5:end=15,"));
@@ -147,6 +156,7 @@ fn graph_zero_skip_and_clip_disable_trim() {
         None,
         None,
         ScaleMethod::default(),
+        RefPixFmt::NoConversion,
     );
     assert_eq!(
         filtergraph(
@@ -155,7 +165,8 @@ fn graph_zero_skip_and_clip_disable_trim() {
             &ref_info(),
             Some(0.0),
             Some(0.0),
-            ScaleMethod::default()
+            ScaleMethod::default(),
+            RefPixFmt::NoConversion
         ),
         plain
     );
@@ -168,6 +179,7 @@ fn graph_zero_skip_and_clip_disable_trim() {
         Some(0.0),
         Some(10.0),
         ScaleMethod::default(),
+        RefPixFmt::NoConversion,
     );
     assert!(g.contains("trim=start=0:end=10"));
     let g = filtergraph(
@@ -177,6 +189,7 @@ fn graph_zero_skip_and_clip_disable_trim() {
         Some(5.0),
         Some(0.0),
         ScaleMethod::default(),
+        RefPixFmt::NoConversion,
     );
     assert!(g.contains("[0:v]trim=start=5,"));
     assert!(!g.contains(":end="));
@@ -192,6 +205,7 @@ fn ssim_graph_differs_only_by_filter_name() {
         Some(5.0),
         Some(10.0),
         ScaleMethod::default(),
+        RefPixFmt::NoConversion,
     );
     let ssim = filtergraph(
         Ssim,
@@ -200,6 +214,7 @@ fn ssim_graph_differs_only_by_filter_name() {
         Some(5.0),
         Some(10.0),
         ScaleMethod::default(),
+        RefPixFmt::NoConversion,
     );
     // Same legs, same order — only the filter segment differs.
     assert_eq!(
@@ -219,6 +234,7 @@ fn ssim_graph_differs_only_by_filter_name() {
         None,
         ScaleMethod::default(),
         super::InputFpsMode::default(),
+        RefPixFmt::NoConversion,
     );
     assert!(a.iter().any(|x| x.contains("[main][ref]ssim=")));
 }
@@ -236,6 +252,7 @@ fn args_order_is_dist_then_ref() {
         None,
         ScaleMethod::default(),
         super::InputFpsMode::default(),
+        RefPixFmt::NoConversion,
     );
     let i1 = a.iter().position(|x| x == "dist.mp4").unwrap();
     let i2 = a.iter().position(|x| x == "ref.mp4").unwrap();
@@ -400,6 +417,7 @@ fn xpsnr_graph_inverts_input_order() {
         Some(5.0),
         Some(10.0),
         ScaleMethod::default(),
+        RefPixFmt::NoConversion,
     );
     let xpsnr = filtergraph(
         Xpsnr,
@@ -408,6 +426,7 @@ fn xpsnr_graph_inverts_input_order() {
         Some(5.0),
         Some(10.0),
         ScaleMethod::default(),
+        RefPixFmt::NoConversion,
     );
     // Same legs — only the order segment and filter name differ.
     assert_eq!(
@@ -444,6 +463,7 @@ fn setrange_only_when_ranges_differ() {
         None,
         None,
         ScaleMethod::default(),
+        RefPixFmt::NoConversion,
     );
     assert!(!g.contains("setrange"));
     // tv vs pc: each leg tagged with its own range.
@@ -451,7 +471,15 @@ fn setrange_only_when_ranges_differ() {
     rf.range_tag = Some("tv".to_owned());
     let mut dist = ref_info();
     dist.range_tag = Some("pc".to_owned());
-    let g = filtergraph(Psnr, &rf, &dist, None, None, ScaleMethod::default());
+    let g = filtergraph(
+        Psnr,
+        &rf,
+        &dist,
+        None,
+        None,
+        ScaleMethod::default(),
+        RefPixFmt::NoConversion,
+    );
     assert!(g.contains("[0:v]settb=AVTB,setpts=PTS-STARTPTS,setrange=range=pc[main]"));
     assert!(g.contains("[1:v]settb=AVTB,setpts=PTS-STARTPTS,setrange=range=tv[ref]"));
 }
@@ -466,7 +494,15 @@ fn setrange_sits_between_scale_and_format() {
     dist.width = Some(1280);
     dist.height = Some(720);
     dist.pix_fmt = Some("yuv444p".to_owned());
-    let g = filtergraph(Psnr, &rf, &dist, None, None, ScaleMethod::default());
+    let g = filtergraph(
+        Psnr,
+        &rf,
+        &dist,
+        None,
+        None,
+        ScaleMethod::default(),
+        RefPixFmt::NoConversion,
+    );
     assert!(g.contains(
             "[0:v]settb=AVTB,setpts=PTS-STARTPTS,scale=1920:1080:flags=bicubic,setrange=range=pc,format=yuv420p[main]"
         ));
@@ -485,6 +521,7 @@ fn args_start_with_probesize() {
         None,
         ScaleMethod::default(),
         super::InputFpsMode::default(),
+        RefPixFmt::NoConversion,
     );
     assert_eq!(&a[..4], &["-hide_banner", "-nostdin", "-probesize", "50M"]);
 }
@@ -524,7 +561,15 @@ fn graph_scaler_selects_flags() {
     let mut dist = ref_info();
     dist.width = Some(1280);
     dist.height = Some(720);
-    let g = filtergraph(Psnr, &ref_info(), &dist, None, None, ScaleMethod::Lanczos);
+    let g = filtergraph(
+        Psnr,
+        &ref_info(),
+        &dist,
+        None,
+        None,
+        ScaleMethod::Lanczos,
+        RefPixFmt::NoConversion,
+    );
     assert!(g.contains("scale=1920:1080:flags=lanczos[main]"));
     // FFmpeg default: today's flagless strings.
     let g = filtergraph(
@@ -534,6 +579,7 @@ fn graph_scaler_selects_flags() {
         None,
         None,
         ScaleMethod::FfmpegDefault,
+        RefPixFmt::NoConversion,
     );
     assert!(g.contains("scale=1920:1080[main]"));
     assert!(!g.contains("flags="));
@@ -630,5 +676,153 @@ fn conversion_warnings_mirror_filtergraph_legs() {
             .map(RefDistMismatch::describe)
             .collect::<Vec<_>>(),
         ["Scaled: 640x480 -> 1920x1080"]
+    );
+}
+
+#[test]
+fn ref_pixfmt_labels_tokens_and_support() {
+    use super::{MetricKind, RefPixFmt};
+    assert_eq!(RefPixFmt::default(), RefPixFmt::NoConversion);
+    assert_eq!(RefPixFmt::ALL.len(), 12);
+    assert_eq!(RefPixFmt::ALL[0], RefPixFmt::NoConversion);
+    assert_eq!(RefPixFmt::NoConversion.token(), None);
+    assert_eq!(RefPixFmt::Rgb24.token(), Some("rgb24"));
+    assert_eq!(RefPixFmt::Rgb48.token(), Some("rgb48le"));
+    assert_eq!(RefPixFmt::Yuv444p16.token(), Some("yuv444p16le"));
+    for m in RefPixFmt::ALL {
+        assert_eq!(RefPixFmt::from_label(m.label()), Some(m));
+    }
+    assert_eq!(RefPixFmt::from_label("yuv420p"), None);
+    assert_eq!(RefPixFmt::from_label(""), None);
+    // VMAF requires YUV (verified upstream); the filter metrics score
+    // every token (rgb24, rgb48le, yuv444p16le verified live).
+    for m in RefPixFmt::ALL {
+        let yuv = m.token().is_none_or(|t| t.starts_with("yuv"));
+        assert_eq!(m.supports(MetricKind::Vmaf), yuv);
+        assert!(m.supports(MetricKind::Psnr));
+        assert!(m.supports(MetricKind::Ssim));
+        assert!(m.supports(MetricKind::Xpsnr));
+        assert!(m.supports(MetricKind::Ssim2));
+    }
+}
+
+#[test]
+fn format_legs_converge_or_fall_back() {
+    use super::{MetricKind::Psnr, RefPixFmt, format_legs};
+    // Legacy: dist converts to the known reference, ref leg untouched.
+    assert_eq!(
+        format_legs(
+            Some("yuv420p"),
+            Some("yuv444p"),
+            RefPixFmt::NoConversion,
+            Psnr
+        ),
+        (Some("format=yuv420p".to_owned()), None)
+    );
+    // Matching pair: no legs at all.
+    assert_eq!(
+        format_legs(
+            Some("yuv420p"),
+            Some("yuv420p"),
+            RefPixFmt::NoConversion,
+            Psnr
+        ),
+        (None, None)
+    );
+    // Targeted: both legs converge; the already-matching side stays bare.
+    assert_eq!(
+        format_legs(Some("yuv420p"), Some("yuv420p"), RefPixFmt::Yuv444p, Psnr),
+        (
+            Some("format=yuv444p".to_owned()),
+            Some("format=yuv444p".to_owned())
+        )
+    );
+    assert_eq!(
+        format_legs(Some("yuv444p"), Some("yuv420p"), RefPixFmt::Yuv444p, Psnr),
+        (Some("format=yuv444p".to_owned()), None)
+    );
+    // Unknown distorted still converts (legacy parity).
+    assert_eq!(
+        format_legs(Some("yuv420p"), None, RefPixFmt::NoConversion, Psnr),
+        (Some("format=yuv420p".to_owned()), None)
+    );
+}
+
+#[test]
+fn filtergraph_target_converges_both_legs() {
+    use super::MetricKind::Psnr;
+    let mut dist = ref_info();
+    dist.pix_fmt = Some("yuv422p".to_owned());
+    let g = filtergraph(
+        Psnr,
+        &ref_info(),
+        &dist,
+        None,
+        None,
+        ScaleMethod::default(),
+        RefPixFmt::Yuv444p,
+    );
+    assert!(g.contains("[0:v]settb=AVTB,setpts=PTS-STARTPTS,format=yuv444p[main]"));
+    assert!(g.contains("[1:v]settb=AVTB,setpts=PTS-STARTPTS,format=yuv444p[ref]"));
+}
+
+#[test]
+fn canonical_pixfmt_resolves_upstream_map() {
+    use super::canonical_pixfmt;
+    // Family representatives route to their canonical working format.
+    assert_eq!(canonical_pixfmt(Some("rgb24")), Some("yuv444p"));
+    assert_eq!(canonical_pixfmt(Some("nv12")), Some("yuv420p"));
+    assert_eq!(canonical_pixfmt(Some("gbrp10le")), Some("yuv444p10le"));
+    assert_eq!(canonical_pixfmt(Some("yuv422p14le")), Some("yuv422p16le"));
+    // Canonical formats resolve to themselves (no legs emitted).
+    assert_eq!(canonical_pixfmt(Some("yuv420p")), Some("yuv420p"));
+    // Unlisted formats fall back to the upstream default; unknown emits
+    // nothing (no leg can be built without a source format).
+    assert_eq!(canonical_pixfmt(Some("mystery")), Some("yuv444p16le"));
+    assert_eq!(canonical_pixfmt(None), None);
+}
+
+#[test]
+fn every_yuv_token_is_self_canonical() {
+    use super::{RefPixFmt, canonical_pixfmt};
+    // The dropdown tokens must never gain map legs of their own.
+    for m in RefPixFmt::ALL {
+        if let Some(t) = m.token()
+            && t.starts_with("yuv")
+        {
+            assert_eq!(canonical_pixfmt(Some(t)), Some(t), "{t}");
+        }
+    }
+}
+
+#[test]
+fn format_legs_vmaf_canonicalizes_through_map() {
+    use super::{MetricKind::Vmaf, RefPixFmt, format_legs};
+    let nc = RefPixFmt::NoConversion;
+    // RGB pair: both legs converge on yuv444p instead of failing libvmaf.
+    assert_eq!(
+        format_legs(Some("rgb24"), Some("rgb24"), nc, Vmaf),
+        (
+            Some("format=yuv444p".to_owned()),
+            Some("format=yuv444p".to_owned())
+        )
+    );
+    // Unlisted ref format: default fallback on both legs.
+    assert_eq!(
+        format_legs(Some("mystery"), Some("mystery"), nc, Vmaf),
+        (
+            Some("format=yuv444p16le".to_owned()),
+            Some("format=yuv444p16le".to_owned())
+        )
+    );
+    // Unknown ref: nothing emitted (legacy parity).
+    assert_eq!(format_legs(None, Some("yuv420p"), nc, Vmaf), (None, None));
+    // Explicit RGB target is unsupported for VMAF: map decides instead.
+    assert_eq!(
+        format_legs(Some("rgb24"), Some("rgb24"), RefPixFmt::Rgb24, Vmaf),
+        (
+            Some("format=yuv444p".to_owned()),
+            Some("format=yuv444p".to_owned())
+        )
     );
 }

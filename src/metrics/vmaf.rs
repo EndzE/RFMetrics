@@ -178,6 +178,7 @@ pub fn build_filter(
     logname: &str,
     n_threads: u32,
     scaler: ScaleMethod,
+    ref_pixfmt: super::ffmpeg::RefPixFmt,
 ) -> Result<String, String> {
     let (mut model_opt, model_name) = resolve_model(&cfg.model, models_dir);
     if cfg.phone {
@@ -231,8 +232,19 @@ pub fn build_filter(
     if range_differs && let Some(s) = setrange_segment(ref_info.range_tag.as_deref()) {
         ref_pre.push(s);
     }
-    if ref_info.pix_fmt.is_some() && dist_info.pix_fmt != ref_info.pix_fmt {
-        main_pre.push(format!("format={}", ref_info.pix_fmt.as_deref().unwrap()));
+    // Pixel-format target converges both legs (unsupported selections,
+    // e.g. RGB for VMAF, fall back to the map canonicalization).
+    let (dist_fmt, ref_fmt) = super::ffmpeg::format_legs(
+        ref_info.pix_fmt.as_deref(),
+        dist_info.pix_fmt.as_deref(),
+        ref_pixfmt,
+        super::ffmpeg::MetricKind::Vmaf,
+    );
+    if let Some(s) = dist_fmt {
+        main_pre.push(s);
+    }
+    if let Some(s) = ref_fmt {
+        ref_pre.push(s);
     }
     // `model={model_opt}` unquoted so `\\:` passes both parse levels.
     Ok(format!(
@@ -393,6 +405,7 @@ pub fn run_vmaf(job: &RunInputs, cfg: &VmafCfg, on_progress: &(dyn Fn(u64) + Syn
         clip_dur,
         scaler,
         fps_mode,
+        ref_pixfmt,
         abort,
         child_slot,
         ..
@@ -424,6 +437,7 @@ pub fn run_vmaf(job: &RunInputs, cfg: &VmafCfg, on_progress: &(dyn Fn(u64) + Syn
         &logname,
         cfg.n_threads,
         scaler,
+        ref_pixfmt,
     ) {
         Ok(f) => f,
         Err(e) => {

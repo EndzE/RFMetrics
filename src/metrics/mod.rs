@@ -37,6 +37,11 @@ pub enum MetricCell {
         /// mode recomputes every ffmpeg-backed column (FFVship has no
         /// `-r` stage and ignores it).
         fps_mode: crate::metrics::ffmpeg::InputFpsMode,
+        /// Reference pixel-format target the run used; a rerun under a
+        /// different target recomputes every ffmpeg-backed column
+        /// (FFVship has no `format=` stage and ignores it; selections
+        /// the metric doesn't support fall back to legacy legs).
+        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt,
     },
     Error {
         msg: String,
