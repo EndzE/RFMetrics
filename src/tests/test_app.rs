@@ -720,6 +720,42 @@ fn drain_caches_stats_and_ranks_once() {
 }
 
 #[test]
+fn reset_metric_clears_only_that_column() {
+    use crate::metrics::ffmpeg::MetricKind;
+    use crate::metrics::{MetricCell, StatRank};
+    let mut app = RFMetricsApp::default();
+    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    let done = |avg: f64| MetricCell::Done {
+        values: vec![avg - 1.0, avg, avg + 1.0],
+        avg,
+        exec_s: 1.0,
+        skip: None,
+        clip_dur: None,
+        vmaf_cfg: None,
+        scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
+    };
+    app.rows[0].psnr = done(30.0);
+    app.rows[0].ssim = done(0.95);
+    app.rows[0].psnr_cache.stats = app.rows[0].psnr.done_stats();
+    app.rows[0].ssim_cache.stats = app.rows[0].ssim.done_stats();
+    app.rows[0].psnr_cache.text = app.rows[0].psnr.cell_text();
+    app.rows[0].ssim_cache.text = app.rows[0].ssim.cell_text();
+    app.live_kind = Some(MetricKind::Psnr);
+    app.live_key = Some(app.rows[0].key.clone());
+    app.reset_metric(MetricKind::Psnr);
+    assert!(matches!(app.rows[0].psnr, MetricCell::Idle));
+    assert!(app.rows[0].psnr_cache.stats.is_none());
+    assert_eq!(app.rows[0].psnr_cache.ranks, [StatRank::Plain; 10]);
+    // Other columns untouched.
+    assert!(matches!(app.rows[0].ssim, MetricCell::Done { .. }));
+    assert!(app.rows[0].ssim_cache.stats.is_some());
+    assert_eq!(app.rows[0].ssim_cache.text, "0.9500");
+    // Live pointer cleared only because it pointed at the reset kind.
+    assert_eq!(app.live_kind, None);
+}
+
+#[test]
 fn refresh_ranks_single_row_stays_plain() {
     use crate::metrics::ffmpeg::MetricKind;
     use crate::metrics::{MetricCell, StatRank};

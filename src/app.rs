@@ -2202,6 +2202,21 @@ impl RFMetricsApp {
         log::info!(target: "rfmetrics::app", "metric results cleared");
     }
 
+    /// Clear one metric column (header Reset). No abort/generation bump:
+    /// the menu item is disabled while running, so nothing is in flight.
+    fn reset_metric(&mut self, kind: MetricKind) {
+        for row in &mut self.rows {
+            *row.cell_mut(kind) = crate::metrics::MetricCell::Idle;
+            *row.cached_mut(kind) = CachedStats::default();
+        }
+        self.refresh_ranks(kind);
+        if self.live_kind == Some(kind) {
+            self.live_kind = None;
+            self.live_key = None;
+        }
+        log::info!(target: "rfmetrics::app", "{} results cleared", kind.name());
+    }
+
     /// Snapshot of finished cells for the bad-frames worker (owned so
     /// the thread never touches UI state). Current viewer tab only.
     fn badframe_jobs_for(&self, kind: MetricKind) -> Option<BadframePlan> {
@@ -4901,6 +4916,10 @@ impl eframe::App for RFMetricsApp {
                     let sort_spec = self.sort_spec;
                     // Header sort click, applied once below the loop.
                     let mut sort_click: Option<SortColumn> = None;
+                    // Header per-metric Reset, applied once below the loop
+                    // (deferred so the `&mut` flag borrows above don't
+                    // conflict with the `&mut self` reset call).
+                    let mut reset_click: Option<MetricKind> = None;
                     table
                         .header(18.0, |mut header| {
                             header.col(|_| {});
@@ -4983,19 +5002,31 @@ impl eframe::App for RFMetricsApp {
                                     {
                                         sort_click = Some(col);
                                     }
-                                    let resp = ui.add_enabled(
+                                    let mut resp = ui.add_enabled(
                                         ok && !run_locked,
                                         egui::Checkbox::new(flag, name),
                                     );
                                     if !ok {
-                                        if kind.is_ffvship() {
-                                            resp.on_hover_text(&ffvship_detail);
+                                        resp = if kind.is_ffvship() {
+                                            resp.on_hover_text(&ffvship_detail)
                                         } else {
                                             resp.on_hover_text(format!(
                                                 "{name} filter not supported by this ffmpeg build"
-                                            ));
-                                        }
+                                            ))
+                                        };
                                     }
+                                    resp.context_menu(|ui| {
+                                        if ui
+                                            .add_enabled(
+                                                !run_locked,
+                                                egui::Button::new(format!("Reset {name}")),
+                                            )
+                                            .clicked()
+                                        {
+                                            reset_click = Some(kind);
+                                            ui.close();
+                                        }
+                                    });
                                 });
                             }
                         })
@@ -5307,6 +5338,10 @@ impl eframe::App for RFMetricsApp {
                     // insertion).
                     if let Some(col) = sort_click {
                         self.sort_spec = cycle_sort(self.sort_spec, col);
+                    }
+                    // Header per-metric Reset: one column back to Idle.
+                    if let Some(kind) = reset_click {
+                        self.reset_metric(kind);
                     }
                     if let Some(path) = open_path
                         && let Err(e) = open::that(&path)
