@@ -579,3 +579,56 @@ fn rate_args_modes_per_leg() {
         ["-r", "30"]
     );
 }
+
+/// Upstream #47: every silent normalization warns; matches and probe
+/// gaps warn nothing.
+#[test]
+fn conversion_warnings_mirror_filtergraph_legs() {
+    use super::{RefDistMismatch, conversion_warnings};
+    let rf = ref_info();
+    // Identical pair: silent.
+    assert!(conversion_warnings(&rf, &rf).is_empty());
+    // Unknown everything: no false alarms on probe gaps — except pixfmt,
+    // which mirrors the `format=` leg verbatim (a known reference converts
+    // even an unknown distorted format).
+    assert!(conversion_warnings(&MediaInfo::default(), &rf).is_empty());
+    assert_eq!(
+        conversion_warnings(&rf, &MediaInfo::default())
+            .iter()
+            .map(RefDistMismatch::describe)
+            .collect::<Vec<_>>(),
+        ["Converted: -unknown- -> yuv420p"]
+    );
+    let mut dist = rf.clone();
+    dist.width = Some(1280);
+    dist.height = Some(720);
+    dist.pix_fmt = Some("yuv420p10le".to_owned());
+    dist.range_tag = Some("pc".to_owned());
+    dist.fps = Some(30.0);
+    let mut rf = rf.clone();
+    rf.range_tag = Some("tv".to_owned());
+    let got: Vec<String> = conversion_warnings(&rf, &dist)
+        .iter()
+        .map(RefDistMismatch::describe)
+        .collect();
+    assert_eq!(
+        got,
+        [
+            "Scaled: 1280x720 -> 1920x1080",
+            "Converted: yuv420p10le -> yuv420p",
+            "Range: PC -> TV",
+            "Frame rate: 30 vs 25 fps",
+        ]
+    );
+    // One axis at a time also warns alone.
+    let mut d = rf.clone();
+    d.width = Some(640);
+    d.height = Some(480);
+    assert_eq!(
+        conversion_warnings(&rf, &d)
+            .iter()
+            .map(RefDistMismatch::describe)
+            .collect::<Vec<_>>(),
+        ["Scaled: 640x480 -> 1920x1080"]
+    );
+}

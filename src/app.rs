@@ -4013,6 +4013,9 @@ fn panel_frame(ui: &egui::Ui, hovering: bool) -> egui::Frame {
 const BEST_FILL: egui::Color32 = egui::Color32::from_rgb(0x2E, 0x6B, 0x3E);
 const WORST_FILL: egui::Color32 = egui::Color32::from_rgb(0x7A, 0x36, 0x36);
 const TIE_FILL: egui::Color32 = egui::Color32::from_rgb(0x6B, 0x5F, 0x2A);
+/// Cross-format warning tint for Media cells (upstream #47): readable on
+/// the dark default theme without touching layout.
+const WARN_TEXT: egui::Color32 = egui::Color32::from_rgb(0xE5, 0xA6, 0x3B);
 
 /// Cell/chip background for a stat rank; `None` = no highlight.
 fn rank_fill(rank: crate::metrics::StatRank) -> Option<egui::Color32> {
@@ -5338,8 +5341,48 @@ impl eframe::App for RFMetricsApp {
                                 }
                                 let (_, r) = row.col(|ui| {
                                     let row_data = &self.rows[vi];
-                                    ui.add(egui::Label::new(&row_data.media).selectable(false))
-                                        .on_hover_text(&row_data.media_tip);
+                                    // Cross-format warning (upstream #47):
+                                    // the runners silently scale/convert a
+                                    // distorted leg to the reference (FFVship
+                                    // normalizes nothing at all), so a row
+                                    // whose probe differs from the reference
+                                    // ambers with the conversions listed in
+                                    // its tooltip. Comparisons only when
+                                    // matched; strings alloc on mismatch.
+                                    let warns = match (
+                                        self.ref_info_data.as_ref(),
+                                        row_data.info.as_ref(),
+                                    ) {
+                                        (Some(r), Some(d)) => {
+                                            crate::metrics::ffmpeg::conversion_warnings(r, d)
+                                        }
+                                        _ => Vec::new(),
+                                    };
+                                    let rich = if warns.is_empty() {
+                                        egui::RichText::new(&row_data.media)
+                                    } else {
+                                        egui::RichText::new(&row_data.media).color(WARN_TEXT)
+                                    };
+                                    let resp = ui.add(
+                                        egui::Label::new(rich).selectable(false),
+                                    );
+                                    if warns.is_empty() {
+                                        resp.on_hover_text(&row_data.media_tip);
+                                    } else {
+                                        resp.on_hover_ui(|ui| {
+                                            ui.label(&row_data.media_tip);
+                                            ui.add_space(5.0);
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "Cross-format vs reference:",
+                                                )
+                                                .strong(),
+                                            );
+                                            for w in &warns {
+                                                ui.label(w.describe());
+                                            }
+                                        });
+                                    }
                                 });
                                 r.context_menu(|ui| {
                                     if ui.button("Copy summary").clicked() {

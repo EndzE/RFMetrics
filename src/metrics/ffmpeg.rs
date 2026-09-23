@@ -520,6 +520,82 @@ pub fn filtergraph(
     )
 }
 
+/// One silent ref-vs-dist normalization (upstream #47): the filtergraph
+/// above (and the VMAF one) applies these legs without telling the user,
+/// and FFVship applies none at all — either way the scores are
+/// cross-format. Pure display data; mirrors the leg conditions exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefDistMismatch {
+    Scaled { dist: String, refr: String },
+    Format { dist: String, refr: String },
+    Range { dist: String, refr: String },
+    Fps { dist: String, refr: String },
+}
+
+impl RefDistMismatch {
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Scaled { dist, refr } => format!("Scaled: {dist} -> {refr}"),
+            Self::Format { dist, refr } => format!("Converted: {dist} -> {refr}"),
+            Self::Range { dist, refr } => format!("Range: {dist} -> {refr}"),
+            Self::Fps { dist, refr } => format!("Frame rate: {dist} vs {refr} fps"),
+        }
+    }
+}
+
+/// Ref-vs-dist normalizations the runners will silently apply (or, for
+/// FFVship, silently skip): resolution + pixfmt + range mirror the
+/// filtergraph legs above; fps flags that a rate step exists regardless
+/// of the Framerate mode (its hover already explains `-r` forcing).
+/// Unknown sides emit no leg, so they warn nothing — no false alarms on
+/// probe gaps (pixfmt mirrors the `format=` condition verbatim: a known
+/// reference converts even an unknown distorted format).
+pub fn conversion_warnings(ref_info: &MediaInfo, dist_info: &MediaInfo) -> Vec<RefDistMismatch> {
+    let mut out = Vec::new();
+    if (dist_info.width, dist_info.height) != (ref_info.width, ref_info.height)
+        && let (Some(dw), Some(dh)) = (dist_info.width, dist_info.height)
+        && let (Some(rw), Some(rh)) = (ref_info.width, ref_info.height)
+    {
+        out.push(RefDistMismatch::Scaled {
+            dist: format!("{dw}x{dh}"),
+            refr: format!("{rw}x{rh}"),
+        });
+    }
+    if ref_info.pix_fmt.is_some() && dist_info.pix_fmt != ref_info.pix_fmt {
+        out.push(RefDistMismatch::Format {
+            dist: dist_info
+                .pix_fmt
+                .as_deref()
+                .unwrap_or("-unknown-")
+                .to_owned(),
+            refr: ref_info
+                .pix_fmt
+                .as_deref()
+                .unwrap_or("-unknown-")
+                .to_owned(),
+        });
+    }
+    if let (Some(d), Some(r)) = (
+        dist_info.range_tag.as_deref(),
+        ref_info.range_tag.as_deref(),
+    ) && d != r
+    {
+        out.push(RefDistMismatch::Range {
+            dist: d.to_uppercase(),
+            refr: r.to_uppercase(),
+        });
+    }
+    if let (Some(d), Some(r)) = (dist_info.fps, ref_info.fps)
+        && d != r
+    {
+        out.push(RefDistMismatch::Fps {
+            dist: crate::probe::format_fps(d),
+            refr: crate::probe::format_fps(r),
+        });
+    }
+    out
+}
+
 /// Plane weights as `(y, u, v)` sample counts (Python
 /// `_xpsnr_plane_weights` parity): exact counts when the reference
 /// dimensions are known (`w*h`, `ceil(w/2)*ceil(h/2)`), 4:1:1 / 2:1:1
