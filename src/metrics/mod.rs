@@ -43,28 +43,33 @@ pub enum MetricCell {
     },
 }
 
+/// Default cell decimals (Options Precision) and its valid range.
+pub const DEFAULT_PRECISION: usize = 4;
+pub const MAX_PRECISION: usize = 6;
+
 impl MetricCell {
-    /// Short cell text (Python `_done_metric` / progress handler parity).
-    pub fn cell_text(&self) -> String {
+    /// Short cell text (Python `_done_metric` / progress handler parity)
+    /// at an explicit decimals count (Options Precision).
+    pub fn cell_text_prec(&self, prec: usize) -> String {
         match self {
             Self::Idle => "N/A".to_owned(),
             Self::Running { frame, .. } => format!("Frame: {frame}"),
-            Self::Done { avg, .. } => format!("{avg:.4}"),
+            Self::Done { avg, .. } => format!("{avg:.prec$}"),
             Self::Error { msg } => msg.clone(),
         }
     }
 
-    /// Copy-value text for the Options cell-value selector. Avg reuses
-    /// the frozen cell text; other stats format from a one-off
-    /// `DoneStats` — discrete clicks only, never the per-frame hot path.
-    pub fn cell_stat_text(&self, stat: CellStat) -> String {
+    /// Copy-value text for the Options cell-value selector at an
+    /// explicit decimals count (Options Precision) — discrete clicks
+    /// only, never the per-frame hot path.
+    pub fn cell_stat_text_prec(&self, stat: CellStat, prec: usize) -> String {
         match (self, stat) {
-            (_, CellStat::Avg) => self.cell_text(),
+            (_, CellStat::Avg) => self.cell_text_prec(prec),
             (done @ Self::Done { .. }, _) => done
                 .done_stats()
-                .map(|s| format!("{:.4}", s.value(stat)))
-                .unwrap_or_else(|| self.cell_text()),
-            _ => self.cell_text(),
+                .map(|s| format!("{:.prec$}", s.value(stat)))
+                .unwrap_or_else(|| self.cell_text_prec(prec)),
+            _ => self.cell_text_prec(prec),
         }
     }
 

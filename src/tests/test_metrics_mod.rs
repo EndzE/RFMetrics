@@ -92,13 +92,13 @@ fn done_stats_shape() {
 
 #[test]
 fn cell_text_and_tooltip() {
-    assert_eq!(MetricCell::Idle.cell_text(), "N/A");
+    assert_eq!(MetricCell::Idle.cell_text_prec(DEFAULT_PRECISION), "N/A");
     assert_eq!(
         MetricCell::Running {
             frame: 7,
             values: vec![30.0],
         }
-        .cell_text(),
+        .cell_text_prec(DEFAULT_PRECISION),
         "Frame: 7"
     );
     assert_eq!(
@@ -112,7 +112,7 @@ fn cell_text_and_tooltip() {
             scaler: crate::metrics::ffmpeg::ScaleMethod::Bicubic,
             fps_mode: crate::metrics::ffmpeg::InputFpsMode::Reference,
         }
-        .cell_text(),
+        .cell_text_prec(DEFAULT_PRECISION),
         "30.1235"
     );
     assert!(
@@ -210,17 +210,55 @@ fn cell_stat_text_formats_selected_stat() {
         scaler: crate::metrics::ffmpeg::ScaleMethod::Bicubic,
         fps_mode: crate::metrics::ffmpeg::InputFpsMode::Reference,
     };
-    assert_eq!(done.cell_stat_text(CellStat::Avg), "21.0000");
-    assert_eq!(done.cell_stat_text(CellStat::Mean), "20.0000");
-    assert_eq!(done.cell_stat_text(CellStat::Min), "10.0000");
-    assert_eq!(done.cell_stat_text(CellStat::Max), "30.0000");
+    assert_eq!(
+        done.cell_stat_text_prec(CellStat::Avg, DEFAULT_PRECISION),
+        "21.0000"
+    );
+    assert_eq!(
+        done.cell_stat_text_prec(CellStat::Mean, DEFAULT_PRECISION),
+        "20.0000"
+    );
+    assert_eq!(
+        done.cell_stat_text_prec(CellStat::Min, DEFAULT_PRECISION),
+        "10.0000"
+    );
+    assert_eq!(
+        done.cell_stat_text_prec(CellStat::Max, DEFAULT_PRECISION),
+        "30.0000"
+    );
     // Non-Done cells fall back to the plain cell text.
-    assert_eq!(MetricCell::Idle.cell_stat_text(CellStat::Max), "N/A");
+    assert_eq!(
+        MetricCell::Idle.cell_stat_text_prec(CellStat::Max, DEFAULT_PRECISION),
+        "N/A"
+    );
     assert_eq!(
         MetricCell::Error {
             msg: "boom".to_owned()
         }
-        .cell_stat_text(CellStat::Min),
+        .cell_stat_text_prec(CellStat::Min, DEFAULT_PRECISION),
         "boom"
     );
+}
+
+#[test]
+fn cell_precision_formats_at_given_decimals() {
+    use super::{CellStat, DEFAULT_PRECISION, MAX_PRECISION, MetricCell};
+    assert_eq!(DEFAULT_PRECISION, 4);
+    assert_eq!(MAX_PRECISION, 6);
+    let done = MetricCell::Done {
+        values: vec![10.0, 20.0, 30.0],
+        avg: 21.0,
+        exec_s: 1.0,
+        skip: None,
+        clip_dur: None,
+        vmaf_cfg: None,
+        scaler: crate::metrics::ffmpeg::ScaleMethod::Bicubic,
+        fps_mode: crate::metrics::ffmpeg::InputFpsMode::Reference,
+    };
+    assert_eq!(done.cell_text_prec(0), "21");
+    assert_eq!(done.cell_text_prec(2), "21.00");
+    assert_eq!(done.cell_text_prec(6), "21.000000");
+    assert_eq!(done.cell_stat_text_prec(CellStat::Mean, 0), "20");
+    assert_eq!(done.cell_stat_text_prec(CellStat::Mean, 6), "20.000000");
+    assert_eq!(done.cell_stat_text_prec(CellStat::Min, 2), "10.00");
 }

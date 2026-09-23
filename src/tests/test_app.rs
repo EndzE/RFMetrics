@@ -739,8 +739,12 @@ fn reset_metric_clears_only_that_column() {
     app.rows[0].ssim = done(0.95);
     app.rows[0].psnr_cache.stats = app.rows[0].psnr.done_stats();
     app.rows[0].ssim_cache.stats = app.rows[0].ssim.done_stats();
-    app.rows[0].psnr_cache.text = app.rows[0].psnr.cell_text();
-    app.rows[0].ssim_cache.text = app.rows[0].ssim.cell_text();
+    app.rows[0].psnr_cache.text = app.rows[0]
+        .psnr
+        .cell_text_prec(crate::metrics::DEFAULT_PRECISION);
+    app.rows[0].ssim_cache.text = app.rows[0]
+        .ssim
+        .cell_text_prec(crate::metrics::DEFAULT_PRECISION);
     app.live_kind = Some(MetricKind::Psnr);
     app.live_key = Some(app.rows[0].key.clone());
     app.reset_metric(MetricKind::Psnr);
@@ -2558,7 +2562,7 @@ fn row_routing_perf() {
 }
 
 /// Done/Error arrival freezes the rendered cell text (equal to
-/// `cell_text()` by construction); Reset clears it.
+/// `cell_text_prec()` by construction); Reset clears it.
 #[test]
 fn cell_text_cache_set_and_cleared() {
     use super::MetricMsg;
@@ -2584,7 +2588,12 @@ fn cell_text_cache_set_and_cleared() {
     app.metric_tx.send(done(None)).unwrap();
     app.drain_metric_results();
     assert_eq!(app.rows[0].psnr_cache.text, "30.1235");
-    assert_eq!(app.rows[0].psnr_cache.text, app.rows[0].psnr.cell_text());
+    assert_eq!(
+        app.rows[0].psnr_cache.text,
+        app.rows[0]
+            .psnr
+            .cell_text_prec(crate::metrics::DEFAULT_PRECISION)
+    );
     app.metric_tx.send(done(Some("boom".to_owned()))).unwrap();
     app.drain_metric_results();
     assert!(matches!(app.rows[0].psnr, MetricCell::Error { .. }));
@@ -2731,7 +2740,7 @@ fn cell_text_cache_cleared_on_rerun() {
 }
 
 /// Before/after timing for the table cell string work: per-frame
-/// `cell_text()` + `tooltip()` (old) vs borrowing statics (new).
+/// `cell_text_prec()` + `tooltip()` (old) vs borrowing statics (new).
 /// Models 200 rows × 7 idle columns.
 #[test]
 fn cell_text_perf() {
@@ -2740,13 +2749,16 @@ fn cell_text_perf() {
     let kinds = MetricKind::ALL;
     let cells: Vec<MetricCell> = (0..200 * kinds.len()).map(|_| MetricCell::Idle).collect();
     // Borrowed text must read identically to the formatted one.
-    assert_eq!(cells[0].cell_text(), "N/A");
+    assert_eq!(
+        cells[0].cell_text_prec(crate::metrics::DEFAULT_PRECISION),
+        "N/A"
+    );
     let n = 500;
     let t0 = std::time::Instant::now();
     let mut len_old = 0;
     for _ in 0..n {
         for (cell, kind) in cells.iter().zip(kinds.iter().cycle()) {
-            let text = cell.cell_text();
+            let text = cell.cell_text_prec(crate::metrics::DEFAULT_PRECISION);
             let tip = cell.tooltip(kind.name());
             len_old += text.len() + tip.len();
         }
@@ -2938,7 +2950,7 @@ fn fps_counter_budget() {
     for _ in 0..n {
         acc += (app.snapshot() != app.saved_snapshot) as usize;
         for (cell, kind) in cells.iter().zip(kinds.iter().cycle()) {
-            let text = cell.cell_text();
+            let text = cell.cell_text_prec(crate::metrics::DEFAULT_PRECISION);
             let tip = cell.tooltip(kind.name());
             acc += text.len() + tip.len();
         }
@@ -3404,6 +3416,64 @@ fn state_apply_restores_cell_stat() {
     };
     app.apply_state(Some(state));
     assert_eq!(app.cell_stat, CellStat::Max);
+}
+
+/// Precision persists and restores; out-of-range labels keep the live value.
+#[test]
+fn state_apply_restores_cell_precision() {
+    let mut app = RFMetricsApp::default();
+    assert_eq!(app.cell_precision, 4);
+    let state = crate::state::AppState {
+        options: crate::state::OptionsState {
+            cell_precision: Some("2".to_owned()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    app.apply_state(Some(state));
+    assert_eq!(app.cell_precision, 2);
+    assert!(app.snapshot().options.cell_precision == Some("2".to_owned()));
+    for bad in ["abc", "7", ""] {
+        let state = crate::state::AppState {
+            options: crate::state::OptionsState {
+                cell_precision: Some(bad.to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        app.apply_state(Some(state));
+        assert_eq!(app.cell_precision, 2, "label {bad:?} must be rejected");
+    }
+}
+
+/// Precision change re-freezes every Done cell's Avg text; other columns
+/// and non-Done cells are untouched.
+#[test]
+fn refreeze_cell_texts_updates_all_done_cells() {
+    use crate::metrics::MetricCell;
+    let mut app = RFMetricsApp::default();
+    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    let done = |avg: f64| MetricCell::Done {
+        values: vec![avg],
+        avg,
+        exec_s: 1.0,
+        skip: None,
+        clip_dur: None,
+        vmaf_cfg: None,
+        scaler: ScaleMethod::Bicubic,
+        fps_mode: InputFpsMode::Reference,
+    };
+    app.rows[0].psnr = done(30.123_456);
+    app.rows[0].ssim = done(0.987_654);
+    app.rows[0].psnr_cache.text = app.rows[0].psnr.cell_text_prec(4);
+    app.rows[0].ssim_cache.text = app.rows[0].ssim.cell_text_prec(4);
+    assert_eq!(app.rows[0].psnr_cache.text, "30.1235");
+    app.cell_precision = 2;
+    app.refreeze_cell_texts();
+    assert_eq!(app.rows[0].psnr_cache.text, "30.12");
+    assert_eq!(app.rows[0].ssim_cache.text, "0.99");
+    // Idle cells have no text to re-freeze.
+    assert!(app.rows[0].vmaf_cache.text.is_empty());
 }
 
 #[test]

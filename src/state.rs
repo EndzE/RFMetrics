@@ -96,6 +96,7 @@ pub struct OptionsState {
     pub scaling: Option<String>,
     pub fps_mode: Option<String>,
     pub cell_stat: Option<String>,
+    pub cell_precision: Option<String>,
     pub plot_at_start: Option<bool>,
     pub plot_size: Option<String>,
     pub csv_export: Option<bool>,

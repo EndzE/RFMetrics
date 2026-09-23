@@ -48,7 +48,7 @@ struct QueueRow {
 struct CachedStats {
     stats: Option<crate::metrics::DoneStats>,
     ranks: [crate::metrics::StatRank; 10],
-    /// Rendered Done text (`format!("{avg:.4}")`), frozen at Done arrival
+    /// Rendered Done text (Avg at the Options Precision), frozen at Done arrival
     /// so the table loop never formats per frame. Cleared wherever `stats`
     /// is cleared (rerun start, Reset via wholesale `default()`).
     text: String,
@@ -490,6 +490,9 @@ pub struct RFMetricsApp {
     /// Which `DoneStats` stat metric cells display, sort by, and copy
     /// (Options combobox, default Avg).
     cell_stat: crate::metrics::CellStat,
+    /// Decimals for metric cell display + Copy value (Options combobox,
+    /// default 4). Frozen Avg texts re-freeze on change (see below).
+    cell_precision: u8,
     /// Open the plot viewport when a run starts (Options checkbox).
     plot_at_start: bool,
     /// Save per-frame metric CSVs on Done (Options checkbox).
@@ -702,6 +705,7 @@ impl Default for RFMetricsApp {
             scale_method: ScaleMethod::default(),
             fps_mode: crate::metrics::ffmpeg::InputFpsMode::default(),
             cell_stat: crate::metrics::CellStat::default(),
+            cell_precision: crate::metrics::DEFAULT_PRECISION as u8,
             plot_at_start: false,
             csv_export: false,
             csv_dir: String::new(),
@@ -1202,7 +1206,7 @@ impl RFMetricsApp {
                         let stats = row.cell(kind).done_stats();
                         // Rendered text frozen once per result (the table loop
                         // borrows it instead of formatting per frame).
-                        let text = row.cell(kind).cell_text();
+                        let text = row.cell(kind).cell_text_prec(self.cell_precision as usize);
                         row.cached_mut(kind).stats = stats;
                         row.cached_mut(kind).text = text;
                         row.cached_mut(kind).finished =
@@ -1434,6 +1438,7 @@ impl RFMetricsApp {
                 scaling: Some(self.scale_method.label().to_owned()),
                 fps_mode: Some(self.fps_mode.label().to_owned()),
                 cell_stat: Some(self.cell_stat.label().to_owned()),
+                cell_precision: Some(self.cell_precision.to_string()),
                 plot_at_start: Some(self.plot_at_start),
                 plot_size: Some(self.plot_size.label().to_owned()),
                 csv_export: Some(self.csv_export),
@@ -1565,6 +1570,12 @@ impl RFMetricsApp {
         {
             self.cell_stat = m;
         }
+        if let Some(cell_precision) = s.options.cell_precision
+            && let Ok(p) = cell_precision.parse::<u8>()
+            && p as usize <= crate::metrics::MAX_PRECISION
+        {
+            self.cell_precision = p;
+        }
         if let Some(plot_at_start) = s.options.plot_at_start {
             self.plot_at_start = plot_at_start;
         }
@@ -1646,6 +1657,10 @@ impl RFMetricsApp {
         if o.scaling.as_deref() != Some(self.scale_method.label())
             || o.fps_mode.as_deref() != Some(self.fps_mode.label())
             || o.cell_stat.as_deref() != Some(self.cell_stat.label())
+            || o.cell_precision
+                .as_deref()
+                .and_then(|s| s.parse::<u8>().ok())
+                != Some(self.cell_precision)
             || o.plot_at_start != Some(self.plot_at_start)
             || o.plot_size.as_deref() != Some(self.plot_size.label())
             || o.csv_export != Some(self.csv_export)
@@ -2230,6 +2245,20 @@ impl RFMetricsApp {
             self.live_key = None;
         }
         log::info!(target: "rfmetrics::app", "{} results cleared", kind.name());
+    }
+
+    /// Re-freeze every `Done` cell's Avg text at the current Precision.
+    /// Runs only on discrete Precision changes (Options combobox), so the
+    /// per-frame table loop keeps borrowing without formatting.
+    fn refreeze_cell_texts(&mut self) {
+        let prec = self.cell_precision as usize;
+        for row in &mut self.rows {
+            for kind in MetricKind::ALL {
+                if matches!(row.cell(kind), crate::metrics::MetricCell::Done { .. }) {
+                    row.cached_mut(kind).text = row.cell(kind).cell_text_prec(prec);
+                }
+            }
+        }
     }
 
     /// Snapshot of finished cells for the bad-frames worker (owned so
@@ -4815,6 +4844,35 @@ impl eframe::App for RFMetricsApp {
                                         "Which per-run stat metric cells show, sort by, and copy (default Avg)",
                                     );
                             });
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [70.0, 18.0],
+                                    egui::Label::new("Precision").selectable(false),
+                                );
+                                let prev_precision = self.cell_precision;
+                                let _ = egui::ComboBox::from_id_salt("cell_precision")
+                                    .width(220.0)
+                                    .selected_text(self.cell_precision.to_string())
+                                    .show_ui(ui, |ui| {
+                                        for p in 0..=crate::metrics::MAX_PRECISION as u8 {
+                                            let _ = ui.selectable_value(
+                                                &mut self.cell_precision,
+                                                p,
+                                                p.to_string(),
+                                            );
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(
+                                        "Decimals for metric cell display and Copy value (default 4)",
+                                    );
+                                // Frozen Avg texts embed the old precision —
+                                // re-freeze them once on change (non-Avg
+                                // selectors format live and follow for free).
+                                if self.cell_precision != prev_precision {
+                                    self.refreeze_cell_texts();
+                                }
+                            });
                             let _ = ui
                                 .add(egui::Checkbox::new(
                                     &mut self.plot_at_start,
@@ -5334,6 +5392,7 @@ impl eframe::App for RFMetricsApp {
                                         // Running frames format per frame
                                         // (they change anyway).
                                         let sel = self.cell_stat;
+                                        let prec = self.cell_precision as usize;
                                         let running;
                                         let selected;
                                         let text: &str = match cell {
@@ -5352,8 +5411,11 @@ impl eframe::App for RFMetricsApp {
                                             crate::metrics::MetricCell::Done { .. } => {
                                                 match cached.stats.as_ref() {
                                                     Some(s) => {
-                                                        selected =
-                                                            format!("{:.4}", s.value(sel));
+                                                        selected = format!(
+                                                            "{:.prec$}",
+                                                            s.value(sel),
+                                                            prec = prec
+                                                        );
                                                         &selected
                                                     }
                                                     None => &cached.text,
@@ -5422,9 +5484,10 @@ impl eframe::App for RFMetricsApp {
                                     r.context_menu(|ui| {
                                         if ui.button("Copy value").clicked() {
                                             ui.ctx().copy_text(
-                                                self.rows[vi]
-                                                    .cell(kind)
-                                                    .cell_stat_text(self.cell_stat),
+                                                self.rows[vi].cell(kind).cell_stat_text_prec(
+                                                    self.cell_stat,
+                                                    self.cell_precision as usize,
+                                                ),
                                             );
                                             ui.close();
                                         }
