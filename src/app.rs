@@ -487,6 +487,9 @@ pub struct RFMetricsApp {
     scale_method: ScaleMethod,
     /// Input framerate mode for every `-i` the app emits (FFMetrics #111).
     fps_mode: crate::metrics::ffmpeg::InputFpsMode,
+    /// Which `DoneStats` stat metric cells display, sort by, and copy
+    /// (Options combobox, default Avg).
+    cell_stat: crate::metrics::CellStat,
     /// Open the plot viewport when a run starts (Options checkbox).
     plot_at_start: bool,
     /// Save per-frame metric CSVs on Done (Options checkbox).
@@ -698,6 +701,7 @@ impl Default for RFMetricsApp {
             ),
             scale_method: ScaleMethod::default(),
             fps_mode: crate::metrics::ffmpeg::InputFpsMode::default(),
+            cell_stat: crate::metrics::CellStat::default(),
             plot_at_start: false,
             csv_export: false,
             csv_dir: String::new(),
@@ -1429,6 +1433,7 @@ impl RFMetricsApp {
             options: crate::state::OptionsState {
                 scaling: Some(self.scale_method.label().to_owned()),
                 fps_mode: Some(self.fps_mode.label().to_owned()),
+                cell_stat: Some(self.cell_stat.label().to_owned()),
                 plot_at_start: Some(self.plot_at_start),
                 plot_size: Some(self.plot_size.label().to_owned()),
                 csv_export: Some(self.csv_export),
@@ -1555,6 +1560,11 @@ impl RFMetricsApp {
         {
             self.fps_mode = m;
         }
+        if let Some(cell_stat) = s.options.cell_stat
+            && let Some(m) = crate::metrics::CellStat::from_label(&cell_stat)
+        {
+            self.cell_stat = m;
+        }
         if let Some(plot_at_start) = s.options.plot_at_start {
             self.plot_at_start = plot_at_start;
         }
@@ -1635,6 +1645,7 @@ impl RFMetricsApp {
         let o = &s.options;
         if o.scaling.as_deref() != Some(self.scale_method.label())
             || o.fps_mode.as_deref() != Some(self.fps_mode.label())
+            || o.cell_stat.as_deref() != Some(self.cell_stat.label())
             || o.plot_at_start != Some(self.plot_at_start)
             || o.plot_size.as_deref() != Some(self.plot_size.label())
             || o.csv_export != Some(self.csv_export)
@@ -4077,11 +4088,14 @@ impl SortDir {
 }
 
 /// First-click direction per column (best first).
-fn initial_dir(col: SortColumn) -> SortDir {
+fn initial_dir(col: SortColumn, stat: crate::metrics::CellStat) -> SortDir {
+    use crate::metrics::CellStat;
     match col {
         SortColumn::Path => SortDir::Asc,
-        // Butteraugli is lower-better (mirrors the rank logic).
+        // Butteraugli is lower-better on every stat, StdDev on every
+        // metric (mirrors the rank logic).
         SortColumn::Metric(MetricKind::But) => SortDir::Asc,
+        SortColumn::Metric(_) if stat == CellStat::StdDev => SortDir::Asc,
         SortColumn::Metric(_) => SortDir::Desc,
     }
 }
@@ -4091,32 +4105,69 @@ fn initial_dir(col: SortColumn) -> SortDir {
 fn cycle_sort(
     current: Option<(SortColumn, SortDir)>,
     col: SortColumn,
+    stat: crate::metrics::CellStat,
 ) -> Option<(SortColumn, SortDir)> {
     match current {
-        None => Some((col, initial_dir(col))),
-        Some((c, _)) if c != col => Some((col, initial_dir(col))),
-        Some((_, dir)) if dir == initial_dir(col) => Some((col, dir.flipped())),
+        None => Some((col, initial_dir(col, stat))),
+        Some((c, _)) if c != col => Some((col, initial_dir(col, stat))),
+        Some((_, dir)) if dir == initial_dir(col, stat) => Some((col, dir.flipped())),
         Some(_) => None,
     }
 }
 
-/// Scored average for sorting; unscored cells (Idle/Running/Error) sort
-/// after every scored row in both directions.
-fn sort_avg(row: &QueueRow, kind: MetricKind) -> Option<f64> {
+/// Scored selector value for sorting; unscored cells (Idle/Running/Error)
+/// sort after every scored row in both directions. Reads the
+/// arrival-cached stats (O(1)); uncached `Done` cells only exist in
+/// tests and compute from the values instead.
+fn sort_stat(row: &QueueRow, kind: MetricKind, stat: crate::metrics::CellStat) -> Option<f64> {
+    use crate::metrics::CellStat;
+    if let Some(s) = &row.cached(kind).stats {
+        return Some(s.value(stat));
+    }
     match row.cell(kind) {
-        crate::metrics::MetricCell::Done { avg, .. } => Some(*avg),
+        crate::metrics::MetricCell::Done { values, avg, .. } if !values.is_empty() => {
+            Some(match stat {
+                CellStat::Avg => *avg,
+                CellStat::Mean => crate::metrics::mean(values),
+                CellStat::Harm => crate::metrics::harm_mean(values),
+                CellStat::Min => values
+                    .iter()
+                    .copied()
+                    .max_by(|a, b| a.total_cmp(b).reverse())?,
+                CellStat::Max => values.iter().copied().max_by(|a, b| a.total_cmp(b))?,
+                CellStat::StdDev => crate::metrics::pstdev(values),
+                CellStat::P1 | CellStat::P5 | CellStat::P10 | CellStat::P25 => {
+                    let mut s = values.to_vec();
+                    s.sort_by(|a, b| a.total_cmp(b));
+                    let pct = match stat {
+                        CellStat::P1 => 1.0,
+                        CellStat::P5 => 5.0,
+                        CellStat::P10 => 10.0,
+                        CellStat::P25 => 25.0,
+                        _ => 1.0,
+                    };
+                    crate::metrics::percentile(&s, pct)
+                }
+            })
+        }
         _ => None,
     }
 }
 
-fn cmp_rows(col: SortColumn, dir: SortDir, a: &QueueRow, b: &QueueRow) -> std::cmp::Ordering {
+fn cmp_rows(
+    col: SortColumn,
+    dir: SortDir,
+    a: &QueueRow,
+    b: &QueueRow,
+    stat: crate::metrics::CellStat,
+) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match col {
         SortColumn::Path => match dir {
             SortDir::Asc => a.display.cmp(&b.display),
             SortDir::Desc => b.display.cmp(&a.display),
         },
-        SortColumn::Metric(kind) => match (sort_avg(a, kind), sort_avg(b, kind)) {
+        SortColumn::Metric(kind) => match (sort_stat(a, kind, stat), sort_stat(b, kind, stat)) {
             (Some(x), Some(y)) => {
                 let ord = x.total_cmp(&y);
                 match dir {
@@ -4135,10 +4186,16 @@ fn cmp_rows(col: SortColumn, dir: SortDir, a: &QueueRow, b: &QueueRow) -> std::c
 /// Display order as underlying row indices (identity when unsorted).
 /// Stable sort, so ties keep insertion order. Rebuilt per frame while a
 /// sort is active — trivial at queue sizes, and `None` skips it entirely.
-fn sort_view(rows: &[QueueRow], spec: Option<(SortColumn, SortDir)>) -> Vec<usize> {
+/// Values come from the arrival-cached stats, so sorting stays O(1) per
+/// comparison no matter which selector is active.
+fn sort_view(
+    rows: &[QueueRow],
+    spec: Option<(SortColumn, SortDir)>,
+    stat: crate::metrics::CellStat,
+) -> Vec<usize> {
     let mut view: Vec<usize> = (0..rows.len()).collect();
     if let Some((col, dir)) = spec {
-        view.sort_by(|&a, &b| cmp_rows(col, dir, &rows[a], &rows[b]));
+        view.sort_by(|&a, &b| cmp_rows(col, dir, &rows[a], &rows[b], stat));
     }
     view
 }
@@ -4166,30 +4223,44 @@ fn metric_stat_tooltip(
     title: &str,
     stats: &crate::metrics::DoneStats,
     ranks: &[crate::metrics::StatRank; 10],
+    sel: crate::metrics::CellStat,
 ) {
     ui.label(egui::RichText::new(title).strong());
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 1.0);
+        // Bold the row the cell-value selector shows.
+        let lbl = |k: usize, label: &'static str| {
+            if k == sel.index() {
+                egui::RichText::new(label).strong()
+            } else {
+                egui::RichText::new(label)
+            }
+        };
         let comp = stats.comparable();
         let (label, v, _) = comp[0];
-        tip_stat_row(ui, label, &format!("{v:.6}"), ranks[0]);
+        tip_stat_row(ui, lbl(0, label), &format!("{v:.6}"), ranks[0]);
         tip_plain_row(ui, "Exec time:", &crate::metrics::format_exec(stats.exec_s));
         tip_plain_row(ui, "Frames count:", &stats.frames.to_string());
         ui.add_space(5.0);
         for k in 1..=5 {
             let (label, v, _) = comp[k];
-            tip_stat_row(ui, label, &format!("{v:.6}"), ranks[k]);
+            tip_stat_row(ui, lbl(k, label), &format!("{v:.6}"), ranks[k]);
         }
         ui.add_space(5.0);
         for k in 6..10 {
             let (label, v, _) = comp[k];
-            tip_stat_row(ui, label, &format!("{v:.6}"), ranks[k]);
+            tip_stat_row(ui, lbl(k, label), &format!("{v:.6}"), ranks[k]);
         }
     });
 }
 
 /// One tooltip row: fixed label + right-aligned value, chipped when ranked.
-fn tip_stat_row(ui: &mut egui::Ui, label: &str, val: &str, rank: crate::metrics::StatRank) {
+fn tip_stat_row(
+    ui: &mut egui::Ui,
+    label: impl Into<egui::WidgetText>,
+    val: &str,
+    rank: crate::metrics::StatRank,
+) {
     ui.horizontal(|ui| {
         ui.add_sized(
             [96.0, 15.0],
@@ -4722,6 +4793,28 @@ impl eframe::App for RFMetricsApp {
                                         "Image dimensions for Save PNG and Copy (current plot view)",
                                     );
                             });
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [70.0, 18.0],
+                                    egui::Label::new("Cell value").selectable(false),
+                                );
+                                let _ = egui::ComboBox::from_id_salt("cell_stat")
+                                    .width(220.0)
+                                    .selected_text(self.cell_stat.label())
+                                    .show_ui(ui, |ui| {
+                                        for m in crate::metrics::CellStat::ALL {
+                                            let _ = ui.selectable_value(
+                                                &mut self.cell_stat,
+                                                m,
+                                                m.label(),
+                                            );
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(
+                                        "Which per-run stat metric cells show, sort by, and copy (default Avg)",
+                                    );
+                            });
                             let _ = ui
                                 .add(egui::Checkbox::new(
                                     &mut self.plot_at_start,
@@ -4948,7 +5041,7 @@ impl eframe::App for RFMetricsApp {
                     // Sorted display order as underlying indices (identity
                     // when unsorted); anchors/toggles below stay underlying
                     // so they survive re-sorts without invalidation.
-                    let view: Vec<usize> = sort_view(&self.rows, self.sort_spec);
+                    let view: Vec<usize> = sort_view(&self.rows, self.sort_spec, self.cell_stat);
                     let sort_spec = self.sort_spec;
                     // Header sort click, applied once below the loop.
                     let mut sort_click: Option<SortColumn> = None;
@@ -5232,11 +5325,17 @@ impl eframe::App for RFMetricsApp {
                                             ),
                                             None => false,
                                         };
-                                        // Idle borrows a static, Done borrows
-                                        // the arrival-frozen text, Error borrows
-                                        // its message; only live Running frames
-                                        // format per frame (they change anyway).
+                                        // Idle borrows a static, Avg-selected Done
+                                        // borrows the arrival-frozen text, other
+                                        // selectors format from the cached stats
+                                        // (one short format per visible cell per
+                                        // frame, only when non-Avg is selected),
+                                        // Error borrows its message; only live
+                                        // Running frames format per frame
+                                        // (they change anyway).
+                                        let sel = self.cell_stat;
                                         let running;
+                                        let selected;
                                         let text: &str = match cell {
                                             crate::metrics::MetricCell::Idle => "N/A",
                                             crate::metrics::MetricCell::Running {
@@ -5245,7 +5344,21 @@ impl eframe::App for RFMetricsApp {
                                                 running = format!("Frame: {frame}");
                                                 &running
                                             }
-                                            crate::metrics::MetricCell::Done { .. } => &cached.text,
+                                            crate::metrics::MetricCell::Done { .. }
+                                                if sel == crate::metrics::CellStat::Avg =>
+                                            {
+                                                &cached.text
+                                            }
+                                            crate::metrics::MetricCell::Done { .. } => {
+                                                match cached.stats.as_ref() {
+                                                    Some(s) => {
+                                                        selected =
+                                                            format!("{:.4}", s.value(sel));
+                                                        &selected
+                                                    }
+                                                    None => &cached.text,
+                                                }
+                                            }
                                             crate::metrics::MetricCell::Error { msg } => msg,
                                         };
                                         // Borrow the cached stats when scored;
@@ -5254,7 +5367,7 @@ impl eframe::App for RFMetricsApp {
                                         let stats = cached.stats.as_ref();
                                         let ranks = cached.ranks;
                                         let mut cell_frame = egui::Frame::NONE;
-                                        if let Some(fill) = rank_fill(ranks[0]) {
+                                        if let Some(fill) = rank_fill(ranks[sel.index()]) {
                                             cell_frame = cell_frame.fill(fill);
                                         }
                                         // Only the job on the Progress/Series feed
@@ -5290,7 +5403,7 @@ impl eframe::App for RFMetricsApp {
                                                                 ui.label("Stale settings - rerun to refresh");
                                                             }
                                                             metric_stat_tooltip(
-                                                                ui, title, stats, &ranks,
+                                                                ui, title, stats, &ranks, sel,
                                                             );
                                                         });
                                                     }
@@ -5304,12 +5417,15 @@ impl eframe::App for RFMetricsApp {
                                         });
                                     });
                                     // Right-click copies (Media-column parity):
-                                    // value = the visible avg/text only,
+                                    // value = the visible selector stat,
                                     // summary = the whole tooltip stats block.
                                     r.context_menu(|ui| {
                                         if ui.button("Copy value").clicked() {
-                                            ui.ctx()
-                                                .copy_text(self.rows[vi].cell(kind).cell_text());
+                                            ui.ctx().copy_text(
+                                                self.rows[vi]
+                                                    .cell(kind)
+                                                    .cell_stat_text(self.cell_stat),
+                                            );
                                             ui.close();
                                         }
                                         if ui.button("Copy summary").clicked() {
@@ -5409,7 +5525,7 @@ impl eframe::App for RFMetricsApp {
                     // insertion order (session-only; run/state order stays
                     // insertion).
                     if let Some(col) = sort_click {
-                        self.sort_spec = cycle_sort(self.sort_spec, col);
+                        self.sort_spec = cycle_sort(self.sort_spec, col, self.cell_stat);
                     }
                     // Header per-metric Reset: one column back to Idle.
                     if let Some(kind) = reset_click {

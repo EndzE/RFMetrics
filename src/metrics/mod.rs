@@ -54,6 +54,20 @@ impl MetricCell {
         }
     }
 
+    /// Copy-value text for the Options cell-value selector. Avg reuses
+    /// the frozen cell text; other stats format from a one-off
+    /// `DoneStats` — discrete clicks only, never the per-frame hot path.
+    pub fn cell_stat_text(&self, stat: CellStat) -> String {
+        match (self, stat) {
+            (_, CellStat::Avg) => self.cell_text(),
+            (done @ Self::Done { .. }, _) => done
+                .done_stats()
+                .map(|s| format!("{:.4}", s.value(stat)))
+                .unwrap_or_else(|| self.cell_text()),
+            _ => self.cell_text(),
+        }
+    }
+
     /// Hover tooltip; `title` is the metric name (e.g. "PSNR").
     pub fn tooltip(&self, title: &str) -> String {
         match self {
@@ -182,6 +196,82 @@ impl DoneStats {
             ("Percentile 10:", self.p10, false),
             ("Percentile 25:", self.p25, false),
         ]
+    }
+
+    /// One comparable value by selector (single routing point for cell
+    /// display, sorting, and Copy value).
+    pub fn value(&self, stat: CellStat) -> f64 {
+        self.comparable()[stat.index()].1
+    }
+}
+
+/// Display selector for metric cells (Options combobox): which
+/// `comparable()` stat the cell shows, sorts by, and copies. Exec time
+/// and Frames count are display-only and intentionally not selectable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CellStat {
+    #[default]
+    Avg,
+    Mean,
+    Harm,
+    Min,
+    Max,
+    StdDev,
+    P1,
+    P5,
+    P10,
+    P25,
+}
+
+impl CellStat {
+    /// Combo order: the default first, then tooltip order.
+    pub const ALL: [CellStat; 10] = [
+        CellStat::Avg,
+        CellStat::Mean,
+        CellStat::Harm,
+        CellStat::Min,
+        CellStat::Max,
+        CellStat::StdDev,
+        CellStat::P1,
+        CellStat::P5,
+        CellStat::P10,
+        CellStat::P25,
+    ];
+
+    /// Index into `DoneStats::comparable()` / rank arrays.
+    pub fn index(self) -> usize {
+        match self {
+            Self::Avg => 0,
+            Self::Mean => 1,
+            Self::Harm => 2,
+            Self::Min => 3,
+            Self::Max => 4,
+            Self::StdDev => 5,
+            Self::P1 => 6,
+            Self::P5 => 7,
+            Self::P10 => 8,
+            Self::P25 => 9,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Avg => "Avg",
+            Self::Mean => "Mean",
+            Self::Harm => "Mean (harm)",
+            Self::Min => "Min",
+            Self::Max => "Max",
+            Self::StdDev => "StdDev",
+            Self::P1 => "P1",
+            Self::P5 => "P5",
+            Self::P10 => "P10",
+            Self::P25 => "P25",
+        }
+    }
+
+    /// State-file validation (unknown labels keep the live default).
+    pub fn from_label(s: &str) -> Option<CellStat> {
+        Self::ALL.into_iter().find(|m| m.label() == s)
     }
 }
 

@@ -168,3 +168,59 @@ fn done_arrival_budget() {
         "done arrival (270k frames): DoneStats::new {stats:?} | stats_text {text:?} | harm_mean {harm:?}"
     );
 }
+
+#[test]
+fn cell_stat_labels_index_and_validate() {
+    use super::CellStat;
+    assert_eq!(CellStat::default(), CellStat::Avg);
+    assert_eq!(CellStat::ALL.len(), 10);
+    assert_eq!(CellStat::ALL[0], CellStat::Avg);
+    for (i, m) in CellStat::ALL.iter().enumerate() {
+        assert_eq!(m.index(), i);
+        assert_eq!(CellStat::from_label(m.label()), Some(*m));
+    }
+    assert_eq!(CellStat::from_label("Frames"), None);
+    assert_eq!(CellStat::from_label("Exec time"), None);
+    assert_eq!(CellStat::from_label(""), None);
+}
+
+#[test]
+fn done_stats_value_follows_comparable_order() {
+    use super::CellStat;
+    let s = DoneStats::new(&[10.0, 20.0, 30.0], 21.0, 1.0).unwrap();
+    let comp = s.comparable();
+    for m in CellStat::ALL {
+        assert_eq!(s.value(m), comp[m.index()].1);
+    }
+    assert_eq!(s.value(CellStat::Avg), 21.0);
+    assert_eq!(s.value(CellStat::Min), 10.0);
+    assert_eq!(s.value(CellStat::Max), 30.0);
+}
+
+#[test]
+fn cell_stat_text_formats_selected_stat() {
+    use super::{CellStat, MetricCell};
+    let done = MetricCell::Done {
+        values: vec![10.0, 20.0, 30.0],
+        avg: 21.0,
+        exec_s: 1.0,
+        skip: None,
+        clip_dur: None,
+        vmaf_cfg: None,
+        scaler: crate::metrics::ffmpeg::ScaleMethod::Bicubic,
+        fps_mode: crate::metrics::ffmpeg::InputFpsMode::Reference,
+    };
+    assert_eq!(done.cell_stat_text(CellStat::Avg), "21.0000");
+    assert_eq!(done.cell_stat_text(CellStat::Mean), "20.0000");
+    assert_eq!(done.cell_stat_text(CellStat::Min), "10.0000");
+    assert_eq!(done.cell_stat_text(CellStat::Max), "30.0000");
+    // Non-Done cells fall back to the plain cell text.
+    assert_eq!(MetricCell::Idle.cell_stat_text(CellStat::Max), "N/A");
+    assert_eq!(
+        MetricCell::Error {
+            msg: "boom".to_owned()
+        }
+        .cell_stat_text(CellStat::Min),
+        "boom"
+    );
+}

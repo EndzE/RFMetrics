@@ -3235,29 +3235,48 @@ fn sort_test_row(
 #[test]
 fn sort_cycle_path_and_metrics() {
     use super::{SortColumn, SortDir, cycle_sort, initial_dir};
+    use crate::metrics::CellStat;
     use crate::metrics::ffmpeg::MetricKind;
     assert_eq!(
-        cycle_sort(None, SortColumn::Path),
+        cycle_sort(None, SortColumn::Path, CellStat::Avg),
         Some((SortColumn::Path, SortDir::Asc))
     );
     assert_eq!(
-        cycle_sort(None, SortColumn::Metric(MetricKind::Vmaf)),
+        cycle_sort(None, SortColumn::Metric(MetricKind::Vmaf), CellStat::Avg),
         Some((SortColumn::Metric(MetricKind::Vmaf), SortDir::Desc))
     );
     // Butteraugli is lower-better: best first is ascending.
     assert_eq!(
-        initial_dir(SortColumn::Metric(MetricKind::But)),
+        initial_dir(SortColumn::Metric(MetricKind::But), CellStat::Avg),
         SortDir::Asc
     );
-    let first = cycle_sort(None, SortColumn::Metric(MetricKind::Vmaf)).unwrap();
-    let second = cycle_sort(Some(first), SortColumn::Metric(MetricKind::Vmaf)).unwrap();
+    // StdDev is lower-better on every metric: best first is ascending.
+    assert_eq!(
+        initial_dir(SortColumn::Metric(MetricKind::Vmaf), CellStat::StdDev),
+        SortDir::Asc
+    );
+    assert_eq!(
+        initial_dir(SortColumn::Metric(MetricKind::Vmaf), CellStat::Max),
+        SortDir::Desc
+    );
+    let first = cycle_sort(None, SortColumn::Metric(MetricKind::Vmaf), CellStat::Avg).unwrap();
+    let second = cycle_sort(
+        Some(first),
+        SortColumn::Metric(MetricKind::Vmaf),
+        CellStat::Avg,
+    )
+    .unwrap();
     assert_eq!(second.1, SortDir::Asc);
     assert_eq!(
-        cycle_sort(Some(second), SortColumn::Metric(MetricKind::Vmaf)),
+        cycle_sort(
+            Some(second),
+            SortColumn::Metric(MetricKind::Vmaf),
+            CellStat::Avg
+        ),
         None
     );
     assert_eq!(
-        cycle_sort(Some(second), SortColumn::Path),
+        cycle_sort(Some(second), SortColumn::Path, CellStat::Avg),
         Some((SortColumn::Path, SortDir::Asc))
     );
 }
@@ -3267,6 +3286,7 @@ fn sort_cycle_path_and_metrics() {
 #[test]
 fn sort_view_orders_and_restores() {
     use super::{SortColumn, SortDir, sort_view};
+    use crate::metrics::CellStat;
     use crate::metrics::ffmpeg::MetricKind;
     let rows = vec![
         sort_test_row("c.mp4", MetricKind::Vmaf, Some(30.0)),
@@ -3275,17 +3295,18 @@ fn sort_view_orders_and_restores() {
         sort_test_row("d.mp4", MetricKind::Vmaf, Some(40.0)),
     ];
     // Insertion identity when unsorted.
-    assert_eq!(sort_view(&rows, None), vec![0, 1, 2, 3]);
+    assert_eq!(sort_view(&rows, None, CellStat::Avg), vec![0, 1, 2, 3]);
     // Path A-Z.
     assert_eq!(
-        sort_view(&rows, Some((SortColumn::Path, SortDir::Asc))),
+        sort_view(&rows, Some((SortColumn::Path, SortDir::Asc)), CellStat::Avg),
         vec![1, 2, 0, 3]
     );
     // VMAF best first: highest scored first, unscored last, ties stable.
     assert_eq!(
         sort_view(
             &rows,
-            Some((SortColumn::Metric(MetricKind::Vmaf), SortDir::Desc))
+            Some((SortColumn::Metric(MetricKind::Vmaf), SortDir::Desc)),
+            CellStat::Avg
         ),
         vec![2, 3, 0, 1]
     );
@@ -3293,7 +3314,8 @@ fn sort_view_orders_and_restores() {
     assert_eq!(
         sort_view(
             &rows,
-            Some((SortColumn::Metric(MetricKind::Vmaf), SortDir::Asc))
+            Some((SortColumn::Metric(MetricKind::Vmaf), SortDir::Asc)),
+            CellStat::Avg
         ),
         vec![0, 2, 3, 1]
     );
@@ -3305,10 +3327,83 @@ fn sort_view_orders_and_restores() {
     assert_eq!(
         sort_view(
             &rows,
-            Some((SortColumn::Metric(MetricKind::But), SortDir::Asc))
+            Some((SortColumn::Metric(MetricKind::But), SortDir::Asc)),
+            CellStat::Avg
         ),
         vec![1, 0]
     );
+}
+
+/// Sort follows the cell-value selector: same rows order differently
+/// under Avg vs Min. Multi-value cells exercise both the cached-stats
+/// path (populated) and the uncached fallback (cleared).
+#[test]
+fn sort_view_follows_cell_stat_selector() {
+    use super::{SortColumn, SortDir, sort_view};
+    use crate::metrics::CellStat;
+    use crate::metrics::ffmpeg::MetricKind;
+    fn scored(display: &str, values: Vec<f64>, avg: f64, cache: bool) -> QueueRow {
+        use crate::metrics::MetricCell;
+        let mut r = psnr_test_row(&format!("C:/vids/{display}"), true);
+        r.display = display.to_owned();
+        r.psnr = MetricCell::Done {
+            values,
+            avg,
+            exec_s: 1.0,
+            skip: None,
+            clip_dur: None,
+            vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
+            fps_mode: InputFpsMode::Reference,
+        };
+        if cache {
+            let stats = r.psnr.done_stats();
+            r.psnr_cache.stats = stats;
+        }
+        r
+    }
+    // a: avg 15, min 10 — b: avg 14, min 14.
+    let spec = Some((SortColumn::Metric(MetricKind::Psnr), SortDir::Desc));
+    let rows = vec![
+        scored("a.mp4", vec![10.0, 20.0], 15.0, true),
+        scored("b.mp4", vec![14.0, 14.0], 14.0, true),
+    ];
+    assert_eq!(sort_view(&rows, spec, CellStat::Avg), vec![0, 1]);
+    assert_eq!(sort_view(&rows, spec, CellStat::Min), vec![1, 0]);
+    // Uncached fallback agrees (caches never populated, cells Done).
+    let bare = vec![
+        scored("a.mp4", vec![10.0, 20.0], 15.0, false),
+        scored("b.mp4", vec![14.0, 14.0], 14.0, false),
+    ];
+    assert_eq!(sort_view(&bare, spec, CellStat::Avg), vec![0, 1]);
+    assert_eq!(sort_view(&bare, spec, CellStat::Min), vec![1, 0]);
+}
+
+/// Cell-value selector persists and restores; unknown labels keep Avg.
+#[test]
+fn state_apply_restores_cell_stat() {
+    use crate::metrics::CellStat;
+    let mut app = RFMetricsApp::default();
+    assert_eq!(app.cell_stat, CellStat::Avg);
+    let state = crate::state::AppState {
+        options: crate::state::OptionsState {
+            cell_stat: Some("Max".to_owned()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    app.apply_state(Some(state));
+    assert_eq!(app.cell_stat, CellStat::Max);
+    assert!(app.snapshot().options.cell_stat == Some("Max".to_owned()));
+    let state = crate::state::AppState {
+        options: crate::state::OptionsState {
+            cell_stat: Some("Frames".to_owned()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    app.apply_state(Some(state));
+    assert_eq!(app.cell_stat, CellStat::Max);
 }
 
 #[test]
