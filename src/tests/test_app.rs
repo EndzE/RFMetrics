@@ -4040,7 +4040,7 @@ fn refreeze_cell_texts_updates_all_done_cells() {
 
 #[test]
 fn running_sweep_ping_pongs() {
-    use super::running_sweep_pos;
+    use crate::app_widgets::running_sweep_pos;
     // 0.7s per leg: 0 → 1 → 0 → 1 …
     assert!((running_sweep_pos(0.0) - 0.0).abs() < 1e-6);
     assert!((running_sweep_pos(0.35) - 0.5).abs() < 1e-6);

@@ -5,9 +5,12 @@
 
 mod app;
 mod app_badframes;
+mod app_panels;
 mod app_plots;
 mod app_queue;
 mod app_run;
+mod app_state;
+mod app_widgets;
 mod binaries;
 mod cmd;
 mod logging;
