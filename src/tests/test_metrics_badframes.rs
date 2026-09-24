@@ -89,6 +89,37 @@ fn wipe_layout_tiles_without_gap() {
 }
 
 #[test]
+fn changed_overlay_maps_diff_to_purple_alpha() {
+    let mut a = image::RgbaImage::new(2, 1);
+    let mut b = image::RgbaImage::new(2, 1);
+    a.put_pixel(0, 0, image::Rgba([10, 20, 30, 255]));
+    b.put_pixel(0, 0, image::Rgba([10, 20, 30, 255]));
+    a.put_pixel(1, 0, image::Rgba([0, 0, 0, 255]));
+    b.put_pixel(1, 0, image::Rgba([255, 255, 255, 255]));
+    let out = changed_overlay(&a, &b);
+    assert_eq!(out.get_pixel(0, 0), &image::Rgba([180, 0, 255, 0]));
+    assert_eq!(out.get_pixel(1, 0), &image::Rgba([180, 0, 255, 128]));
+    // Noise-level change stays transparent; a small real change starts at
+    // the visible floor (typical artifacts were ~1-3% opacity before).
+    let mut c = image::RgbaImage::new(2, 1);
+    c.put_pixel(0, 0, image::Rgba([100, 100, 100, 255]));
+    c.put_pixel(1, 0, image::Rgba([100, 100, 100, 255]));
+    let mut e = image::RgbaImage::new(2, 1);
+    e.put_pixel(0, 0, image::Rgba([102, 102, 102, 255]));
+    e.put_pixel(1, 0, image::Rgba([110, 110, 110, 255]));
+    let out2 = changed_overlay(&c, &e);
+    assert_eq!(out2.get_pixel(0, 0)[3], 0);
+    assert!(
+        out2.get_pixel(1, 0)[3] >= 48,
+        "small change must be visible"
+    );
+    // Size mismatch resamples dist to ref dims instead of panicking.
+    let big = image::RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 0, 255]));
+    let small = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255]));
+    assert_eq!(changed_overlay(&big, &small).dimensions(), (2, 2));
+}
+
+#[test]
 fn tmp_names_match_beside_file_stems() {
     let tmp = Path::new("tmp");
     let d = tmp_dest_for(tmp, "C:/v/movie.mkv", "PSNR", 7);

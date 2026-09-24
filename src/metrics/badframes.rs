@@ -130,6 +130,40 @@ pub fn wipe_layout(w: f64, split: f32) -> WipeLayout {
     }
 }
 
+/// Changed-pixels heatmap for the viewer: ref-sized purple overlay where
+/// alpha follows the mean absolute RGB change. Changes at or below noise
+/// level stay transparent; anything above starts at a clearly visible
+/// floor and ramps to `128` (= 50%) at max change. A differently-sized
+/// dist is resampled to ref dimensions (nearest); the viewer stretches
+/// the overlay over the distorted image like any texture.
+pub fn changed_overlay(dist: &image::RgbaImage, refr: &image::RgbaImage) -> image::RgbaImage {
+    let (w, h) = refr.dimensions();
+    if w == 0 || h == 0 {
+        return image::RgbaImage::new(0, 0);
+    }
+    let dsized = if dist.dimensions() == (w, h) {
+        dist.clone()
+    } else {
+        image::imageops::resize(dist, w, h, image::imageops::FilterType::Nearest)
+    };
+    let mut out = image::RgbaImage::new(w, h);
+    for (x, y, px) in out.enumerate_pixels_mut() {
+        let d = dsized.get_pixel(x, y);
+        let r = refr.get_pixel(x, y);
+        let diff =
+            (d[0].abs_diff(r[0]) as u16 + d[1].abs_diff(r[1]) as u16 + d[2].abs_diff(r[2]) as u16)
+                / 3;
+        // ponytail: fixed noise floor + visible floor; a slider if tuning matters.
+        let alpha = if diff <= 4 {
+            0
+        } else {
+            48 + ((diff - 4) * 80 / 251) as u8
+        };
+        *px = image::Rgba([180, 0, 255, alpha]);
+    }
+    out
+}
+
 /// Run-scoped tmp dir for viewer PNGs (bounded memory: 1080p RGBA stays
 /// on disk, only the visible pair becomes textures). Per-process so two
 /// instances never share it; best-effort cleanup by the caller.

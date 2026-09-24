@@ -236,6 +236,11 @@ pub struct RFMetricsApp {
     pub(crate) badframe_tex_dist: Option<egui::TextureHandle>,
     pub(crate) badframe_tex_ref: Option<egui::TextureHandle>,
     pub(crate) badframe_tex_key: Option<(String, MetricKind, usize)>,
+    /// Changed-pixels heatmap toggle + cached diff overlay texture for the
+    /// visible pair (ref-sized purple, alpha ∝ change, max 50%).
+    /// Session-only, never persisted.
+    pub(crate) badframe_show_diff: bool,
+    pub(crate) badframe_tex_diff: Option<egui::TextureHandle>,
     /// Tmp dir holding this run's viewer PNGs (per-process).
     pub(crate) badframe_tmp: std::path::PathBuf,
     /// Close requested while a bad-frames worker runs: tmp deletion waits
@@ -390,6 +395,8 @@ impl Default for RFMetricsApp {
             badframe_tex_dist: None,
             badframe_tex_ref: None,
             badframe_tex_key: None,
+            badframe_show_diff: false,
+            badframe_tex_diff: None,
             badframe_tmp: crate::metrics::badframes::tmp_dir(),
             badframe_tmp_cleanup_pending: false,
             badframe_files: Vec::new(),

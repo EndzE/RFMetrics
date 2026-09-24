@@ -605,6 +605,7 @@ impl crate::app::RFMetricsApp {
                         .unwrap_or_default();
                     self.badframe_tex_dist = None;
                     self.badframe_tex_ref = None;
+                    self.badframe_tex_diff = None;
                     self.badframe_tex_key = None;
                     self.badframe_frame_pos = 0;
                     if self
@@ -647,8 +648,8 @@ impl crate::app::RFMetricsApp {
     }
 
     /// Upload the visible viewer pair as textures when the selection
-    /// changed. Full resolution (inspection needs detail); only two
-    /// textures are ever cached.
+    /// changed. Full resolution (inspection needs detail); only the pair
+    /// plus the optional diff overlay are ever cached.
     pub(crate) fn refresh_viewer_textures(&mut self, ctx: &egui::Context) {
         let key = match &self.badframe_file {
             Some(k) => (k.clone(), self.badframe_tab, self.badframe_frame_pos),
@@ -659,6 +660,7 @@ impl crate::app::RFMetricsApp {
         }
         self.badframe_tex_dist = None;
         self.badframe_tex_ref = None;
+        self.badframe_tex_diff = None;
         let picks = self.badframe_picks(key.1, &key.0);
         let Some((frame, _, _)) = picks.get(key.2).copied() else {
             return;
@@ -667,34 +669,57 @@ impl crate::app::RFMetricsApp {
             Some(r) => r.path.clone(),
             None => return,
         };
-        let load = |p: std::path::PathBuf| -> Option<egui::TextureHandle> {
+        let decode = |p: std::path::PathBuf| -> Option<image::RgbaImage> {
             let bytes = std::fs::read(&p).ok()?;
             if bytes.len() <= 100 {
                 return None;
             }
             let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
-            let (w, h) = (img.width(), img.height());
-            if w == 0 || h == 0 {
+            if img.width() == 0 || img.height() == 0 {
                 return None;
             }
-            Some(ctx.load_texture(
-                p.to_string_lossy().into_owned(),
-                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &img.into_raw()),
-                egui::TextureOptions::LINEAR,
-            ))
+            Some(img)
         };
-        self.badframe_tex_dist = load(crate::metrics::badframes::tmp_dest_for(
+        let upload = |name: String, img: &image::RgbaImage| {
+            ctx.load_texture(
+                name,
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [img.width() as usize, img.height() as usize],
+                    img.as_raw(),
+                ),
+                egui::TextureOptions::LINEAR,
+            )
+        };
+        let dist_p = crate::metrics::badframes::tmp_dest_for(
             &self.badframe_tmp,
             &row_path,
             key.1.name(),
             frame,
-        ));
-        self.badframe_tex_ref = load(crate::metrics::badframes::tmp_dest_ref_for(
+        );
+        let ref_p = crate::metrics::badframes::tmp_dest_ref_for(
             &self.badframe_tmp,
             &row_path,
             key.1.name(),
             frame,
-        ));
+        );
+        let dist_img = decode(dist_p.clone());
+        let ref_img = decode(ref_p.clone());
+        self.badframe_tex_dist = dist_img
+            .as_ref()
+            .map(|img| upload(dist_p.to_string_lossy().into_owned(), img));
+        self.badframe_tex_ref = ref_img
+            .as_ref()
+            .map(|img| upload(ref_p.to_string_lossy().into_owned(), img));
+        self.badframe_tex_diff = match (&dist_img, &ref_img) {
+            (Some(d), Some(r)) if self.badframe_show_diff => {
+                let overlay = crate::metrics::badframes::changed_overlay(d, r);
+                Some(upload(
+                    format!("{}-{}-{frame}-diff", key.0, key.1.name()),
+                    &overlay,
+                ))
+            }
+            _ => None,
+        };
         self.badframe_tex_key = Some(key);
     }
 
@@ -717,6 +742,7 @@ impl crate::app::RFMetricsApp {
         self.badframe_files.clear();
         self.badframe_tex_dist = None;
         self.badframe_tex_ref = None;
+        self.badframe_tex_diff = None;
         self.badframe_tex_key = None;
     }
 
@@ -864,6 +890,17 @@ impl crate::app::RFMetricsApp {
                         .on_hover_text("Distorted and reference side by side");
                     ui.selectable_value(&mut self.badframe_slider, true, "Slider")
                         .on_hover_text("Before/after wipe — drag the divider");
+                    ui.separator();
+                    if ui
+                        .checkbox(&mut self.badframe_show_diff, "Changed pixels")
+                        .on_hover_text(
+                            "Purple heatmap of ref-vs-dist change on the distorted image",
+                        )
+                        .changed()
+                    {
+                        // Toggle recomputes the cached overlay on next refresh.
+                        self.badframe_tex_key = None;
+                    }
                 });
             });
             // Options box first: egui requires CentralPanel after all
@@ -984,6 +1021,7 @@ impl crate::app::RFMetricsApp {
                 if self.badframe_slider {
                     let dist = self.badframe_tex_dist.clone();
                     let refr = self.badframe_tex_ref.clone();
+                    let diff = self.badframe_tex_diff.clone();
                     match (dist, refr) {
                         (Some(d), Some(r)) => {
                             ui.label("Reference (left) | Distorted (right) — drag divider to compare · drag to pan · scroll to zoom · double-click to fit");
@@ -1038,6 +1076,28 @@ impl crate::app::RFMetricsApp {
                                     ))
                                     .allow_hover(false),
                                 );
+                                // Changed-pixels overlay tiles exactly over
+                                // the distorted half (same UV as dist).
+                                if let Some(f) = diff.as_ref() {
+                                    plot_ui.image(
+                                        egui_plot::PlotImage::new(
+                                            "bf-wipe-diff",
+                                            f.id(),
+                                            egui_plot::PlotPoint::new(
+                                                lay.right_cx, 0.0,
+                                            ),
+                                            egui::Vec2::new(
+                                                lay.right_w as f32,
+                                                h as f32,
+                                            ),
+                                        )
+                                        .uv(egui::Rect::from_min_max(
+                                            egui::Pos2::new(u, 0.0),
+                                            egui::Pos2::new(1.0, 1.0),
+                                        ))
+                                        .allow_hover(false),
+                                    );
+                                }
                                 plot_ui.line(
                                     egui_plot::Line::new(
                                         "bf-wipe-div",
@@ -1190,6 +1250,7 @@ impl crate::app::RFMetricsApp {
                         _ => (-1.0, 1.0, -1.0, 1.0),
                     };
                 let do_reset = self.badframe_reset_once;
+                let diff = self.badframe_tex_diff.clone();
                 ui.columns(2, |cols| {
                     if let Some(tex) = &self.badframe_tex_ref {
                         let (w, h) = (tex.size()[0] as f32, tex.size()[1] as f32);
@@ -1239,6 +1300,17 @@ impl crate::app::RFMetricsApp {
                                 )
                                 .allow_hover(false),
                             );
+                            if let Some(f) = diff.as_ref() {
+                                plot_ui.image(
+                                    egui_plot::PlotImage::new(
+                                        "bf-dist-diff",
+                                        f.id(),
+                                        egui_plot::PlotPoint::new(0.0, 0.0),
+                                        egui::Vec2::new(w, h),
+                                    )
+                                    .allow_hover(false),
+                                );
+                            }
                         });
                     } else {
                         cols[1].label("Distorted — not extracted");
