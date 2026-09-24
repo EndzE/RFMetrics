@@ -90,6 +90,30 @@ fn tmp_suffix_targets_state_file() {
 }
 
 #[test]
+fn candidate_dirs_lead_with_app_dir_deduped() {
+    // Fallback order is exe → cwd → temp with no repeats, so a writable
+    // exe dir keeps the file exactly where it always was.
+    let dirs = crate::binaries::candidate_dirs();
+    assert!(!dirs.is_empty());
+    assert_eq!(dirs[0], crate::binaries::app_dir());
+    let mut seen = std::collections::HashSet::new();
+    for d in &dirs {
+        assert!(seen.insert(d), "duplicate candidate dir {d:?}");
+    }
+}
+
+#[test]
+fn write_atomic_fails_cleanly_without_side_effects() {
+    // Read-only install path: a failed write leaves no tmp behind so the
+    // next candidate dir gets a clean shot.
+    let dir = std::env::temp_dir().join(format!("rfmetrics-state-fail-{}", std::process::id()));
+    let path = dir.join("no-such-dir").join("ffmetrics-state.json");
+    assert!(!write_atomic("{}", &path));
+    assert!(!path.with_extension(format!("json{TMP_SUFFIX}")).exists());
+    assert!(!path.exists());
+}
+
+#[test]
 fn save_round_trip_is_atomic() {
     let dir = std::env::temp_dir().join(format!("rfmetrics-state-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

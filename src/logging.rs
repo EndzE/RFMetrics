@@ -5,10 +5,10 @@ use flexi_logger::{FileSpec, Logger};
 /// Log file basename next to the executable: `<exe_dir>/rfmetrics.log`.
 const BASENAME: &str = "rfmetrics";
 
-/// Directory for the log file: next to the exe, falling back to the
-/// current dir and then the temp dir when the exe dir is unresolvable.
+/// Directory for the log file: first writable of exe dir → cwd → temp,
+/// so a read-only install still logs instead of failing silently.
 fn log_dir() -> PathBuf {
-    crate::binaries::app_dir()
+    crate::binaries::writable_app_dir()
 }
 
 /// Initialize file-only logging once per process. Safe to call from tests:

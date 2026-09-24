@@ -3,6 +3,7 @@ use super::{
     CachedStats, DropAction, METRIC_COLUMNS, ProbeMsg, QueueRow, RFMetricsApp, display_names,
     norm_key, route_drop,
 };
+use crate::binaries::BinaryInfo;
 use crate::metrics::ffmpeg::InputFpsMode;
 
 #[test]
@@ -74,6 +75,28 @@ fn posix_keys_keep_separators_and_case() {
     );
     assert_ne!(norm_key("/vids/a.mp4"), norm_key("/vids/A.MP4"));
     assert_ne!(norm_key("/vids/a.mp4"), norm_key("/vids/b.mp4"));
+}
+
+#[test]
+fn norm_key_collapses_dot_segments() {
+    // Same file, four spellings: the duplicate-file guard must see one key.
+    // Purely lexical, so no files need to exist.
+    let plain = norm_key("vids/a.mp4");
+    for spelling in [
+        "./vids/a.mp4",
+        "vids/./a.mp4",
+        "vids/../vids/a.mp4",
+        "vids//a.mp4",
+    ] {
+        assert_eq!(norm_key(spelling), plain, "spelling {spelling:?}");
+    }
+    // Relative and absolute spellings agree too.
+    let abs = std::env::current_dir().unwrap().join("vids/a.mp4");
+    assert_eq!(norm_key(&abs.to_string_lossy()), plain);
+    // `..` past the root clamps (normpath parity), never escapes it.
+    // POSIX-only: on Windows a leading `/` is drive-relative, not absolute.
+    #[cfg(not(windows))]
+    assert_eq!(norm_key("/../a.mp4"), norm_key("/a.mp4"));
 }
 
 #[test]
@@ -187,6 +210,83 @@ fn stale_reference_result_discarded() {
 }
 
 #[test]
+fn bin_probe_drain_swaps_placeholders_and_reprobes() {
+    use crate::metrics::ffmpeg::MetricKind;
+    let mut app = RFMetricsApp {
+        bins_probing: true,
+        ..RFMetricsApp::default()
+    };
+    // A row that settled while binaries were unknown re-probes fresh.
+    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.rows[0].media = "ffprobe not found".to_owned();
+    app.rows[0].info = None;
+    app.next_probe_seq = 1;
+    let old_gen = app.rows[0].probe_gen;
+    app.last_spawned_ref = "C:/vids/ref.mp4".to_owned();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.bin_rx = rx;
+    let ffmpeg = BinaryInfo {
+        path: Some(std::path::PathBuf::from("C:/ffmpeg.exe")),
+        origin: "test",
+        short: "FFmpeg: test".to_owned(),
+        detail: "test".to_owned(),
+        usable: true,
+        supported_metrics: vec![MetricKind::Psnr],
+        ffmpeg_version: None,
+    };
+    let ffvship = BinaryInfo::probing("Probing for FFVship…");
+    tx.send((ffmpeg, ffvship, None)).unwrap();
+    assert!(app.drain_bin_results());
+    assert!(!app.bins_probing);
+    assert_eq!(app.ffmpeg.short, "FFmpeg: test");
+    assert!(!app.m_vmaf, "unsupported VMAF unticked on land");
+    assert!(app.last_spawned_ref.is_empty(), "ref re-probes next frame");
+    assert_ne!(app.rows[0].probe_gen, old_gen, "stale token dropped");
+    let fresh_gen = app.rows[0].probe_gen;
+    assert!(!app.drain_bin_results(), "channel drained");
+    // Stale no-binary results carry the old token and drop on arrival.
+    app.probe_tx
+        .send(ProbeMsg::RowMedia {
+            key: app.rows[0].key.clone(),
+            probe_gen: old_gen,
+            media: "STALE".to_owned(),
+            tip: "STALE".to_owned(),
+            info: None,
+            timed_out: false,
+        })
+        .unwrap();
+    app.drain_probe_results();
+    assert_ne!(app.rows[0].media, "STALE");
+    // The re-probe worker carries the fresh token (spawn proof).
+    let mut seen_fresh = false;
+    for _ in 0..200 {
+        app.drain_probe_results();
+        if app.rows[0].probe_gen == fresh_gen && app.rows[0].media != "Probing…" {
+            seen_fresh = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(seen_fresh, "re-probe worker lands with the fresh token");
+}
+
+#[test]
+fn start_run_while_bins_probing_toasts() {
+    let mut app = RFMetricsApp {
+        bins_probing: true,
+        ..RFMetricsApp::default()
+    };
+    app.start_run(1.0);
+    assert!(!app.measuring);
+    assert!(
+        app.toast
+            .as_ref()
+            .is_some_and(|t| t.text.contains("still probing")),
+        "accurate toast, not 'not found'"
+    );
+}
+
+#[test]
 fn row_media_applies_by_key() {
     let mut app = RFMetricsApp::default();
     app.rows.push(QueueRow {
@@ -195,6 +295,7 @@ fn row_media_applies_by_key() {
         display: "a.mp4".to_owned(),
         include: true,
         color_idx: 0,
+        probe_gen: 0,
         selected: false,
         media: "Probing…".to_owned(),
         media_tip: "Probing…".to_owned(),
@@ -218,6 +319,7 @@ fn row_media_applies_by_key() {
     app.probe_tx
         .send(ProbeMsg::RowMedia {
             key,
+            probe_gen: app.rows[0].probe_gen,
             media: "h264, 1080p".to_owned(),
             tip: "tip".to_owned(),
             info: None,
@@ -227,6 +329,7 @@ fn row_media_applies_by_key() {
     app.probe_tx
         .send(ProbeMsg::RowMedia {
             key: "nope".to_owned(),
+            probe_gen: 0,
             media: "x".to_owned(),
             tip: "y".to_owned(),
             info: None,
@@ -236,6 +339,60 @@ fn row_media_applies_by_key() {
     app.refresh_ref_info();
     assert_eq!(app.rows[0].media, "h264, 1080p");
     assert_eq!(app.rows[0].media_tip, "tip");
+}
+
+#[test]
+fn row_probe_token_rejects_stale_after_readd() {
+    use super::ProbeMsg;
+    // The token advances across remove/re-add through the real insert path
+    // (spawned probe threads are never drained here, so no timing involved).
+    let mut app = RFMetricsApp::default();
+    let p = std::path::PathBuf::from("C:/no/such/repro.mp4");
+    app.add_queue_files(vec![p.clone()]);
+    assert_eq!(app.rows.len(), 1);
+    let first_gen = app.rows[0].probe_gen;
+    app.rows.remove(0);
+    app.add_queue_files(vec![p]);
+    assert_eq!(app.rows.len(), 1);
+    assert_ne!(
+        app.rows[0].probe_gen, first_gen,
+        "re-added row must take a fresh probe token"
+    );
+
+    // Drain contract with hand-set tokens (no threads at all).
+    let mut app = RFMetricsApp::default();
+    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.rows[0].probe_gen = 5;
+    app.rows[0].media = "current".to_owned();
+    let key = norm_key("C:/vids/a.mp4");
+    // Orphaned probe from the removed row's generation: dropped, and its
+    // timeout stays silent.
+    app.probe_tx
+        .send(ProbeMsg::RowMedia {
+            key: key.clone(),
+            probe_gen: 2,
+            media: "STALE".to_owned(),
+            tip: "stale".to_owned(),
+            info: None,
+            timed_out: true,
+        })
+        .unwrap();
+    app.drain_probe_results();
+    assert_eq!(app.rows[0].media, "current");
+    assert!(app.probe_timeout_note.is_none());
+    // Live probe for this row's generation: applied.
+    app.probe_tx
+        .send(ProbeMsg::RowMedia {
+            key,
+            probe_gen: 5,
+            media: "fresh".to_owned(),
+            tip: "tip".to_owned(),
+            info: None,
+            timed_out: false,
+        })
+        .unwrap();
+    app.drain_probe_results();
+    assert_eq!(app.rows[0].media, "fresh");
 }
 
 #[test]
@@ -285,6 +442,7 @@ fn psnr_test_row(path: &str, include: bool) -> QueueRow {
         display: "a.mp4".to_owned(),
         include,
         color_idx: 0,
+        probe_gen: 0,
         selected: false,
         media: "h264, 1080p".to_owned(),
         media_tip: "tip".to_owned(),
@@ -359,7 +517,7 @@ fn start_psnr_bad_time_marks_cells() {
 }
 
 #[test]
-fn psnr_progress_keeps_max_and_done_clears() {
+fn psnr_progress_keeps_max_and_finished_clears() {
     use super::MetricMsg;
     use crate::metrics::MetricCell;
     let mut app = RFMetricsApp::default();
@@ -419,6 +577,15 @@ fn psnr_progress_keeps_max_and_done_clears() {
         MetricCell::Done { avg, skip, clip_dur, .. }
             if (*avg - 31.0).abs() < 1e-9 && skip.is_none() && *clip_dur == Some(5.0)
     ));
+    // Last `Done` leaves the run open; `Finished` ends it.
+    assert!(app.measuring);
+    app.metric_tx
+        .send(MetricMsg::Finished {
+            generation: 1,
+            aborted: false,
+        })
+        .unwrap();
+    app.drain_metric_results();
     assert!(!app.measuring);
 }
 
@@ -1078,6 +1245,176 @@ fn clean_finish_leaves_cells_and_clears_measuring() {
         .unwrap();
     app.drain_metric_results();
     assert!(!app.measuring);
+}
+
+/// Last `Done` must not clear `measuring`: the worker sends `Finished`
+/// (then `CsvReport`) after it, and clearing here would reopen Start a
+/// frame early so a restart orphans those terminal messages as stale
+/// (losing the auto-save trigger and CSV summary).
+#[test]
+fn last_done_keeps_measuring_until_finished() {
+    use super::MetricMsg;
+    use crate::metrics::MetricCell;
+    use crate::metrics::ffmpeg::MetricKind;
+    let mut app = RFMetricsApp {
+        results_autosave: true,
+        ..RFMetricsApp::default()
+    };
+    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.rows[0].psnr = MetricCell::Running {
+        frame: 42,
+        values: Vec::new(),
+    };
+    app.measuring = true;
+    app.pending = 1;
+    app.run_generation = 1;
+
+    app.metric_tx
+        .send(MetricMsg::Done {
+            generation: 1,
+            kind: MetricKind::Psnr,
+            key: norm_key("C:/vids/a.mp4"),
+            values: vec![30.0],
+            avg: Some(30.0),
+            exec_s: 1.0,
+            error: None,
+            skip: None,
+            clip_dur: None,
+            vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
+            fps_mode: InputFpsMode::Reference,
+            ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
+        })
+        .unwrap();
+    app.drain_metric_results();
+    assert!(
+        matches!(&app.rows[0].psnr, MetricCell::Done { .. }),
+        "last Done must still apply its cell"
+    );
+    assert_eq!(app.pending, 0);
+    assert!(
+        app.measuring,
+        "last Done must not reopen Start before Finished lands"
+    );
+
+    app.metric_tx
+        .send(MetricMsg::Finished {
+            generation: 1,
+            aborted: false,
+        })
+        .unwrap();
+    app.drain_metric_results();
+    assert!(!app.measuring);
+    assert!(app.results_autosave_pending);
+
+    app.metric_tx
+        .send(MetricMsg::CsvReport {
+            generation: 1,
+            ok: 2,
+            errors: Vec::new(),
+        })
+        .unwrap();
+    app.drain_metric_results();
+    assert_eq!(app.csv_report, Some((2, Vec::new())));
+}
+
+/// Pre-flight errors must not leave stale result caches behind: rank,
+/// sort, and tooltip readers trust the cache, so an `Error` cell with a
+/// leftover `Done` cache keeps its coloring and sorts as scored.
+#[test]
+fn preflight_error_clears_cached_stats_and_ranks() {
+    use crate::metrics::ffmpeg::MetricKind;
+    use crate::metrics::{CellStat, MetricCell, StatRank};
+    let p = std::env::temp_dir().join("rfmetrics-preflight-cache.tmp");
+    std::fs::write(&p, b"x").unwrap();
+    let mut app = RFMetricsApp {
+        m_psnr: true,
+        ref_path: p.to_string_lossy().into_owned(),
+        skip: "abc".to_owned(), // unparseable: hits the bad-time path
+        ..RFMetricsApp::default()
+    };
+    for (path, avg) in [("C:/vids/a.mp4", 30.0), ("C:/vids/b.mp4", 32.0)] {
+        let mut row = psnr_test_row(path, true);
+        row.psnr = MetricCell::Done {
+            values: vec![avg],
+            avg,
+            exec_s: 1.0,
+            skip: None,
+            clip_dur: None,
+            vmaf_cfg: None,
+            scaler: ScaleMethod::Bicubic,
+            fps_mode: InputFpsMode::Reference,
+            ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
+        };
+        row.psnr_cache.stats = row.psnr.done_stats();
+        app.rows.push(row);
+    }
+    app.refresh_ranks(MetricKind::Psnr);
+    // Sanity: two scored rows rank against each other before the error.
+    assert!(
+        app.rows
+            .iter()
+            .any(|r| r.psnr_cache.ranks != [StatRank::Plain; 10])
+    );
+
+    app.start_run(0.0);
+    std::fs::remove_file(&p).ok();
+    for row in &app.rows {
+        assert!(matches!(&row.psnr, MetricCell::Error { msg } if msg == "bad time"),);
+        assert!(row.psnr_cache.stats.is_none(), "stale stats survived");
+        assert_eq!(row.psnr_cache.ranks, [StatRank::Plain; 10]);
+        assert_eq!(super::sort_stat(row, MetricKind::Psnr, CellStat::Avg), None);
+    }
+}
+
+/// Closing the viewer mid-run must not pull tmp out from under the
+/// worker: deletion waits for its `Finished` (its last send, so nothing
+/// touches tmp afterwards). Idle close deletes immediately.
+#[test]
+fn badframe_close_defers_tmp_cleanup_while_busy() {
+    use super::BadframeMsg;
+    let dir = std::env::temp_dir().join(format!("rfmetrics-bf-close-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.PSNR.bf000001.png"), b"x").unwrap();
+
+    // Busy close: tmp survives, cleanup armed.
+    let mut app = RFMetricsApp {
+        badframe_tmp: dir.clone(),
+        show_badframes: true,
+        badframes_busy: true,
+        ..RFMetricsApp::default()
+    };
+    app.close_badframes();
+    assert!(!app.show_badframes);
+    assert!(app.badframe_tmp_cleanup_pending);
+    assert!(
+        dir.join("a.PSNR.bf000001.png").is_file(),
+        "tmp deleted under a live worker"
+    );
+
+    // The worker's last word clears busy and fires the deferred delete.
+    app.badframe_tx
+        .send(BadframeMsg::Finished {
+            ok: 1,
+            errors: Vec::new(),
+        })
+        .unwrap();
+    app.drain_badframe_results(0.0);
+    assert!(!app.badframes_busy);
+    assert!(!app.badframe_tmp_cleanup_pending);
+    assert!(!dir.exists(), "deferred tmp cleanup never fired");
+
+    // Idle close: immediate delete, nothing armed.
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut app = RFMetricsApp {
+        badframe_tmp: dir.clone(),
+        show_badframes: true,
+        ..RFMetricsApp::default()
+    };
+    app.close_badframes();
+    assert!(!app.badframe_tmp_cleanup_pending);
+    assert!(!dir.exists());
 }
 
 #[test]
@@ -2692,6 +3029,25 @@ fn dirty_check_matches_snapshot_compare() {
     assert_ne!(app.snapshot(), app.saved_snapshot);
 }
 
+/// Exit flush: a change inside the debounce window still reaches disk —
+/// `on_exit` saves whenever dirty, so the final second is never lost.
+#[test]
+fn on_exit_flushes_dirty_state() {
+    let mut app = RFMetricsApp {
+        ref_path: "C:/vids/ref.mp4".to_owned(),
+        ..RFMetricsApp::default()
+    };
+    assert!(app.is_state_dirty());
+    eframe::App::on_exit(&mut app);
+    assert!(!app.is_state_dirty(), "exit must leave nothing unsaved");
+    let loaded = crate::state::load().expect("on_exit must write the state file");
+    assert_eq!(loaded.ref_path, "C:/vids/ref.mp4");
+    // Leave no trace next to the test binary.
+    let path = crate::state::state_path();
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(path.with_extension("json.tmp")).ok();
+}
+
 /// Before/after timing: full `snapshot()` clone+compare (old per-frame
 /// path) vs `is_state_dirty` (new path) over a 200-row queue.
 #[test]
@@ -3382,6 +3738,7 @@ fn probe_timeout_note_recorded_once() {
     app.probe_tx
         .send(ProbeMsg::RowMedia {
             key: norm_key("C:/vids/a.mp4"),
+            probe_gen: app.rows[0].probe_gen,
             media: "x".to_owned(),
             tip: "y".to_owned(),
             info: None,
@@ -3405,6 +3762,7 @@ fn probe_timeout_note_recorded_once() {
     app.probe_tx
         .send(ProbeMsg::RowMedia {
             key: "gone".to_owned(),
+            probe_gen: 0,
             media: "x".to_owned(),
             tip: "y".to_owned(),
             info: None,

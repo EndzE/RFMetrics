@@ -269,8 +269,10 @@ pub fn parse_progress(line: &str) -> Option<u64> {
 /// Pooled average from ffmpeg's stderr summary, scanned bottom-up.
 /// PSNR (`... PSNR ... average:33.98 ...`) matches `average:` on any line
 /// mentioning PSNR; SSIM (`SSIM ... All:0.99 ...`) matches `All:` on lines
-/// mentioning SSIM that are not per-frame `n:` lines (Python parity,
-/// unclamped — `inf` stays `inf`).
+/// mentioning SSIM that are not per-frame `n:` lines (Python parity).
+/// Sanitized like the series: `nan` lines are skipped (the mean of the
+/// surviving frames wins downstream), `inf` saturates at the top of the
+/// range (100 for PSNR, 1 for SSIM).
 pub fn parse_summary(text: &str, kind: MetricKind) -> Option<f64> {
     for line in text.lines().rev() {
         match kind {
@@ -278,8 +280,9 @@ pub fn parse_summary(text: &str, kind: MetricKind) -> Option<f64> {
                 if line.contains("PSNR")
                     && let Some(c) = summary_re().captures(line)
                     && let Ok(v) = c.get(1).unwrap().as_str().parse::<f64>()
+                    && !v.is_nan()
                 {
-                    return Some(v);
+                    return Some(v.clamp(0.0, 100.0));
                 }
             }
             MetricKind::Ssim => {
@@ -288,8 +291,9 @@ pub fn parse_summary(text: &str, kind: MetricKind) -> Option<f64> {
                     && !s.starts_with("n:")
                     && let Some(c) = ssim_summary_re().captures(s)
                     && let Ok(v) = c.get(1).unwrap().as_str().parse::<f64>()
+                    && !v.is_nan()
                 {
-                    return Some(v);
+                    return Some(v.clamp(0.0, 1.0));
                 }
             }
             // XPSNR combines three planes with weights: use parse_xpsnr_summary.

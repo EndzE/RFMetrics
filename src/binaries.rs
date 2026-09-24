@@ -69,6 +69,23 @@ pub struct BinaryInfo {
     pub ffmpeg_version: Option<String>,
 }
 
+/// Startup placeholder while the version probes run off the UI thread:
+/// unusable with no path, so `start_run` gates on it like a missing
+/// binary until the drain swaps in the real result.
+impl BinaryInfo {
+    pub fn probing(short: &str) -> Self {
+        Self {
+            path: None,
+            origin: "",
+            short: short.to_owned(),
+            detail: "Probing…".to_owned(),
+            usable: false,
+            supported_metrics: Vec::new(),
+            ffmpeg_version: None,
+        }
+    }
+}
+
 /// Directory holding the running executable (Rust analog of Python's script dir).
 pub(crate) fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe()
@@ -81,6 +98,54 @@ pub(crate) fn exe_dir() -> Option<PathBuf> {
 pub(crate) fn app_dir() -> PathBuf {
     exe_dir()
         .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// Ordered candidate dirs for state/log files: exe dir, then cwd, then
+/// system temp (deduplicated). `app_dir` parity order, so a writable
+/// exe dir keeps the file exactly where it always was.
+pub(crate) fn candidate_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for d in [
+        exe_dir(),
+        std::env::current_dir().ok(),
+        Some(std::env::temp_dir()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
+    dirs
+}
+
+fn dir_writable(dir: &Path) -> bool {
+    // ponytail: probe file, not ACLs — a readonly-flag check misses
+    // Program-Files ACL denials, the actual failure mode here.
+    if !dir.is_dir() {
+        return false;
+    }
+    let probe = dir.join(format!(".rfmetrics-writetest-{}", std::process::id()));
+    match std::fs::write(&probe, []) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// First writable candidate dir (exe → cwd → temp). State saves and the
+/// log file use this instead of `app_dir` so a read-only install
+/// (Program Files) falls back instead of silently losing persistence.
+/// Unwritable leftovers are skipped; a total failure returns temp anyway
+/// and lets the caller surface it.
+pub(crate) fn writable_app_dir() -> PathBuf {
+    candidate_dirs()
+        .into_iter()
+        .find(|d| dir_writable(d))
         .unwrap_or_else(std::env::temp_dir)
 }
 

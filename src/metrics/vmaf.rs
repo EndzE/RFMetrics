@@ -284,7 +284,9 @@ pub struct VmafLog {
 
 /// Parse a libvmaf JSON log (Python `_parse_vmaf_log` parity):
 /// `frames[].metrics.vmaf` per frame (sanitized + clamped 0–`max_score`),
-/// `pooled_metrics.vmaf.{mean,harmonic_mean}` pooled (raw, never clamped).
+/// `pooled_metrics.vmaf.{mean,harmonic_mean}` pooled (sanitized like the
+/// series: `nan` drops to `None` so the frame mean wins downstream, `inf`
+/// saturates at `max_score`).
 /// `max_score` is `model_score_max` for the run's model (110 for v1 4K 3H).
 pub fn parse_vmaf_log(text: &str, max_score: f64) -> Option<VmafLog> {
     let data: serde_json::Value = serde_json::from_str(text).ok()?;
@@ -343,8 +345,10 @@ pub fn parse_vmaf_log(text: &str, max_score: f64) -> Option<VmafLog> {
         }
     }
     if let Some(pooled) = data.get("pooled_metrics").and_then(|p| p.get("vmaf")) {
-        log.mean = pooled.get("mean").and_then(tolerant_f64);
-        log.harmonic_mean = pooled.get("harmonic_mean").and_then(tolerant_f64);
+        let sanitize_pooled =
+            |v: Option<f64>| v.filter(|v| !v.is_nan()).map(|v| v.clamp(0.0, max_score));
+        log.mean = sanitize_pooled(pooled.get("mean").and_then(tolerant_f64));
+        log.harmonic_mean = sanitize_pooled(pooled.get("harmonic_mean").and_then(tolerant_f64));
     }
     Some(log)
 }

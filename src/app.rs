@@ -19,6 +19,10 @@ struct QueueRow {
     /// and never reused: hiding or removing one row never recolors the
     /// survivors. Session-only (reassigned 0..n in file order on load).
     color_idx: usize,
+    /// Probe token, assigned from `next_probe_seq` at insert and never
+    /// reused: `RowMedia` applies only on match, so removing a row and
+    /// re-adding the same path can't let the old probe paint the new row.
+    probe_gen: u64,
     selected: bool,
     media: String,
     media_tip: String,
@@ -106,6 +110,13 @@ impl QueueRow {
             MetricKind::Cvvdp => &mut self.cvvdp_cache,
         }
     }
+
+    /// Drop a stale result cache when its cell stops being `Done`
+    /// (pre-flight `Error`, Reset): rank/sort/tooltip readers trust the
+    /// cache, so leaving it behind resurrects the old result.
+    fn clear_cached(&mut self, kind: MetricKind) {
+        *self.cached_mut(kind) = CachedStats::default();
+    }
 }
 
 /// File picker extensions (FFMetrics.conf `VideoFilesList` parity).
@@ -113,6 +124,26 @@ const VIDEO_EXTS: &[&str] = &[
     "264", "avi", "avs", "h264", "hevc", "m2ts", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "mts",
     "mxf", "ts", "webm",
 ];
+
+/// Purely lexical `.`/`..`/duplicate-separator resolution (the `normpath`
+/// half of Python `abspath`): no filesystem access, no symlink resolution,
+/// so pending-drop paths work and spellings stay stable. `pop` on an empty
+/// or root path is a no-op, which clamps `..` at the filesystem root exactly
+/// like `normpath` does for absolute inputs.
+fn lexical_normalize(p: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            _ => out.push(c.as_os_str()),
+        }
+    }
+    out
+}
 
 /// Python `normcase(abspath)` equivalent for the same-file guard rail.
 /// Windows: lowercase + `/` -> `\`. POSIX `normcase` is the identity, so
@@ -130,6 +161,7 @@ fn norm_key(p: &str) -> String {
             }
         }
     };
+    let abs = lexical_normalize(&abs);
     #[cfg(windows)]
     {
         abs.to_string_lossy().replace('/', "\\").to_lowercase()
@@ -291,6 +323,9 @@ enum ProbeMsg {
     },
     RowMedia {
         key: String,
+        /// Row token at spawn; applies only if the row still holds it
+        /// (a remove/re-add orphan carries the old one).
+        probe_gen: u64,
         media: String,
         tip: String,
         info: Option<crate::probe::MediaInfo>,
@@ -305,6 +340,15 @@ struct ThumbMsg {
     generation: u64,
     image: Option<egui::ColorImage>,
 }
+
+/// Startup binary probe result: the version probes (`-version` × 2 +
+/// `-filters`) run on a worker thread so a wedged exe can't freeze the
+/// window; exactly one tuple is sent.
+type BinProbe = (
+    crate::binaries::BinaryInfo,
+    crate::binaries::BinaryInfo,
+    Option<std::path::PathBuf>,
+);
 
 /// PNG export result from the one-shot saver thread. The supersampled
 /// render + Lanczos3 downscale blocks for seconds, so it never runs on the
@@ -555,6 +599,12 @@ pub struct RFMetricsApp {
     results_autosave_pending: bool,
     probe_tx: Sender<ProbeMsg>,
     probe_rx: Receiver<ProbeMsg>,
+    /// Startup binary probe channel: one `(ffmpeg, ffvship, ffprobe)`
+    /// tuple lands after the version probes finish off the UI thread.
+    /// `bins_probing` gates `start_run` with an accurate toast meanwhile
+    /// (instead of a misleading "not found").
+    bin_rx: Receiver<BinProbe>,
+    bins_probing: bool,
     metric_tx: Sender<MetricMsg>,
     metric_rx: Receiver<MetricMsg>,
     /// True while the metric worker runs; the button flips Start↔Stop then.
@@ -563,10 +613,13 @@ pub struct RFMetricsApp {
     abort: Arc<AtomicBool>,
     /// The live ffmpeg child, so Stop can kill the in-flight run.
     current_child: Arc<Mutex<Option<std::process::Child>>>,
-    /// Jobs still Blocking; last `Done` clears `measuring`.
+    /// Jobs still Blocking; `Finished` alone clears `measuring` (the
+    /// last `Done` must not: `Finished`/`CsvReport` still follow it).
     pending: usize,
     /// Next plot-color slot; bumped per queued file, never reused.
     next_color_idx: usize,
+    /// Next row-probe token; bumped per queued file, never reused.
+    next_probe_seq: u64,
     /// Bumped per run; late worker messages after a Reset are stale.
     run_generation: u64,
     /// Path last handed to a probe worker (or resolved cheaply without one).
@@ -590,6 +643,9 @@ pub struct RFMetricsApp {
     saved_snapshot: crate::state::AppState,
     /// Egui time of the first unsaved change (`None` = clean).
     pending_save_since: Option<f64>,
+    /// One-shot: the state-fallback/failure toast already fired, so a
+    /// read-only install toasts once instead of every debounce.
+    state_fallback_toasted: bool,
     /// Metric kind of the currently executing job (last kind seen on the
     /// Progress/Series feed); drives plot tab-follow while measuring.
     live_kind: Option<MetricKind>,
@@ -674,6 +730,10 @@ pub struct RFMetricsApp {
     badframe_tex_key: Option<(String, MetricKind, usize)>,
     /// Tmp dir holding this run's viewer PNGs (per-process).
     badframe_tmp: std::path::PathBuf,
+    /// Close requested while a bad-frames worker runs: tmp deletion waits
+    /// for its `Finished` drain (the worker reads/writes tmp until then).
+    /// Session-only, never persisted.
+    badframe_tmp_cleanup_pending: bool,
     /// All tmp PNGs from the last Extract run.
     badframe_files: Vec<std::path::PathBuf>,
     /// In-flight export summary (copies done, worker PNGs pending).
@@ -683,9 +743,31 @@ pub struct RFMetricsApp {
 
 impl Default for RFMetricsApp {
     fn default() -> Self {
-        let ffmpeg = crate::binaries::ffmpeg_info();
-        let ffvship = crate::binaries::ffvship_info();
-        let ffprobe = crate::binaries::ffprobe_path(ffmpeg.path.as_deref());
+        // Version probes can each block up to `VERSION_TIMEOUT` (wedged
+        // exe, AV stall): run them on a worker, never the UI thread.
+        // Tests stay synchronous + hermetic (no host timing in asserts).
+        let (ffmpeg, ffvship, ffprobe, bin_rx, bins_probing) = if cfg!(test) {
+            let ffmpeg = crate::binaries::ffmpeg_info();
+            let ffvship = crate::binaries::ffvship_info();
+            let ffprobe = crate::binaries::ffprobe_path(ffmpeg.path.as_deref());
+            let (_, bin_rx) = std::sync::mpsc::channel();
+            (ffmpeg, ffvship, ffprobe, bin_rx, false)
+        } else {
+            let (bin_tx, bin_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let ffmpeg = crate::binaries::ffmpeg_info();
+                let ffvship = crate::binaries::ffvship_info();
+                let ffprobe = crate::binaries::ffprobe_path(ffmpeg.path.as_deref());
+                let _ = bin_tx.send((ffmpeg, ffvship, ffprobe));
+            });
+            (
+                crate::binaries::BinaryInfo::probing("Probing for ffmpeg…"),
+                crate::binaries::BinaryInfo::probing("Probing for FFVship…"),
+                None,
+                bin_rx,
+                true,
+            )
+        };
         let (probe_tx, probe_rx) = std::sync::mpsc::channel();
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
         let (metric_tx, metric_rx) = std::sync::mpsc::channel();
@@ -744,6 +826,8 @@ impl Default for RFMetricsApp {
             results_autosave_pending: false,
             probe_tx,
             probe_rx,
+            bin_rx,
+            bins_probing,
             metric_tx,
             metric_rx,
             measuring: false,
@@ -751,6 +835,7 @@ impl Default for RFMetricsApp {
             current_child: Arc::new(Mutex::new(None)),
             pending: 0,
             next_color_idx: 0,
+            next_probe_seq: 0,
             run_generation: 0,
             last_spawned_ref: String::new(),
             ref_info_path: String::new(),
@@ -763,6 +848,7 @@ impl Default for RFMetricsApp {
             thumb_generation: 0,
             saved_snapshot: crate::state::AppState::default(),
             pending_save_since: None,
+            state_fallback_toasted: false,
             live_kind: None,
             live_key: None,
             show_plot: false,
@@ -797,6 +883,7 @@ impl Default for RFMetricsApp {
             badframe_tex_ref: None,
             badframe_tex_key: None,
             badframe_tmp: crate::metrics::badframes::tmp_dir(),
+            badframe_tmp_cleanup_pending: false,
             badframe_files: Vec::new(),
             badframe_export_pending: None,
         };
@@ -847,23 +934,85 @@ impl RFMetricsApp {
                 }
                 ProbeMsg::RowMedia {
                     key,
+                    probe_gen,
                     media,
                     tip,
                     info,
                     timed_out,
                 } => {
                     if let Some(row) = self.rows.iter_mut().find(|r| r.key == key) {
-                        row.media = media;
-                        row.media_tip = tip;
-                        row.info = info;
-                        if timed_out {
-                            self.probe_timeout_note = Some(row.display.clone());
+                        // Remove/re-add orphans carry the old token: only the
+                        // row this probe spawned for may consume it.
+                        if row.probe_gen == probe_gen {
+                            row.media = media;
+                            row.media_tip = tip;
+                            row.info = info;
+                            if timed_out {
+                                self.probe_timeout_note = Some(row.display.clone());
+                            }
+                        } else {
+                            log::debug!(target: "rfmetrics::app", "discarded stale row probe for {key}");
                         }
                     }
                 }
             }
         }
         activity
+    }
+
+    /// Startup binary probe drain: swaps the `Probing…` placeholders for
+    /// the real version results, then re-arms anything that resolved
+    /// while the binaries were unknown. Generations bump so stale
+    /// no-binary results ("ffprobe not found") drop instead of winning
+    /// the race against the re-probes.
+    fn drain_bin_results(&mut self) -> bool {
+        let Ok((ffmpeg, ffvship, ffprobe)) = self.bin_rx.try_recv() else {
+            return false;
+        };
+        // Only one tuple is ever sent; drop duplicates if any.
+        while self.bin_rx.try_recv().is_ok() {}
+        self.ffmpeg = ffmpeg;
+        self.ffvship = ffvship;
+        self.ffprobe = ffprobe;
+        self.bins_probing = false;
+        self.untick_unsupported_metrics();
+        // Reference + thumbnail re-probe through the normal path next frame.
+        self.ref_generation = self.ref_generation.wrapping_add(1);
+        self.last_spawned_ref.clear();
+        self.thumb_generation = self.thumb_generation.wrapping_add(1);
+        self.last_thumb_path.clear();
+        // Queue rows that settled (or are still settling) without a binary
+        // re-probe with fresh tokens; stale workers carry the old token.
+        let mut stale: Vec<(String, String, u64)> = Vec::new();
+        for row in &mut self.rows {
+            if row.info.is_none() {
+                let token = self.next_probe_seq;
+                self.next_probe_seq = self.next_probe_seq.wrapping_add(1);
+                row.probe_gen = token;
+                row.media = "Probing…".to_owned();
+                row.media_tip = "Probing…".to_owned();
+                stale.push((row.key.clone(), row.path.clone(), token));
+            }
+        }
+        if !stale.is_empty() {
+            let tx = self.probe_tx.clone();
+            let exe = self.ffprobe.clone();
+            std::thread::spawn(move || {
+                for (key, s, probe_gen) in stale {
+                    let (media, tip, info, timed_out) =
+                        crate::probe::probe_table_text(&s, exe.as_deref());
+                    let _ = tx.send(ProbeMsg::RowMedia {
+                        key,
+                        probe_gen,
+                        media,
+                        tip,
+                        info,
+                        timed_out,
+                    });
+                }
+            });
+        }
+        true
     }
 
     /// Re-probe only when the path actually changed, and only off the UI
@@ -1009,17 +1158,18 @@ impl RFMetricsApp {
         }
         let tx = self.probe_tx.clone();
         let exe = self.ffprobe.clone();
-        let paths: Vec<(String, String)> = self
+        let paths: Vec<(String, String, u64)> = self
             .rows
             .iter()
-            .map(|r| (r.key.clone(), r.path.clone()))
+            .map(|r| (r.key.clone(), r.path.clone(), r.probe_gen))
             .collect();
         std::thread::spawn(move || {
-            for (key, s) in paths {
+            for (key, s, probe_gen) in paths {
                 let (media, tip, info, timed_out) =
                     crate::probe::probe_table_text(&s, exe.as_deref());
                 let _ = tx.send(ProbeMsg::RowMedia {
                     key,
+                    probe_gen,
                     media,
                     tip,
                     info,
@@ -1034,7 +1184,7 @@ impl RFMetricsApp {
     /// until their results arrive, so drops never freeze the window.
     fn add_queue_files(&mut self, paths: Vec<std::path::PathBuf>) {
         let mut seen: HashSet<String> = self.rows.iter().map(|r| r.key.clone()).collect();
-        let mut fresh: Vec<(String, String)> = Vec::new();
+        let mut fresh: Vec<(String, String, u64)> = Vec::new();
         for p in paths {
             let s = p.to_string_lossy().into_owned();
             let key = norm_key(&s);
@@ -1043,12 +1193,15 @@ impl RFMetricsApp {
             }
             let color_idx = self.next_color_idx;
             self.next_color_idx += 1;
+            let probe_gen = self.next_probe_seq;
+            self.next_probe_seq = self.next_probe_seq.wrapping_add(1);
             self.rows.push(QueueRow {
                 path: s.clone(),
                 key: key.clone(),
                 display: String::new(),
                 include: true,
                 color_idx,
+                probe_gen,
                 selected: false,
                 media: "Probing…".to_owned(),
                 media_tip: "Probing…".to_owned(),
@@ -1068,7 +1221,7 @@ impl RFMetricsApp {
                 butter_cache: CachedStats::default(),
                 cvvdp_cache: CachedStats::default(),
             });
-            fresh.push((key, s));
+            fresh.push((key, s, probe_gen));
         }
         self.refresh_queue_names();
         if fresh.is_empty() {
@@ -1077,11 +1230,12 @@ impl RFMetricsApp {
         let tx = self.probe_tx.clone();
         let exe = self.ffprobe.clone();
         std::thread::spawn(move || {
-            for (key, s) in fresh {
+            for (key, s, probe_gen) in fresh {
                 let (media, tip, info, timed_out) =
                     crate::probe::probe_table_text(&s, exe.as_deref());
                 let _ = tx.send(ProbeMsg::RowMedia {
                     key,
+                    probe_gen,
                     media,
                     tip,
                     info,
@@ -1226,9 +1380,10 @@ impl RFMetricsApp {
                                 .then(wall_now_string);
                         scored_changed = true;
                     }
-                    if self.pending == 0 {
-                        self.measuring = false;
-                    }
+                    // `Finished` alone clears `measuring` below: the worker
+                    // sends it (then `CsvReport`) after the last `Done`, so
+                    // clearing here would reopen Start a frame early and
+                    // orphan those terminal messages as stale.
                 }
                 MetricMsg::Finished {
                     generation,
@@ -1710,9 +1865,41 @@ impl RFMetricsApp {
             }
             Some(since) if now - since >= SAVE_DEBOUNCE_SECS => {
                 let snap = self.snapshot();
-                crate::state::save(&snap);
-                self.saved_snapshot = snap;
-                self.pending_save_since = None;
+                match crate::state::save(&snap) {
+                    Some(path) => {
+                        // Read-only install: the save fell back (or the log
+                        // did) — toast once so persistence loss is visible.
+                        if path != crate::state::state_path() && !self.state_fallback_toasted {
+                            self.state_fallback_toasted = true;
+                            self.toast(
+                                now,
+                                format!(
+                                    "App folder not writable — state saves to {}",
+                                    path.display()
+                                ),
+                                ToastKind::Warning,
+                            );
+                        }
+                        self.saved_snapshot = snap;
+                        self.pending_save_since = None;
+                    }
+                    None => {
+                        // Transient (locked/full disk): retry next debounce,
+                        // toast once.
+                        if !self.state_fallback_toasted {
+                            self.state_fallback_toasted = true;
+                            self.toast(
+                                now,
+                                "State save failed everywhere — retrying".to_owned(),
+                                ToastKind::Warning,
+                            );
+                        }
+                        self.pending_save_since = Some(now);
+                        ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+                            SAVE_DEBOUNCE_SECS,
+                        ));
+                    }
+                }
             }
             Some(since) => {
                 let remaining = (SAVE_DEBOUNCE_SECS - (now - since)).max(0.0);
@@ -1727,6 +1914,14 @@ impl RFMetricsApp {
     /// as errors, mirroring Python's `"bad time"` / `"probe failed"` text.
     fn start_run(&mut self, now: f64) {
         if self.measuring {
+            return;
+        }
+        if self.bins_probing {
+            self.toast(
+                now,
+                "Binaries still probing — try again in a moment".to_owned(),
+                ToastKind::Info,
+            );
             return;
         }
         let kinds: Vec<MetricKind> = MetricKind::ALL
@@ -1773,7 +1968,11 @@ impl RFMetricsApp {
                     *self.rows[i].cell_mut(kind) = crate::metrics::MetricCell::Error {
                         msg: "no ref".to_owned(),
                     };
+                    self.rows[i].clear_cached(kind);
                 }
+            }
+            for &kind in &kinds {
+                self.refresh_ranks(kind);
             }
             self.toast(
                 now,
@@ -1791,7 +1990,11 @@ impl RFMetricsApp {
                     *self.rows[i].cell_mut(kind) = crate::metrics::MetricCell::Error {
                         msg: "bad time".to_owned(),
                     };
+                    self.rows[i].clear_cached(kind);
                 }
+            }
+            for &kind in &kinds {
+                self.refresh_ranks(kind);
             }
             self.toast(
                 now,
@@ -1885,6 +2088,9 @@ impl RFMetricsApp {
                     *self.rows[i].cell_mut(*kind) = crate::metrics::MetricCell::Error {
                         msg: label.to_owned(),
                     };
+                    // Ranks refresh with the rest below, after `Running`
+                    // cells are marked (their caches clear there too).
+                    self.rows[i].clear_cached(*kind);
                 }
                 if !missing.contains(&label) {
                     missing.push(label);
@@ -1893,6 +2099,11 @@ impl RFMetricsApp {
         }
         if !missing.is_empty() {
             self.toast(now, missing.join(" + "), ToastKind::Error);
+            // Downstream early-returns (probing ref, empty jobs) skip the
+            // post-marking refresh, so settle ranks here.
+            for (kind, _, _) in &work {
+                self.refresh_ranks(*kind);
+            }
         }
         let Some(ref_info) = self.ref_info_data.clone() else {
             self.toast(
@@ -2769,6 +2980,13 @@ impl RFMetricsApp {
                     self.badframes_busy = false;
                     self.badframe_done = 0;
                     self.badframe_total = 0;
+                    // Deferred close cleanup: the window closed mid-run and
+                    // tmp stayed alive for the worker until now (`Finished`
+                    // is its last send, so nothing touches tmp afterwards).
+                    if self.badframe_tmp_cleanup_pending {
+                        self.badframe_tmp_cleanup_pending = false;
+                        let _ = std::fs::remove_dir_all(&self.badframe_tmp);
+                    }
                     // Export extracts went straight to the destination:
                     // toast the combined outcome, viewer tmp untouched.
                     if let Some(pending) = self.badframe_export_pending.take() {
@@ -2886,6 +3104,24 @@ impl RFMetricsApp {
     /// per-metric tabs, file picker, worst-frame stepper, dist/ref pair
     /// side by side with shared zoom + scroll-pan, current-tab extractor,
     /// and an options box with count + save-all-to-folder.
+    ///
+    /// Close while a worker runs defers tmp deletion until its `Finished`
+    /// drains (no abort: an export launched from the viewer may be using
+    /// tmp, and the run is bounded anyway).
+    fn close_badframes(&mut self) {
+        self.show_badframes = false;
+        if self.badframes_busy {
+            self.badframe_tmp_cleanup_pending = true;
+        } else {
+            // Best-effort tmp cleanup; save-all must happen while open.
+            let _ = std::fs::remove_dir_all(&self.badframe_tmp);
+        }
+        self.badframe_files.clear();
+        self.badframe_tex_dist = None;
+        self.badframe_tex_ref = None;
+        self.badframe_tex_key = None;
+    }
+
     fn show_badframes(&mut self, ctx: &egui::Context) {
         if !self.show_badframes {
             return;
@@ -2896,13 +3132,7 @@ impl RFMetricsApp {
             .with_inner_size([1100.0, 700.0]);
         ctx.show_viewport_immediate(id, builder, |vui, _class| {
             if vui.input(|i| i.viewport().close_requested()) {
-                self.show_badframes = false;
-                // Best-effort tmp cleanup; save-all must happen while open.
-                let _ = std::fs::remove_dir_all(&self.badframe_tmp);
-                self.badframe_files.clear();
-                self.badframe_tex_dist = None;
-                self.badframe_tex_ref = None;
-                self.badframe_tex_key = None;
+                self.close_badframes();
                 return;
             }
             let vnow = vui.input(|i| i.time);
@@ -4451,6 +4681,8 @@ impl eframe::App for RFMetricsApp {
         // drain running. Spawns above stem from input frames, which repaint
         // on their own; thumb workers also wake the UI themselves.
         let live = self.refresh_ref_info();
+        // Startup version probes land here (off-UI-thread, see `Default`).
+        let live = self.drain_bin_results() | live;
         // Probe timeouts surface once as a warning toast (the drain only
         // records the name; the slot keeps the latest like `toast`).
         if let Some(name) = self.probe_timeout_note.take() {
@@ -5810,6 +6042,17 @@ impl eframe::App for RFMetricsApp {
         self.show_plots(ui.ctx());
         // Bad-frames viewer viewport (own OS window while open).
         self.show_badframes(ui.ctx());
+    }
+
+    fn on_exit(&mut self) {
+        // Debounced writes can still be pending: flush the final second.
+        // `save` is atomic (tmp + rename) and log-only, so this never
+        // toasts or blocks shutdown.
+        if self.is_state_dirty() {
+            let snap = self.snapshot();
+            let _ = crate::state::save(&snap);
+            self.saved_snapshot = snap;
+        }
     }
 }
 #[cfg(test)]

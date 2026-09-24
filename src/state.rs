@@ -132,34 +132,78 @@ pub fn state_path() -> PathBuf {
     crate::binaries::app_dir().join(FILE_NAME)
 }
 
+/// Every place the state file may live, exe-first (parity order): load
+/// reads the first one that exists, save writes the first writable one.
+fn candidate_paths() -> Vec<PathBuf> {
+    crate::binaries::candidate_dirs()
+        .into_iter()
+        .map(|d| d.join(FILE_NAME))
+        .collect()
+}
+
 /// Tolerant load: missing/corrupt/non-object files behave as no file.
+/// Searches exe dir → cwd → temp so a fallback save is found again.
 pub fn load() -> Option<AppState> {
-    let path = state_path();
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) => {
-            log::debug!(target: "rfmetrics::state", "no state file {}: {e}", path.display());
-            return None;
-        }
-    };
-    match serde_json::from_str::<AppState>(&text) {
-        Ok(s) => {
-            log::info!(target: "rfmetrics::state", "loaded {}", path.display());
-            Some(s)
-        }
-        Err(e) => {
-            log::warn!(target: "rfmetrics::state", "ignoring corrupt {}: {e}", path.display());
-            None
+    for path in candidate_paths() {
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        match serde_json::from_str::<AppState>(&text) {
+            Ok(s) => {
+                log::info!(target: "rfmetrics::state", "loaded {}", path.display());
+                return Some(s);
+            }
+            Err(e) => {
+                log::warn!(target: "rfmetrics::state", "ignoring corrupt {}: {e}", path.display());
+                return None;
+            }
         }
     }
+    log::debug!(target: "rfmetrics::state", "no state file found");
+    None
 }
 
 /// Atomic save (tmp + rename, Python parity); failures are logged, never
 /// toasted — losing UI persistence must not interrupt a run.
-pub fn save(state: &AppState) {
-    save_to(state, &state_path());
+/// Writes the first writable candidate (exe → cwd → temp) and returns
+/// where it landed (`None` when everywhere failed, so the caller can
+/// toast once instead of losing persistence silently).
+pub fn save(state: &AppState) -> Option<PathBuf> {
+    let text = match serde_json::to_string_pretty(state) {
+        Ok(t) => t,
+        Err(e) => {
+            log::warn!(target: "rfmetrics::state", "serialize failed: {e}");
+            return None;
+        }
+    };
+    for path in candidate_paths() {
+        if write_atomic(&text, &path) {
+            if path != state_path() {
+                log::warn!(target: "rfmetrics::state", "saved fallback {}", path.display());
+            } else {
+                log::debug!(target: "rfmetrics::state", "saved {}", path.display());
+            }
+            return Some(path);
+        }
+    }
+    log::warn!(target: "rfmetrics::state", "save failed in every candidate dir");
+    None
 }
 
+fn write_atomic(text: &str, path: &PathBuf) -> bool {
+    let tmp = path.with_extension(format!("json{TMP_SUFFIX}"));
+    if std::fs::write(&tmp, text)
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .is_err()
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
 fn save_to(state: &AppState, path: &PathBuf) {
     let text = match serde_json::to_string_pretty(state) {
         Ok(t) => t,
@@ -168,13 +212,9 @@ fn save_to(state: &AppState, path: &PathBuf) {
             return;
         }
     };
-    let tmp = path.with_extension(format!("json{TMP_SUFFIX}"));
-    if let Err(e) = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, path)) {
-        let _ = std::fs::remove_file(&tmp);
-        log::warn!(target: "rfmetrics::state", "save {} failed: {e}", path.display());
-        return;
+    if !write_atomic(&text, path) {
+        log::warn!(target: "rfmetrics::state", "save {} failed", path.display());
     }
-    log::debug!(target: "rfmetrics::state", "saved {}", path.display());
 }
 #[cfg(test)]
 #[path = "tests/test_state.rs"]

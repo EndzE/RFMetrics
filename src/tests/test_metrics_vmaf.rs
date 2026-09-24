@@ -568,6 +568,19 @@ fn log_clamps_to_model_range() {
 }
 
 #[test]
+fn log_pooled_sanitizes_like_series() {
+    // `nan` pooled drops to `None` (frame mean wins); `inf` saturates.
+    let text = r#"{"pooled_metrics": {"vmaf": {"mean": "nan", "harmonic_mean": "inf"}}}"#;
+    let log = parse_vmaf_log(text, 100.0).unwrap();
+    assert_eq!(log.mean, None);
+    assert_eq!(log.harmonic_mean, Some(100.0));
+    let text = r#"{"pooled_metrics": {"vmaf": {"mean": 150.0, "harmonic_mean": -5.0}}}"#;
+    let log = parse_vmaf_log(text, 100.0).unwrap();
+    assert_eq!(log.mean, Some(100.0));
+    assert_eq!(log.harmonic_mean, Some(0.0));
+}
+
+#[test]
 fn log_rejects_garbage() {
     assert!(parse_vmaf_log("not json", 100.0).is_none());
     assert!(parse_vmaf_log("{}", 100.0).unwrap().values.is_empty());

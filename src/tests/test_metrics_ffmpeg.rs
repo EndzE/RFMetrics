@@ -103,6 +103,34 @@ fn ssim_summary_scans_bottom_up() {
 }
 
 #[test]
+fn summary_sanitizes_nonfinite_like_series() {
+    use super::MetricKind::{Psnr, Ssim};
+    // `inf` (identical files) saturates; `nan` lines are skipped so the
+    // frame mean wins downstream instead of poisoning the cell.
+    assert_eq!(
+        parse_summary("[Parsed_psnr_0] PSNR average:inf", Psnr),
+        Some(100.0)
+    );
+    assert_eq!(
+        parse_summary("[Parsed_psnr_0] PSNR average:nan", Psnr),
+        None
+    );
+    assert_eq!(
+        parse_summary("[Parsed_ssim_0] SSIM All:inf", Ssim),
+        Some(1.0)
+    );
+    assert_eq!(parse_summary("[Parsed_ssim_0] SSIM All:nan", Ssim), None);
+    // A `nan` summary line falls through to the earlier valid one.
+    assert_eq!(
+        parse_summary(
+            "[Parsed_psnr_0] PSNR average:30.0\n[Parsed_psnr_0] PSNR average:nan",
+            Psnr
+        ),
+        Some(30.0)
+    );
+}
+
+#[test]
 fn graph_scales_dist_to_ref() {
     use super::MetricKind::Psnr;
     let mut dist = ref_info();
