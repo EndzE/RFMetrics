@@ -4,6 +4,10 @@
 )]
 
 mod app;
+mod app_badframes;
+mod app_plots;
+mod app_queue;
+mod app_run;
 mod binaries;
 mod cmd;
 mod logging;

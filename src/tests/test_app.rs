@@ -1,8 +1,6 @@
 use super::ScaleMethod;
-use super::{
-    CachedStats, DropAction, METRIC_COLUMNS, ProbeMsg, QueueRow, RFMetricsApp, display_names,
-    norm_key, route_drop,
-};
+use super::{DropAction, METRIC_COLUMNS, ProbeMsg, QueueRow, RFMetricsApp, norm_key, route_drop};
+use crate::app_queue::{CachedStats, display_names};
 use crate::binaries::BinaryInfo;
 use crate::metrics::ffmpeg::InputFpsMode;
 
@@ -1363,7 +1361,10 @@ fn preflight_error_clears_cached_stats_and_ranks() {
         assert!(matches!(&row.psnr, MetricCell::Error { msg } if msg == "bad time"),);
         assert!(row.psnr_cache.stats.is_none(), "stale stats survived");
         assert_eq!(row.psnr_cache.ranks, [StatRank::Plain; 10]);
-        assert_eq!(super::sort_stat(row, MetricKind::Psnr, CellStat::Avg), None);
+        assert_eq!(
+            crate::app_queue::sort_stat(row, MetricKind::Psnr, CellStat::Avg),
+            None
+        );
     }
 }
 
@@ -3584,7 +3585,7 @@ fn fps_counter_budget() {
 /// qualifies; anything else (or no/zero duration) falls back.
 #[test]
 fn thumb_duration_reuse_rules() {
-    use super::thumb_duration;
+    use crate::app_queue::thumb_duration;
     assert_eq!(
         thumb_duration("C:/r.mp4", "C:/r.mp4", Some(63.0)),
         Some(63.0)
@@ -3805,7 +3806,7 @@ fn sort_test_row(
 /// third clears to insertion; switching columns restarts.
 #[test]
 fn sort_cycle_path_and_metrics() {
-    use super::{SortColumn, SortDir, cycle_sort, initial_dir};
+    use crate::app_queue::{SortColumn, SortDir, cycle_sort, initial_dir};
     use crate::metrics::CellStat;
     use crate::metrics::ffmpeg::MetricKind;
     assert_eq!(
@@ -3856,7 +3857,7 @@ fn sort_cycle_path_and_metrics() {
 /// unscored rows always last in both directions, stable ties.
 #[test]
 fn sort_view_orders_and_restores() {
-    use super::{SortColumn, SortDir, sort_view};
+    use crate::app_queue::{SortColumn, SortDir, sort_view};
     use crate::metrics::CellStat;
     use crate::metrics::ffmpeg::MetricKind;
     let rows = vec![
@@ -3910,7 +3911,7 @@ fn sort_view_orders_and_restores() {
 /// path (populated) and the uncached fallback (cleared).
 #[test]
 fn sort_view_follows_cell_stat_selector() {
-    use super::{SortColumn, SortDir, sort_view};
+    use crate::app_queue::{SortColumn, SortDir, sort_view};
     use crate::metrics::CellStat;
     use crate::metrics::ffmpeg::MetricKind;
     fn scored(display: &str, values: Vec<f64>, avg: f64, cache: bool) -> QueueRow {

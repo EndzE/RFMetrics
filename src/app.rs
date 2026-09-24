@@ -1,253 +1,22 @@
+pub(crate) use crate::app_queue::{
+    DropAction, METRIC_COLUMNS, QueueRow, SortColumn, SortDir, VIDEO_EXTS, apply_alt_include,
+    cycle_sort, done_is_stale, norm_key, reveal_in_explorer, route_drop, shift_include_range,
+    sort_view,
+};
 use crate::metrics::ffmpeg::MetricKind;
 use crate::metrics::ffmpeg::ScaleMethod;
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug)]
-struct QueueRow {
-    path: String,
-    /// `norm_key(path)` computed once at insert; `path` is never mutated
-    /// after push, so worker-message routing compares this instead of
-    /// re-normalizing (and re-hitting `current_dir()`) per row per message.
-    key: String,
-    display: String,
-    include: bool,
-    /// Permanent plot-color slot, assigned from `next_color_idx` at insert
-    /// and never reused: hiding or removing one row never recolors the
-    /// survivors. Session-only (reassigned 0..n in file order on load).
-    color_idx: usize,
-    /// Probe token, assigned from `next_probe_seq` at insert and never
-    /// reused: `RowMedia` applies only on match, so removing a row and
-    /// re-adding the same path can't let the old probe paint the new row.
-    probe_gen: u64,
-    selected: bool,
-    media: String,
-    media_tip: String,
-    info: Option<crate::probe::MediaInfo>,
-    psnr: crate::metrics::MetricCell,
-    ssim: crate::metrics::MetricCell,
-    vmaf: crate::metrics::MetricCell,
-    xpsnr: crate::metrics::MetricCell,
-    ssim2: crate::metrics::MetricCell,
-    butter: crate::metrics::MetricCell,
-    cvvdp: crate::metrics::MetricCell,
-    psnr_cache: CachedStats,
-    ssim_cache: CachedStats,
-    vmaf_cache: CachedStats,
-    xpsnr_cache: CachedStats,
-    ssim2_cache: CachedStats,
-    butter_cache: CachedStats,
-    cvvdp_cache: CachedStats,
-}
-
-/// Cached per-row stats + cross-row ranks for one metric column (H1: the
-/// values-vec clone+sort in `DoneStats::new` and the rank scan run on
-/// result arrival, not per frame; the render loop only reads).
-/// Plot lines decimate directly from the cell `values` (`x = i+1.0`) at
-/// draw time, capped at ~8192 points — no full-res `PlotPoint` cache.
-#[derive(Debug, Clone, Default)]
-struct CachedStats {
-    stats: Option<crate::metrics::DoneStats>,
-    ranks: [crate::metrics::StatRank; 10],
-    /// Rendered Done text (Avg at the Options Precision), frozen at Done arrival
-    /// so the table loop never formats per frame. Cleared wherever `stats`
-    /// is cleared (rerun start, Reset via wholesale `default()`).
-    text: String,
-    /// Wall-clock completion stamp (`%Y-%m-%d %H:%M:%S` local) for the
-    /// results CSV `*-DateTime` columns; frozen with the rest, cleared
-    /// with it.
-    finished: Option<String>,
-}
-
-impl QueueRow {
-    fn cell(&self, kind: MetricKind) -> &crate::metrics::MetricCell {
-        match kind {
-            MetricKind::Psnr => &self.psnr,
-            MetricKind::Ssim => &self.ssim,
-            MetricKind::Vmaf => &self.vmaf,
-            MetricKind::Xpsnr => &self.xpsnr,
-            MetricKind::Ssim2 => &self.ssim2,
-            MetricKind::But => &self.butter,
-            MetricKind::Cvvdp => &self.cvvdp,
-        }
-    }
-
-    fn cell_mut(&mut self, kind: MetricKind) -> &mut crate::metrics::MetricCell {
-        match kind {
-            MetricKind::Psnr => &mut self.psnr,
-            MetricKind::Ssim => &mut self.ssim,
-            MetricKind::Vmaf => &mut self.vmaf,
-            MetricKind::Xpsnr => &mut self.xpsnr,
-            MetricKind::Ssim2 => &mut self.ssim2,
-            MetricKind::But => &mut self.butter,
-            MetricKind::Cvvdp => &mut self.cvvdp,
-        }
-    }
-
-    fn cached(&self, kind: MetricKind) -> &CachedStats {
-        match kind {
-            MetricKind::Psnr => &self.psnr_cache,
-            MetricKind::Ssim => &self.ssim_cache,
-            MetricKind::Vmaf => &self.vmaf_cache,
-            MetricKind::Xpsnr => &self.xpsnr_cache,
-            MetricKind::Ssim2 => &self.ssim2_cache,
-            MetricKind::But => &self.butter_cache,
-            MetricKind::Cvvdp => &self.cvvdp_cache,
-        }
-    }
-
-    fn cached_mut(&mut self, kind: MetricKind) -> &mut CachedStats {
-        match kind {
-            MetricKind::Psnr => &mut self.psnr_cache,
-            MetricKind::Ssim => &mut self.ssim_cache,
-            MetricKind::Vmaf => &mut self.vmaf_cache,
-            MetricKind::Xpsnr => &mut self.xpsnr_cache,
-            MetricKind::Ssim2 => &mut self.ssim2_cache,
-            MetricKind::But => &mut self.butter_cache,
-            MetricKind::Cvvdp => &mut self.cvvdp_cache,
-        }
-    }
-
-    /// Drop a stale result cache when its cell stops being `Done`
-    /// (pre-flight `Error`, Reset): rank/sort/tooltip readers trust the
-    /// cache, so leaving it behind resurrects the old result.
-    fn clear_cached(&mut self, kind: MetricKind) {
-        *self.cached_mut(kind) = CachedStats::default();
-    }
-}
-
-/// File picker extensions (FFMetrics.conf `VideoFilesList` parity).
-const VIDEO_EXTS: &[&str] = &[
-    "264", "avi", "avs", "h264", "hevc", "m2ts", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "mts",
-    "mxf", "ts", "webm",
-];
-
-/// Purely lexical `.`/`..`/duplicate-separator resolution (the `normpath`
-/// half of Python `abspath`): no filesystem access, no symlink resolution,
-/// so pending-drop paths work and spellings stay stable. `pop` on an empty
-/// or root path is a no-op, which clamps `..` at the filesystem root exactly
-/// like `normpath` does for absolute inputs.
-fn lexical_normalize(p: &Path) -> std::path::PathBuf {
-    use std::path::Component;
-    let mut out = std::path::PathBuf::new();
-    for c in p.components() {
-        match c {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            _ => out.push(c.as_os_str()),
-        }
-    }
-    out
-}
-
-/// Python `normcase(abspath)` equivalent for the same-file guard rail.
-/// Windows: lowercase + `/` -> `\`. POSIX `normcase` is the identity, so
-/// Unix keeps separators and case as-is (`foo/bar` vs `foo\bar` are distinct).
-fn norm_key(p: &str) -> String {
-    let path = Path::new(p);
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        match std::env::current_dir() {
-            Ok(cwd) => cwd.join(path),
-            Err(e) => {
-                log::warn!(target: "rfmetrics::app", "current_dir failed ({e}); norm_key falling back to relative path for \"{p}\"");
-                std::path::PathBuf::new().join(path)
-            }
-        }
-    };
-    let abs = lexical_normalize(&abs);
-    #[cfg(windows)]
-    {
-        abs.to_string_lossy().replace('/', "\\").to_lowercase()
-    }
-    #[cfg(not(windows))]
-    {
-        abs.to_string_lossy().into_owned()
-    }
-}
-
-/// Reveal a queued file in the OS file manager without blocking the UI.
-/// Windows selects the file (`explorer /select,`); other platforms open the
-/// containing folder (select-on-open has no portable equivalent).
-/// Spawn-only: never waits on the child, so a slow Explorer can't freeze a frame.
-fn reveal_in_explorer(path: &str) -> std::io::Result<()> {
-    #[cfg(windows)]
-    {
-        std::process::Command::new("explorer")
-            .args(["/select,", path])
-            .spawn()
-            .map(|_| ())
-    }
-    #[cfg(not(windows))]
-    {
-        let target = Path::new(path)
-            .parent()
-            .map(|p| p.as_os_str().to_string_lossy().into_owned())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| path.to_owned());
-        open::that(&target)
-    }
-}
-
-/// Thumbnail seek duration: reuse the completed reference probe's
-/// duration when it belongs to the current path; otherwise `None` and the
-/// worker falls back to a dedicated probe (`media_duration`).
-fn thumb_duration(ref_path: &str, ref_info_path: &str, probed: Option<f64>) -> Option<f64> {
-    if !ref_path.is_empty() && ref_path == ref_info_path {
-        probed.filter(|&d| d > 0.0)
-    } else {
-        None
-    }
-}
-
-/// Shortest unique trailing-path suffix per entry (Python `_display_names`).
-fn display_names(paths: &[String]) -> Vec<String> {
-    let parts: Vec<Vec<String>> = paths
-        .iter()
-        .map(|p| {
-            Path::new(p)
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect()
-        })
-        .collect();
-    let sep = std::path::MAIN_SEPARATOR.to_string();
-    parts
-        .iter()
-        .enumerate()
-        .map(|(i, part)| {
-            for n in 1..=part.len() {
-                let cand = &part[part.len() - n..];
-                let unique = parts.iter().enumerate().all(|(j, q)| {
-                    j == i || {
-                        let tail = if q.len() >= n {
-                            &q[q.len() - n..]
-                        } else {
-                            &q[..]
-                        };
-                        tail != cand
-                    }
-                });
-                if unique {
-                    return cand.join(&sep);
-                }
-            }
-            part.join(&sep)
-        })
-        .collect()
-}
+// Queue domain lives in `crate::app_queue` (re-exported above).
 
 /// Retrieves the cursor position in egui's logical point coordinates.
 /// During Windows OLE file drags, winit omits pointer move events, so egui's
 /// internal pointer state is None/stale. We query the OS cursor directly.
 #[cfg(windows)]
-fn get_cursor_pos(ctx: &egui::Context) -> Option<egui::Pos2> {
+pub(crate) fn get_cursor_pos(ctx: &egui::Context) -> Option<egui::Pos2> {
     #[repr(C)]
     struct Point {
         x: i32,
@@ -273,28 +42,28 @@ fn get_cursor_pos(ctx: &egui::Context) -> Option<egui::Pos2> {
 }
 
 #[cfg(not(windows))]
-fn get_cursor_pos(ctx: &egui::Context) -> Option<egui::Pos2> {
+pub(crate) fn get_cursor_pos(ctx: &egui::Context) -> Option<egui::Pos2> {
     ctx.input(|i| i.pointer.hover_pos().or(i.pointer.latest_pos()))
 }
 
 /// Hover highlight delay (seconds) so passing over rows while aiming
 /// at text to copy doesn't flash each row.
-const ROW_HOVER_DELAY: f64 = 0.1;
+pub(crate) const ROW_HOVER_DELAY: f64 = 0.1;
 
 /// How long the drop toast (e.g. ignored extra reference files) stays up.
-const TOAST_SECS: f64 = 3.0;
+pub(crate) const TOAST_SECS: f64 = 3.0;
 
 /// Toast severity; drives the outline color. `Info` keeps the default
 /// popup outline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToastKind {
+pub(crate) enum ToastKind {
     Info,
     Warning,
     Error,
 }
 
 impl ToastKind {
-    fn outline(self) -> Option<egui::Color32> {
+    pub(crate) fn outline(self) -> Option<egui::Color32> {
         match self {
             ToastKind::Info => None,
             ToastKind::Warning => Some(egui::Color32::from_rgb(0xD9, 0xA4, 0x06)),
@@ -304,441 +73,243 @@ impl ToastKind {
 }
 
 #[derive(Debug, Clone)]
-struct Toast {
-    text: String,
-    until: f64,
-    kind: ToastKind,
+pub(crate) struct Toast {
+    pub(crate) text: String,
+    pub(crate) until: f64,
+    pub(crate) kind: ToastKind,
 }
 
-/// Results sent back from background probe threads. The UI thread never
-/// blocks on ffprobe; it drains these each frame via `try_recv`.
-#[derive(Debug)]
-enum ProbeMsg {
-    Reference {
-        generation: u64,
-        text: String,
-        info: Option<crate::probe::MediaInfo>,
-        /// The ffprobe call timed out (the drain surfaces it as a toast).
-        timed_out: bool,
-    },
-    RowMedia {
-        key: String,
-        /// Row token at spawn; applies only if the row still holds it
-        /// (a remove/re-add orphan carries the old one).
-        probe_gen: u64,
-        media: String,
-        tip: String,
-        info: Option<crate::probe::MediaInfo>,
-        /// The ffprobe call timed out (the drain surfaces it as a toast).
-        timed_out: bool,
-    },
-}
-
-/// Thumbnail result from the dedicated ffmpeg worker (separate channel so
-/// slow frame extracts never block fast ffprobe text results).
-struct ThumbMsg {
-    generation: u64,
-    image: Option<egui::ColorImage>,
-}
-
-/// Startup binary probe result: the version probes (`-version` × 2 +
-/// `-filters`) run on a worker thread so a wedged exe can't freeze the
-/// window; exactly one tuple is sent.
-type BinProbe = (
-    crate::binaries::BinaryInfo,
-    crate::binaries::BinaryInfo,
-    Option<std::path::PathBuf>,
-);
-
-/// PNG export result from the one-shot saver thread. The supersampled
-/// render + Lanczos3 downscale blocks for seconds, so it never runs on the
-/// UI thread; the worker sends the outcome back here for a toast. Copy jobs
-/// send pixels back because `ctx.copy_image()` must run on the UI thread
-/// (winit executes it as a frame-end `OutputCommand`).
-enum PngSaveMsg {
-    Saved { path: std::path::PathBuf },
-    CopyReady { w: u32, h: u32, rgba: Vec<u8> },
-    SaveFailed { err: String },
-    CopyFailed { err: String },
-}
-
-/// Pending plot export: file save (filename captured at click time) or
-/// clipboard copy. Executed in the central panel where the plot id scope
-/// (for the current view bounds) lives.
-enum PlotExport {
-    Save { name: String },
-    Copy,
-}
-
-/// Progress + summary from the bad-frames worker (one thread, sequential
-/// accurate seeks; abort stops between frames).
-#[derive(Debug)]
-enum BadframeMsg {
-    Progress { done: usize, total: usize },
-    Finished { ok: usize, errors: Vec<String> },
-}
-
-/// One PNG to extract (owned snapshot for the worker thread).
-struct BadframeJob {
-    kind: MetricKind,
-    dist_path: String,
-    dist_fps: f64,
-    frame: usize,
-    offset: f64,
-}
-
-/// Frozen-at-click export plan: no UI borrows cross into the thread.
-struct BadframePlan {
-    ffmpeg: std::path::PathBuf,
-    ref_path: String,
-    ref_fps: f64,
-    tmp: std::path::PathBuf,
-    jobs: Vec<BadframeJob>,
-}
-
-/// Export scope for the bad-frames Export buttons (bf_opts row).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BadframeExportScope {
-    Pair,
-    Metric,
-    All,
-}
-
-/// One worst-frame pair to export (owned snapshot for the worker).
-struct BadframeExportPair {
-    kind: MetricKind,
-    dist_path: String,
-    dist_fps: f64,
-    frame: usize,
-    offset: f64,
-}
-
-/// Direct-to-destination extract (viewer tmp untouched, so no wipe and
-/// no stale-tmp risk; overwrites like the old Save-all copy).
-struct BadframeExportJob {
-    kind: MetricKind,
-    dist_src: String,
-    dist_fps: f64,
-    frame: usize,
-    offset: f64,
-    dest_dist: std::path::PathBuf,
-    dest_ref: std::path::PathBuf,
-}
-
-/// Tmp-to-destination copy for an already-extracted pair (exports exactly
-/// what the viewer shows). Runs in the export worker, never on the UI
-/// thread — batch scopes copy hundreds of multi-MB PNGs.
-struct BadframeExportCopy {
-    tmp_dist: std::path::PathBuf,
-    tmp_ref: std::path::PathBuf,
-    dest_dist: std::path::PathBuf,
-    dest_ref: std::path::PathBuf,
-    name: &'static str,
-    frame: usize,
-}
-
-/// Frozen-at-click export plan: no UI borrows cross into the thread.
-struct BadframeExportPlan {
-    ffmpeg: std::path::PathBuf,
-    ref_src: String,
-    ref_fps: f64,
-    jobs: Vec<BadframeExportJob>,
-}
-
-/// Pending export summary: worker copies + PNGs land here on Finished,
-/// then toasted (viewer tmp/textures untouched).
-struct BadframeExportPending {
-    copied: usize,
-    failed: Vec<String>,
-    dest_note: String,
-}
-
-/// Progress + results from the single sequential metric worker (Python
-/// `_worker` parity: one thread, checked metrics in order, never on the UI
-/// thread). `generation` drops late messages after a Reset starts a new run.
-#[derive(Debug)]
-enum MetricMsg {
-    Progress {
-        generation: u64,
-        kind: MetricKind,
-        key: String,
-        frame: u64,
-    },
-    /// Live per-frame value deltas for the running job's plot curve
-    /// (throttled worker-side); appended to `Running.values` in arrival
-    /// order, replaced by the strict full series on `Done`.
-    Series {
-        generation: u64,
-        kind: MetricKind,
-        key: String,
-        new_values: Vec<f64>,
-    },
-    Done {
-        generation: u64,
-        kind: MetricKind,
-        key: String,
-        values: Vec<f64>,
-        avg: Option<f64>,
-        exec_s: f64,
-        error: Option<String>,
-        /// Trim settings the run used; stamped onto the `Done` cell so a
-        /// rerun under different skip/clip recomputes instead of skipping.
-        skip: Option<f64>,
-        clip_dur: Option<f64>,
-        /// VMAF settings the run used (`Some` for VMAF jobs only); stamped
-        /// onto the `Done` cell so an options change recomputes VMAF alone.
-        vmaf_cfg: Option<crate::metrics::vmaf::VmafCfg>,
-        /// Scaling method the run used; stamped onto the `Done` cell so a
-        /// method change recomputes every ffmpeg-backed column (FFVship
-        /// has no scale stage and ignores it at compare time).
-        scaler: ScaleMethod,
-        /// Input framerate mode the run used; stamped like `scaler` so a
-        /// mode change recomputes every ffmpeg-backed column (FFVship
-        /// has no `-r` stage and ignores it at compare time).
-        fps_mode: crate::metrics::ffmpeg::InputFpsMode,
-        /// Reference pixel-format target the run used; stamped like
-        /// `scaler` so a target change recomputes every ffmpeg-backed
-        /// column (FFVship has no `format=` stage and ignores it at
-        /// compare time).
-        ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt,
-    },
-    /// End of the worker loop; `aborted` settles still-Running cells to
-    /// Idle while keeping finished (`Done`) results on screen.
-    Finished { generation: u64, aborted: bool },
-    /// CSV export summary from the worker (sent once before `Finished`
-    /// when export was enabled): files written vs. error strings.
-    CsvReport {
-        generation: u64,
-        ok: usize,
-        errors: Vec<String>,
-    },
-}
+// Worker message + plan types live in their domain modules (re-exported
+// so `super::ProbeMsg` etc. in child tests keeps working).
+pub(crate) use crate::app_badframes::{BadframeExportPending, BadframeMsg};
+pub(crate) use crate::app_plots::{PlotExport, PngSaveMsg};
+pub(crate) use crate::app_run::{BinProbe, MetricMsg, ProbeMsg, ThumbMsg, wall_now_string};
 
 pub struct RFMetricsApp {
-    ref_path: String,
-    duration: String,
-    skip: String,
-    m_psnr: bool,
-    m_ssim: bool,
-    m_vmaf: bool,
-    m_xpsnr: bool,
-    m_ssim2: bool,
-    m_but: bool,
-    m_cvvdp: bool,
-    vmaf_model: String,
-    vmaf_phone: bool,
-    vmaf_scale: bool,
-    vmaf_pooling: String,
-    vmaf_subsample: String,
-    vmaf_threads: String,
-    vmaf_models: Vec<String>,
+    pub(crate) ref_path: String,
+    pub(crate) duration: String,
+    pub(crate) skip: String,
+    pub(crate) m_psnr: bool,
+    pub(crate) m_ssim: bool,
+    pub(crate) m_vmaf: bool,
+    pub(crate) m_xpsnr: bool,
+    pub(crate) m_ssim2: bool,
+    pub(crate) m_but: bool,
+    pub(crate) m_cvvdp: bool,
+    pub(crate) vmaf_model: String,
+    pub(crate) vmaf_phone: bool,
+    pub(crate) vmaf_scale: bool,
+    pub(crate) vmaf_pooling: String,
+    pub(crate) vmaf_subsample: String,
+    pub(crate) vmaf_threads: String,
+    pub(crate) vmaf_models: Vec<String>,
     /// Global scaling method for every `scale=` the app emits.
-    scale_method: ScaleMethod,
+    pub(crate) scale_method: ScaleMethod,
     /// Input framerate mode for every `-i` the app emits (FFMetrics #111).
-    fps_mode: crate::metrics::ffmpeg::InputFpsMode,
+    pub(crate) fps_mode: crate::metrics::ffmpeg::InputFpsMode,
     /// Which `DoneStats` stat metric cells display, sort by, and copy
     /// (Options combobox, default Avg).
-    cell_stat: crate::metrics::CellStat,
+    pub(crate) cell_stat: crate::metrics::CellStat,
     /// Decimals for metric cell display + Copy value (Options combobox,
     /// default 4). Frozen Avg texts re-freeze on change (see below).
-    cell_precision: u8,
+    pub(crate) cell_precision: u8,
     /// Pixel format both legs converge on (Skip-row combobox, default No
     /// conversion = legacy dist→ref-native legs). Run input: locked
     /// mid-run, stamped onto `Done` cells like `scaler`.
-    ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt,
+    pub(crate) ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt,
     /// Open the plot viewport when a run starts (Options checkbox).
-    plot_at_start: bool,
+    pub(crate) plot_at_start: bool,
     /// Save per-frame metric CSVs on Done (Options checkbox).
-    csv_export: bool,
+    pub(crate) csv_export: bool,
     /// CSV output folder; empty = beside the distorted file (Options).
-    csv_dir: String,
+    pub(crate) csv_dir: String,
     /// Append results rows to the results file when each run ends.
-    results_autosave: bool,
+    pub(crate) results_autosave: bool,
     /// Results file path; empty = `RFMetrics.Results.csv` next to the exe.
-    results_path: String,
+    pub(crate) results_path: String,
     /// Save PNG / Copy image size preset (Options combobox).
-    plot_size: crate::plot::PlotSize,
+    pub(crate) plot_size: crate::plot::PlotSize,
     /// Worst frames saved per metric/file by Extract bad frames (Options
     /// combobox, original `BadFrames.Count` parity, default 5).
-    badframes_count: String,
+    pub(crate) badframes_count: String,
     /// Bad-frames export folder; empty = beside each distorted file.
-    badframes_export_dir: String,
-    rows: Vec<QueueRow>,
-    ffmpeg: crate::binaries::BinaryInfo,
-    ffvship: crate::binaries::BinaryInfo,
-    ffprobe: Option<std::path::PathBuf>,
-    ref_info: String,
+    pub(crate) badframes_export_dir: String,
+    pub(crate) rows: Vec<QueueRow>,
+    pub(crate) ffmpeg: crate::binaries::BinaryInfo,
+    pub(crate) ffvship: crate::binaries::BinaryInfo,
+    pub(crate) ffprobe: Option<std::path::PathBuf>,
+    pub(crate) ref_info: String,
     /// Probed reference stream; feeds metric filtergraphs (scale/format).
-    ref_info_data: Option<crate::probe::MediaInfo>,
-    ref_rect: Option<egui::Rect>,
-    table_rect: Option<egui::Rect>,
-    hover_row: Option<usize>,
-    hover_since: Option<f64>,
-    hovered_now: Option<usize>,
+    pub(crate) ref_info_data: Option<crate::probe::MediaInfo>,
+    pub(crate) ref_rect: Option<egui::Rect>,
+    pub(crate) table_rect: Option<egui::Rect>,
+    pub(crate) hover_row: Option<usize>,
+    pub(crate) hover_since: Option<f64>,
+    pub(crate) hovered_now: Option<usize>,
     /// Shift+click range anchor: last clicked include-checkbox row
     /// (session-only, like hover/selection — never persisted).
-    include_anchor: Option<usize>,
+    pub(crate) include_anchor: Option<usize>,
     /// Shift+click range anchor: last free-space-clicked row for the
     /// `selected` removal set (session-only, never persisted).
-    selected_anchor: Option<usize>,
+    pub(crate) selected_anchor: Option<usize>,
     /// Active table sort, if any (session-only, never persisted — the
     /// state file and run order always keep insertion order).
-    sort_spec: Option<(SortColumn, SortDir)>,
-    toast: Option<Toast>,
+    pub(crate) sort_spec: Option<(SortColumn, SortDir)>,
+    pub(crate) toast: Option<Toast>,
     /// A probe worker hit its timeout; the drain records the display name
     /// here and the update loop toasts it once (single slot, like `toast`).
     /// Session-only, never persisted.
-    probe_timeout_note: Option<String>,
+    pub(crate) probe_timeout_note: Option<String>,
     /// Pending CSV summary, set by the CsvReport drain arm and toasted
     /// with a real timestamp at the next UI frame (drain has none).
     /// `(files_written, error_strings)`.
-    csv_report: Option<(usize, Vec<String>)>,
+    pub(crate) csv_report: Option<(usize, Vec<String>)>,
     /// Results auto-save owed: set by the Finished drain arm when the
     /// option is on (aborted runs included), consumed with a timestamp
     /// at the next UI frame like `csv_report` above.
-    results_autosave_pending: bool,
-    probe_tx: Sender<ProbeMsg>,
-    probe_rx: Receiver<ProbeMsg>,
+    pub(crate) results_autosave_pending: bool,
+    pub(crate) probe_tx: Sender<ProbeMsg>,
+    pub(crate) probe_rx: Receiver<ProbeMsg>,
     /// Startup binary probe channel: one `(ffmpeg, ffvship, ffprobe)`
     /// tuple lands after the version probes finish off the UI thread.
     /// `bins_probing` gates `start_run` with an accurate toast meanwhile
     /// (instead of a misleading "not found").
-    bin_rx: Receiver<BinProbe>,
-    bins_probing: bool,
-    metric_tx: Sender<MetricMsg>,
-    metric_rx: Receiver<MetricMsg>,
+    pub(crate) bin_rx: Receiver<BinProbe>,
+    pub(crate) bins_probing: bool,
+    pub(crate) metric_tx: Sender<MetricMsg>,
+    pub(crate) metric_rx: Receiver<MetricMsg>,
     /// True while the metric worker runs; the button flips Start↔Stop then.
-    measuring: bool,
+    pub(crate) measuring: bool,
     /// Stop flag shared with the worker (checked between jobs + in `run_psnr`).
-    abort: Arc<AtomicBool>,
+    pub(crate) abort: Arc<AtomicBool>,
     /// The live ffmpeg child, so Stop can kill the in-flight run.
-    current_child: Arc<Mutex<Option<std::process::Child>>>,
+    pub(crate) current_child: Arc<Mutex<Option<std::process::Child>>>,
     /// Jobs still Blocking; `Finished` alone clears `measuring` (the
     /// last `Done` must not: `Finished`/`CsvReport` still follow it).
-    pending: usize,
+    pub(crate) pending: usize,
     /// Next plot-color slot; bumped per queued file, never reused.
-    next_color_idx: usize,
+    pub(crate) next_color_idx: usize,
     /// Next row-probe token; bumped per queued file, never reused.
-    next_probe_seq: u64,
+    pub(crate) next_probe_seq: u64,
     /// Bumped per run; late worker messages after a Reset are stale.
-    run_generation: u64,
+    pub(crate) run_generation: u64,
     /// Path last handed to a probe worker (or resolved cheaply without one).
-    last_spawned_ref: String,
+    pub(crate) last_spawned_ref: String,
     /// Path the current `ref_info_data` was probed from (set when its
     /// worker result lands). The thumbnail worker reuses its duration only
     /// on a match — `ref_info_data` alone lags one probe behind on ref
     /// change and can't say which path it belongs to.
-    ref_info_path: String,
+    pub(crate) ref_info_path: String,
     /// Bumped on every ref change; worker results with an older generation
     /// are stale (typed-through) and discarded.
-    ref_generation: u64,
-    thumb_tx: Sender<ThumbMsg>,
-    thumb_rx: Receiver<ThumbMsg>,
-    thumb_tex: Option<egui::TextureHandle>,
-    thumb_loading: bool,
-    last_thumb_path: String,
-    thumb_generation: u64,
+    pub(crate) ref_generation: u64,
+    pub(crate) thumb_tx: Sender<ThumbMsg>,
+    pub(crate) thumb_rx: Receiver<ThumbMsg>,
+    pub(crate) thumb_tex: Option<egui::TextureHandle>,
+    pub(crate) thumb_loading: bool,
+    pub(crate) last_thumb_path: String,
+    pub(crate) thumb_generation: u64,
     /// Last state actually written to `ffmetrics-state.json`; the per-frame
     /// snapshot compares against this so only real changes arm a write.
-    saved_snapshot: crate::state::AppState,
+    pub(crate) saved_snapshot: crate::state::AppState,
     /// Egui time of the first unsaved change (`None` = clean).
-    pending_save_since: Option<f64>,
+    pub(crate) pending_save_since: Option<f64>,
     /// One-shot: the state-fallback/failure toast already fired, so a
     /// read-only install toasts once instead of every debounce.
-    state_fallback_toasted: bool,
+    pub(crate) state_fallback_toasted: bool,
     /// Metric kind of the currently executing job (last kind seen on the
     /// Progress/Series feed); drives plot tab-follow while measuring.
-    live_kind: Option<MetricKind>,
+    pub(crate) live_kind: Option<MetricKind>,
     /// Queue key (`QueueRow::key`) of the currently executing job (last
     /// key seen on the Progress/Series feed, cleared when its `Done`
     /// lands). The worker runs jobs sequentially but every queued cell
     /// is marked `Running` upfront, so the sweep animates only this
     /// cell — the rest stay static until their turn.
-    live_key: Option<String>,
+    pub(crate) live_key: Option<String>,
     /// PSNR plot viewport open (Python `plot["win"]` parity: closing the
     /// window withdraws it, Plot reopens it).
-    show_plot: bool,
+    pub(crate) show_plot: bool,
     /// Selected plot viewport tab (session-only, like the Python window).
-    plot_tab: MetricKind,
+    pub(crate) plot_tab: MetricKind,
     /// Last measured tab-strip box width, for centering the strip
     /// (session-only; texts are static so it converges in one frame).
-    plot_tabs_w: f32,
+    pub(crate) plot_tabs_w: f32,
     /// Grow-only live fit per open tab while any series is running;
     /// cleared once all settle, so finished graphs fit exactly again.
-    plot_live_fit: Option<(MetricKind, crate::plot::FitBounds)>,
+    pub(crate) plot_live_fit: Option<(MetricKind, crate::plot::FitBounds)>,
     /// Follow poke still owed: set when a live phase starts without plot
     /// memory present (window just opened), retried until it lands.
-    plot_follow_pending: bool,
+    pub(crate) plot_follow_pending: bool,
     /// Reset-view click still owed: the help-bar `Ui` scopes persistent
     /// ids differently than the canvas `Ui`, so the button only arms this
     /// flag and the central panel (plot id scope) executes the poke.
     /// Retried until plot memory exists, like the follow poke.
-    plot_reset_pending: bool,
+    pub(crate) plot_reset_pending: bool,
     /// Snap-to-data lock (plot window checkbox, session-only): panning is
     /// clamped to the first/last frame on x and the plotted min/max on y;
     /// zooming and in-limits panning stay free.
-    plot_snap: bool,
+    pub(crate) plot_snap: bool,
     /// Pending plot export (Save PNG / Copy button), executed in the
     /// central panel where the plot id scope lives.
-    plot_save_pending: Option<PlotExport>,
+    pub(crate) plot_save_pending: Option<PlotExport>,
     /// Plot export worker channel + busy flag: while `png_saving` both the
     /// Save PNG and Copy buttons are disabled so 5 s renders can't overlap.
-    png_tx: Sender<PngSaveMsg>,
-    png_rx: Receiver<PngSaveMsg>,
-    png_saving: bool,
+    pub(crate) png_tx: Sender<PngSaveMsg>,
+    pub(crate) png_rx: Receiver<PngSaveMsg>,
+    pub(crate) png_saving: bool,
     /// Bad-frames worker channel + state: `badframes_busy` while accurate
     /// seeks run, `badframe_done/total` for the button label, `badframe_abort`
     /// for Stop-between-frames (mid-seek ffmpeg is bounded by
     /// `BADFRAME_TIMEOUT`, so no child kill needed).
-    badframe_tx: Sender<BadframeMsg>,
-    badframe_rx: Receiver<BadframeMsg>,
-    badframes_busy: bool,
-    badframe_done: usize,
-    badframe_total: usize,
-    badframe_abort: Arc<AtomicBool>,
+    pub(crate) badframe_tx: Sender<BadframeMsg>,
+    pub(crate) badframe_rx: Receiver<BadframeMsg>,
+    pub(crate) badframes_busy: bool,
+    pub(crate) badframe_done: usize,
+    pub(crate) badframe_total: usize,
+    pub(crate) badframe_abort: Arc<AtomicBool>,
     /// Pending bad-frames summary, toasted at the next UI frame like
     /// `csv_report` above. `(files_written, error_strings)`.
-    badframe_report: Option<(usize, Vec<String>)>,
+    pub(crate) badframe_report: Option<(usize, Vec<String>)>,
     /// Bad-frames viewer window (own OS viewport like the plot window).
     /// Frames live as tmp PNGs (`badframe_tmp`); only the visible dist/ref
     /// pair is uploaded as textures, keyed by `badframe_tex_key`.
-    show_badframes: bool,
-    badframe_tab: MetricKind,
+    pub(crate) show_badframes: bool,
+    pub(crate) badframe_tab: MetricKind,
     /// Selected queue-row key for the viewer (None = auto-pick first).
-    badframe_file: Option<String>,
+    pub(crate) badframe_file: Option<String>,
     /// Position in the worst-N list for `(file, tab)`.
-    badframe_frame_pos: usize,
+    pub(crate) badframe_frame_pos: usize,
     /// One-frame view reset for the viewer plots (Reset view button /
     /// selection change): applies `Plot::reset()`, which also clears the
     /// shared link-group bounds a fresh plot id alone would keep.
-    badframe_reset_once: bool,
+    pub(crate) badframe_reset_once: bool,
     /// Last selection the viewer plots were fit for; a change arms
     /// `badframe_reset_once` so every tab/file/frame lands fit.
-    badframe_view_key: Option<(MetricKind, String, usize)>,
+    pub(crate) badframe_view_key: Option<(MetricKind, String, usize)>,
     /// Overlay compare mode: false = side-by-side plots (default),
     /// true = single wipe view with a draggable divider.
-    badframe_slider: bool,
+    pub(crate) badframe_slider: bool,
     /// Wipe divider fraction (0..1, ref on the left). Drag-only.
-    badframe_split: f32,
+    pub(crate) badframe_split: f32,
     /// Last-frame divider screen x for pre-show pan suppression
     /// (NaN until the wipe plot paints once).
-    badframe_div_sx: f32,
+    pub(crate) badframe_div_sx: f32,
     /// Divider drag in progress: keeps plot pan off while held.
-    badframe_div_drag: bool,
-    badframe_tex_dist: Option<egui::TextureHandle>,
-    badframe_tex_ref: Option<egui::TextureHandle>,
-    badframe_tex_key: Option<(String, MetricKind, usize)>,
+    pub(crate) badframe_div_drag: bool,
+    pub(crate) badframe_tex_dist: Option<egui::TextureHandle>,
+    pub(crate) badframe_tex_ref: Option<egui::TextureHandle>,
+    pub(crate) badframe_tex_key: Option<(String, MetricKind, usize)>,
     /// Tmp dir holding this run's viewer PNGs (per-process).
-    badframe_tmp: std::path::PathBuf,
+    pub(crate) badframe_tmp: std::path::PathBuf,
     /// Close requested while a bad-frames worker runs: tmp deletion waits
     /// for its `Finished` drain (the worker reads/writes tmp until then).
     /// Session-only, never persisted.
-    badframe_tmp_cleanup_pending: bool,
+    pub(crate) badframe_tmp_cleanup_pending: bool,
     /// All tmp PNGs from the last Extract run.
-    badframe_files: Vec<std::path::PathBuf>,
+    pub(crate) badframe_files: Vec<std::path::PathBuf>,
     /// In-flight export summary (copies done, worker PNGs pending).
     /// Session-only, never persisted.
-    badframe_export_pending: Option<BadframeExportPending>,
+    pub(crate) badframe_export_pending: Option<BadframeExportPending>,
 }
 
 impl Default for RFMetricsApp {
@@ -901,676 +472,8 @@ impl Default for RFMetricsApp {
 }
 
 impl RFMetricsApp {
-    /// Apply any probe results that arrived since the last frame. Stale
-    /// reference results (typed-through while a worker was running) are
-    /// dropped via the generation check.
-    /// Drains the probe channel; returns whether any message arrived (even
-    /// a stale one — callers use it to decide on a repaint, and one extra
-    /// frame on a rare stale message is harmless).
-    fn drain_probe_results(&mut self) -> bool {
-        let mut activity = false;
-        while let Ok(msg) = self.probe_rx.try_recv() {
-            activity = true;
-            match msg {
-                ProbeMsg::Reference {
-                    generation,
-                    text,
-                    info,
-                    timed_out,
-                } => {
-                    if generation == self.ref_generation {
-                        self.ref_info = text;
-                        self.ref_info_data = info;
-                        // No newer spawn happened since (same generation),
-                        // so `last_spawned_ref` is the path this probed.
-                        self.ref_info_path = self.last_spawned_ref.clone();
-                        if timed_out {
-                            self.probe_timeout_note =
-                                Some(Self::timeout_display(&self.last_spawned_ref));
-                        }
-                    } else {
-                        log::debug!(target: "rfmetrics::app", "discarded stale ref probe (gen {generation})");
-                    }
-                }
-                ProbeMsg::RowMedia {
-                    key,
-                    probe_gen,
-                    media,
-                    tip,
-                    info,
-                    timed_out,
-                } => {
-                    if let Some(row) = self.rows.iter_mut().find(|r| r.key == key) {
-                        // Remove/re-add orphans carry the old token: only the
-                        // row this probe spawned for may consume it.
-                        if row.probe_gen == probe_gen {
-                            row.media = media;
-                            row.media_tip = tip;
-                            row.info = info;
-                            if timed_out {
-                                self.probe_timeout_note = Some(row.display.clone());
-                            }
-                        } else {
-                            log::debug!(target: "rfmetrics::app", "discarded stale row probe for {key}");
-                        }
-                    }
-                }
-            }
-        }
-        activity
-    }
-
-    /// Startup binary probe drain: swaps the `Probing…` placeholders for
-    /// the real version results, then re-arms anything that resolved
-    /// while the binaries were unknown. Generations bump so stale
-    /// no-binary results ("ffprobe not found") drop instead of winning
-    /// the race against the re-probes.
-    fn drain_bin_results(&mut self) -> bool {
-        let Ok((ffmpeg, ffvship, ffprobe)) = self.bin_rx.try_recv() else {
-            return false;
-        };
-        // Only one tuple is ever sent; drop duplicates if any.
-        while self.bin_rx.try_recv().is_ok() {}
-        self.ffmpeg = ffmpeg;
-        self.ffvship = ffvship;
-        self.ffprobe = ffprobe;
-        self.bins_probing = false;
-        self.untick_unsupported_metrics();
-        // Reference + thumbnail re-probe through the normal path next frame.
-        self.ref_generation = self.ref_generation.wrapping_add(1);
-        self.last_spawned_ref.clear();
-        self.thumb_generation = self.thumb_generation.wrapping_add(1);
-        self.last_thumb_path.clear();
-        // Queue rows that settled (or are still settling) without a binary
-        // re-probe with fresh tokens; stale workers carry the old token.
-        let mut stale: Vec<(String, String, u64)> = Vec::new();
-        for row in &mut self.rows {
-            if row.info.is_none() {
-                let token = self.next_probe_seq;
-                self.next_probe_seq = self.next_probe_seq.wrapping_add(1);
-                row.probe_gen = token;
-                row.media = "Probing…".to_owned();
-                row.media_tip = "Probing…".to_owned();
-                stale.push((row.key.clone(), row.path.clone(), token));
-            }
-        }
-        if !stale.is_empty() {
-            let tx = self.probe_tx.clone();
-            let exe = self.ffprobe.clone();
-            std::thread::spawn(move || {
-                for (key, s, probe_gen) in stale {
-                    let (media, tip, info, timed_out) =
-                        crate::probe::probe_table_text(&s, exe.as_deref());
-                    let _ = tx.send(ProbeMsg::RowMedia {
-                        key,
-                        probe_gen,
-                        media,
-                        tip,
-                        info,
-                        timed_out,
-                    });
-                }
-            });
-        }
-        true
-    }
-
-    /// Re-probe only when the path actually changed, and only off the UI
-    /// thread: cheap cases (empty/missing/no ffprobe) resolve inline, an
-    /// existing file spawns a worker and shows "Probing…" meanwhile.
-    /// Returns the probe drain flag (spawns stem from input frames, which
-    /// repaint on their own).
-    fn refresh_ref_info(&mut self) -> bool {
-        let activity = self.drain_probe_results();
-        if self.ref_path == self.last_spawned_ref {
-            return activity;
-        }
-        self.last_spawned_ref = self.ref_path.clone();
-        self.ref_generation = self.ref_generation.wrapping_add(1);
-        if self.ref_path.trim().is_empty() {
-            self.ref_info =
-                "Encoder: -unknown-, Frame: -unknown-, Bitrate: -unknown-, Duration: -unknown-"
-                    .to_owned();
-            self.ref_info_data = None;
-            return activity;
-        }
-        if !Path::new(&self.ref_path).is_file() {
-            self.ref_info = "File not found".to_owned();
-            self.ref_info_data = None;
-            return activity;
-        }
-        if self.ffprobe.is_none() {
-            self.ref_info = "ffprobe not found".to_owned();
-            self.ref_info_data = None;
-            return activity;
-        }
-        self.ref_info = "Probing…".to_owned();
-        let tx = self.probe_tx.clone();
-        let generation = self.ref_generation;
-        let path = self.ref_path.clone();
-        let exe = self.ffprobe.clone();
-        std::thread::spawn(move || {
-            let (text, info, timed_out) = crate::probe::reference_media_text(&path, exe.as_deref());
-            let _ = tx.send(ProbeMsg::Reference {
-                generation,
-                text,
-                info,
-                timed_out,
-            });
-        });
-        activity
-    }
-
-    /// Apply arrived thumbnails; stale generations (typed-through) are dropped.
-    /// Returns whether any message arrived (see `drain_probe_results`).
-    fn drain_thumbs(&mut self, ctx: &egui::Context) -> bool {
-        let mut activity = false;
-        while let Ok(msg) = self.thumb_rx.try_recv() {
-            activity = true;
-            if msg.generation != self.thumb_generation {
-                log::debug!(target: "rfmetrics::app", "discarded stale thumbnail (gen {})", msg.generation);
-                continue;
-            }
-            self.thumb_loading = false;
-            match msg.image {
-                Some(img) => {
-                    self.thumb_tex =
-                        Some(ctx.load_texture("ref_thumb", img, egui::TextureOptions::LINEAR));
-                }
-                None => self.thumb_tex = None,
-            }
-        }
-        activity
-    }
-
-    /// Spawn a dedicated ffmpeg worker when the ref path changed. Cheap cases
-    /// clear inline; the worker sends duration-aware extracts back on the
-    /// thumb channel and repaints via the cloned ctx. Returns the thumb
-    /// drain flag (spawns stem from input frames, which repaint on their own).
-    fn refresh_thumbnail(&mut self, ctx: &egui::Context) -> bool {
-        let activity = self.drain_thumbs(ctx);
-        if self.ref_path == self.last_thumb_path {
-            return activity;
-        }
-        self.last_thumb_path = self.ref_path.clone();
-        self.thumb_generation = self.thumb_generation.wrapping_add(1);
-        self.thumb_tex = None;
-        if self.ref_path.trim().is_empty() || !Path::new(&self.ref_path).is_file() {
-            self.thumb_loading = false;
-            return activity;
-        }
-        let Some(ffmpeg_exe) = self.ffmpeg.path.clone() else {
-            self.thumb_loading = false;
-            return activity;
-        };
-        self.thumb_loading = true;
-        let tx = self.thumb_tx.clone();
-        let generation = self.thumb_generation;
-        let path = self.ref_path.clone();
-        let ffprobe_exe = self.ffprobe.clone();
-        // Prefer the completed reference probe's duration (same path only);
-        // the worker probes itself when the ref probe hasn't landed yet.
-        let duration = thumb_duration(
-            &self.ref_path,
-            &self.ref_info_path,
-            self.ref_info_data.as_ref().and_then(|i| i.duration),
-        );
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let duration =
-                duration.or_else(|| crate::probe::media_duration(&path, ffprobe_exe.as_deref()));
-            let image = crate::preview::extract_thumbnail(&ffmpeg_exe, &path, duration);
-            let _ = tx.send(ThumbMsg { generation, image });
-            ctx.request_repaint();
-        });
-        activity
-    }
-
-    /// Short display names for all rows (Python `_refresh_names`).
-    fn refresh_queue_names(&mut self) {
-        let paths: Vec<String> = self.rows.iter().map(|r| r.path.clone()).collect();
-        for (row, name) in self.rows.iter_mut().zip(display_names(&paths)) {
-            row.display = name;
-        }
-        // Row indices may have shifted; drop stale hover state.
-        self.hover_row = None;
-        self.hover_since = None;
-        self.include_anchor = None;
-        self.selected_anchor = None;
-    }
-
-    /// Re-probe everything (Options "Refresh Files Media Info"): the
-    /// reference text + thumbnail and every queue row's media text + raw
-    /// info. Same worker channels as the initial probes, so the window
-    /// never blocks; results (not reruns of finished metrics) update.
-    fn refresh_media_info(&mut self) {
-        // Forget the last-spawned markers: the per-frame refreshers see a
-        // mismatch and re-probe through the normal path (cheap inline
-        // cases resolve without a worker, as before).
-        self.last_spawned_ref.clear();
-        self.last_thumb_path.clear();
-        if self.rows.is_empty() {
-            return;
-        }
-        for row in &mut self.rows {
-            row.media = "Probing…".to_owned();
-            row.media_tip = "Probing…".to_owned();
-        }
-        let tx = self.probe_tx.clone();
-        let exe = self.ffprobe.clone();
-        let paths: Vec<(String, String, u64)> = self
-            .rows
-            .iter()
-            .map(|r| (r.key.clone(), r.path.clone(), r.probe_gen))
-            .collect();
-        std::thread::spawn(move || {
-            for (key, s, probe_gen) in paths {
-                let (media, tip, info, timed_out) =
-                    crate::probe::probe_table_text(&s, exe.as_deref());
-                let _ = tx.send(ProbeMsg::RowMedia {
-                    key,
-                    probe_gen,
-                    media,
-                    tip,
-                    info,
-                    timed_out,
-                });
-            }
-        });
-    }
-
-    /// Queue picked files, silently skipping ones already present.
-    /// Media probing runs on a worker thread; rows show "Probing…"
-    /// until their results arrive, so drops never freeze the window.
-    fn add_queue_files(&mut self, paths: Vec<std::path::PathBuf>) {
-        let mut seen: HashSet<String> = self.rows.iter().map(|r| r.key.clone()).collect();
-        let mut fresh: Vec<(String, String, u64)> = Vec::new();
-        for p in paths {
-            let s = p.to_string_lossy().into_owned();
-            let key = norm_key(&s);
-            if !seen.insert(key.clone()) {
-                continue; // guard rail: same file already queued
-            }
-            let color_idx = self.next_color_idx;
-            self.next_color_idx += 1;
-            let probe_gen = self.next_probe_seq;
-            self.next_probe_seq = self.next_probe_seq.wrapping_add(1);
-            self.rows.push(QueueRow {
-                path: s.clone(),
-                key: key.clone(),
-                display: String::new(),
-                include: true,
-                color_idx,
-                probe_gen,
-                selected: false,
-                media: "Probing…".to_owned(),
-                media_tip: "Probing…".to_owned(),
-                info: None,
-                psnr: crate::metrics::MetricCell::Idle,
-                ssim: crate::metrics::MetricCell::Idle,
-                vmaf: crate::metrics::MetricCell::Idle,
-                xpsnr: crate::metrics::MetricCell::Idle,
-                ssim2: crate::metrics::MetricCell::Idle,
-                butter: crate::metrics::MetricCell::Idle,
-                cvvdp: crate::metrics::MetricCell::Idle,
-                psnr_cache: CachedStats::default(),
-                ssim_cache: CachedStats::default(),
-                vmaf_cache: CachedStats::default(),
-                xpsnr_cache: CachedStats::default(),
-                ssim2_cache: CachedStats::default(),
-                butter_cache: CachedStats::default(),
-                cvvdp_cache: CachedStats::default(),
-            });
-            fresh.push((key, s, probe_gen));
-        }
-        self.refresh_queue_names();
-        if fresh.is_empty() {
-            return;
-        }
-        let tx = self.probe_tx.clone();
-        let exe = self.ffprobe.clone();
-        std::thread::spawn(move || {
-            for (key, s, probe_gen) in fresh {
-                let (media, tip, info, timed_out) =
-                    crate::probe::probe_table_text(&s, exe.as_deref());
-                let _ = tx.send(ProbeMsg::RowMedia {
-                    key,
-                    probe_gen,
-                    media,
-                    tip,
-                    info,
-                    timed_out,
-                });
-            }
-        });
-    }
-
-    /// Apply metric worker results; stale generations (post-Reset) drop.
-    /// Progress keeps the max frame per row (dual stdout/stderr feeds).
-    /// Returns whether any message arrived (see `drain_probe_results`).
-    fn drain_metric_results(&mut self) -> bool {
-        let mut scored_changed = false;
-        let mut activity = false;
-        while let Ok(msg) = self.metric_rx.try_recv() {
-            activity = true;
-            match msg {
-                MetricMsg::Progress {
-                    generation,
-                    kind,
-                    key,
-                    frame,
-                } => {
-                    if generation != self.run_generation {
-                        continue;
-                    }
-                    // The job emitting progress is the live one: the plot
-                    // tab follows it while measuring, and only its cell
-                    // animates the sweep (the rest wait statically).
-                    self.live_kind = Some(kind);
-                    self.live_key = Some(key.clone());
-                    if let Some(row) = self.rows.iter_mut().find(|r| r.key == key)
-                        && let crate::metrics::MetricCell::Running { frame: cur, .. } =
-                            row.cell_mut(kind)
-                        && frame > *cur
-                    {
-                        *cur = frame;
-                    }
-                }
-                MetricMsg::Series {
-                    generation,
-                    kind,
-                    key,
-                    new_values,
-                } => {
-                    if generation != self.run_generation || new_values.is_empty() {
-                        continue;
-                    }
-                    self.live_kind = Some(kind);
-                    self.live_key = Some(key.clone());
-                    if let Some(row) = self.rows.iter_mut().find(|r| r.key == key)
-                        && let crate::metrics::MetricCell::Running { values, .. } =
-                            row.cell_mut(kind)
-                    {
-                        // Live curve feeds straight from `values` (plot
-                        // decimates at draw time, x = 1-based frame).
-                        values.extend_from_slice(&new_values);
-                    }
-                }
-                MetricMsg::Done {
-                    generation,
-                    kind,
-                    key,
-                    values,
-                    avg,
-                    exec_s,
-                    error,
-                    skip,
-                    clip_dur,
-                    vmaf_cfg,
-                    scaler,
-                    fps_mode,
-                    ref_pixfmt,
-                } => {
-                    if generation != self.run_generation {
-                        log::debug!(target: "rfmetrics::app", "discarded stale {} result", kind.name());
-                        continue;
-                    }
-                    // The finished job stops being live; the next job
-                    // takes over on its first Progress/Series (until
-                    // then no cell sweeps — the gap shows static text).
-                    // `live_kind` stays for plot tab-follow.
-                    if self.live_kind == Some(kind)
-                        && self.live_key.as_deref() == Some(key.as_str())
-                    {
-                        self.live_key = None;
-                    }
-                    self.pending = self.pending.saturating_sub(1);
-                    // First real data for a no-live-feed tab (VMAF): it sat
-                    // on the empty default all run, so owe one auto-follow
-                    // poke and Done snaps into view. Live-feed metrics
-                    // follow mid-run already — refitting those here would
-                    // yank a zoom the user is examining. Only when the plot
-                    // window is open on this tab and no sibling row shows
-                    // data yet (later rows must not disturb the first fit).
-                    if !kind.streams_live_values()
-                        && self.show_plot
-                        && kind == self.plot_tab
-                        && error.is_none()
-                        && !values.is_empty()
-                        && !self.rows.iter().any(|r| {
-                            r.key != key
-                                && matches!(
-                                    r.cell(kind),
-                                    crate::metrics::MetricCell::Done { values, .. }
-                                    if !values.is_empty()
-                                )
-                        })
-                    {
-                        self.plot_follow_pending = true;
-                    }
-                    if let Some(row) = self.rows.iter_mut().find(|r| r.key == key) {
-                        *row.cell_mut(kind) = match error {
-                            // Killed by Stop: settle quietly like unstarted
-                            // rows (H4); `Finished{aborted}` below handles
-                            // the still-Running ones.
-                            Some(msg) if msg == "aborted" => crate::metrics::MetricCell::Idle,
-                            Some(msg) => crate::metrics::MetricCell::Error { msg },
-                            None => crate::metrics::MetricCell::Done {
-                                avg: avg.unwrap_or_else(|| crate::metrics::mean(&values)),
-                                values,
-                                exec_s,
-                                skip,
-                                clip_dur,
-                                vmaf_cfg,
-                                scaler,
-                                fps_mode,
-                                ref_pixfmt,
-                            },
-                        };
-                        // Cache the stats once (clone+sort lives here, not
-                        // per frame); ranks refresh below for this metric.
-                        let stats = row.cell(kind).done_stats();
-                        // Rendered text frozen once per result (the table loop
-                        // borrows it instead of formatting per frame).
-                        let text = row.cell(kind).cell_text_prec(self.cell_precision as usize);
-                        row.cached_mut(kind).stats = stats;
-                        row.cached_mut(kind).text = text;
-                        row.cached_mut(kind).finished =
-                            matches!(row.cell(kind), crate::metrics::MetricCell::Done { .. })
-                                .then(wall_now_string);
-                        scored_changed = true;
-                    }
-                    // `Finished` alone clears `measuring` below: the worker
-                    // sends it (then `CsvReport`) after the last `Done`, so
-                    // clearing here would reopen Start a frame early and
-                    // orphan those terminal messages as stale.
-                }
-                MetricMsg::Finished {
-                    generation,
-                    aborted,
-                } => {
-                    if generation != self.run_generation {
-                        continue;
-                    }
-                    // Aborted runs: unstarted/killed rows were left Running;
-                    // settle them to Idle. Finished (`Done`) cells are kept.
-                    if aborted {
-                        for row in &mut self.rows {
-                            for kind in MetricKind::ALL {
-                                let cell = row.cell_mut(kind);
-                                if matches!(cell, crate::metrics::MetricCell::Running { .. }) {
-                                    *cell = crate::metrics::MetricCell::Idle;
-                                }
-                            }
-                        }
-                    }
-                    // Results auto-save (option): exported with a timestamp
-                    // at the next UI frame, stopped runs included — their
-                    // finished cells still count.
-                    if self.results_autosave {
-                        self.results_autosave_pending = true;
-                    }
-                    self.pending = 0;
-                    self.measuring = false;
-                    self.live_key = None;
-                }
-                MetricMsg::CsvReport {
-                    generation,
-                    ok,
-                    errors,
-                } => {
-                    if generation != self.run_generation {
-                        continue;
-                    }
-                    // Toasted with a timestamp at the next UI frame below;
-                    // all-quiet reports (aborted run, nothing written) stay silent.
-                    if ok > 0 || !errors.is_empty() {
-                        self.csv_report = Some((ok, errors));
-                    }
-                }
-            }
-        }
-        // Ranks depend on the whole scored set, so refresh after applying
-        // the batch — not per message, and never per frame. The scan itself
-        // is trivial (min/max over 10 scalars per scored row, no sorting).
-        if scored_changed {
-            for kind in MetricKind::ALL {
-                self.refresh_ranks(kind);
-            }
-        }
-        activity
-    }
-
-    /// Recompute cross-row ranks for one metric from the cached stats.
-    /// Call whenever the scored set changes: `Done` landing, a rerun
-    /// marking cells `Running`, Reset, or row removal.
-    fn refresh_ranks(&mut self, kind: MetricKind) {
-        let mut stat_lo = [f64::INFINITY; 10];
-        let mut stat_hi = [f64::NEG_INFINITY; 10];
-        let mut scored = 0usize;
-        for row in &self.rows {
-            if let Some(s) = &row.cached(kind).stats {
-                scored += 1;
-                for (k, (_, v, _)) in s.comparable().iter().enumerate() {
-                    stat_lo[k] = stat_lo[k].min(*v);
-                    stat_hi[k] = stat_hi[k].max(*v);
-                }
-            }
-        }
-        for row in &mut self.rows {
-            let cached = row.cached_mut(kind);
-            let mut ranks = [crate::metrics::StatRank::Plain; 10];
-            if scored >= 2
-                && let Some(s) = &cached.stats
-            {
-                let comp = s.comparable();
-                for k in 0..10 {
-                    let (_, v, lower_better) = comp[k];
-                    // BUTTERAUGLI is lower-is-better on every stat (Python
-                    // "lower is better, min 0"); StdDev already is.
-                    ranks[k] = if lower_better || kind == MetricKind::But {
-                        crate::metrics::rank_low(v, stat_lo[k], stat_hi[k])
-                    } else {
-                        crate::metrics::rank(v, stat_lo[k], stat_hi[k])
-                    };
-                }
-            }
-            cached.ranks = ranks;
-        }
-    }
-
-    /// Apply plot export thread results; clears the Saving…/Copying…
-    /// lock so the buttons re-arm. Copy pixels land here because
-    /// `ctx.copy_image()` must run on the UI thread. Runs on the main
-    /// viewport each frame. Returns whether any message arrived.
-    fn drain_png_results(&mut self, ctx: &egui::Context, now: f64) -> bool {
-        let mut activity = false;
-        while let Ok(msg) = self.png_rx.try_recv() {
-            activity = true;
-            self.png_saving = false;
-            match msg {
-                PngSaveMsg::Saved { path } => {
-                    self.toast(
-                        now,
-                        format!("Plot saved to {}", path.display()),
-                        ToastKind::Info,
-                    );
-                }
-                PngSaveMsg::CopyReady { w, h, rgba } => {
-                    ctx.copy_image(egui::ColorImage::from_rgba_unmultiplied(
-                        [w as usize, h as usize],
-                        &rgba,
-                    ));
-                    self.toast(now, "Plot copied to clipboard".to_owned(), ToastKind::Info);
-                }
-                PngSaveMsg::SaveFailed { err } => {
-                    self.toast(now, format!("Could not save plot: {err}"), ToastKind::Error);
-                }
-                PngSaveMsg::CopyFailed { err } => {
-                    self.toast(now, format!("Could not copy plot: {err}"), ToastKind::Error);
-                }
-            }
-        }
-        activity
-    }
-
-    fn toast(&mut self, now: f64, text: String, kind: ToastKind) {
-        match kind {
-            ToastKind::Info => log::info!(target: "rfmetrics::app", "toast info: {text}"),
-            ToastKind::Warning => log::warn!(target: "rfmetrics::app", "toast warning: {text}"),
-            ToastKind::Error => log::error!(target: "rfmetrics::app", "toast error: {text}"),
-        }
-        self.toast = Some(Toast {
-            text,
-            until: now + TOAST_SECS,
-            kind,
-        });
-    }
-
-    /// Short display name for timeout toasts: filename when available,
-    /// full path otherwise (never empty — falls back to a placeholder).
-    fn timeout_display(path: &str) -> String {
-        std::path::Path::new(path)
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "(unknown file)".to_owned())
-    }
-
-    /// Parse a trim box; empty means no trim. `None` = invalid ("bad time").
-    fn trim_opt(raw: &str) -> Option<Option<f64>> {
-        if raw.trim().is_empty() {
-            Some(None)
-        } else {
-            crate::metrics::parse_time_spec(raw).map(Some)
-        }
-    }
-
-    /// Validated VMAF settings snapshot (Python `vmaf_cfg`): subsample
-    /// parses to u32 with max(1, …), pooling maps the UI strings to the
-    /// enum. Single source for `start_run` and the stale-cell badge so
-    /// the two can never disagree on what "current settings" means.
-    fn current_vmaf_cfg(&self) -> crate::metrics::vmaf::VmafCfg {
-        crate::metrics::vmaf::VmafCfg {
-            model: self.vmaf_model.clone(),
-            phone: self.vmaf_phone,
-            scale: self.vmaf_scale,
-            pooling: if self.vmaf_pooling == "Harmonic Mean" {
-                crate::metrics::vmaf::Pooling::HarmonicMean
-            } else {
-                crate::metrics::vmaf::Pooling::Mean
-            },
-            subsample: self.vmaf_subsample.parse::<u32>().unwrap_or(1).max(1),
-            // "auto" (or garbage) follows the system CPU, as before.
-            n_threads: match self.vmaf_threads.parse::<u32>() {
-                Ok(n) => n.max(1),
-                Err(_) => crate::metrics::vmaf::system_threads(),
-            },
-        }
-    }
-
     /// Everything `ffmetrics-state.json` persists, read off the live UI.
-    fn snapshot(&self) -> crate::state::AppState {
+    pub(crate) fn snapshot(&self) -> crate::state::AppState {
         crate::state::AppState {
             ref_path: self.ref_path.clone(),
             skip: self.skip.clone(),
@@ -1626,7 +529,7 @@ impl RFMetricsApp {
     /// disabled, so restored ticks are cleared too. Session-only
     /// capability, never persisted.
     /// Idempotent: safe to run for both the no-file and restored paths.
-    fn untick_unsupported_metrics(&mut self) {
+    pub(crate) fn untick_unsupported_metrics(&mut self) {
         let supported = &self.ffmpeg.supported_metrics;
         if !supported.contains(&MetricKind::Psnr) {
             self.m_psnr = false;
@@ -1650,7 +553,7 @@ impl RFMetricsApp {
     /// Apply a loaded state file (tolerant per-key; absent keys keep live
     /// defaults, saved models must still be on disk, queue entries must
     /// still be files). Restored rows probe through the normal path.
-    fn apply_state(&mut self, loaded: Option<crate::state::AppState>) {
+    pub(crate) fn apply_state(&mut self, loaded: Option<crate::state::AppState>) {
         // Defaults (VMAF-on) obey capability even with no state file.
         self.untick_unsupported_metrics();
         let Some(s) = loaded else {
@@ -1785,7 +688,7 @@ impl RFMetricsApp {
     /// without building `AppState`. Covers every field `snapshot()` sets;
     /// a new persisted field must be added here too, or edits to it will
     /// silently stop saving.
-    fn is_state_dirty(&self) -> bool {
+    pub(crate) fn is_state_dirty(&self) -> bool {
         let s = &self.saved_snapshot;
         if self.ref_path != s.ref_path || self.skip != s.skip || self.duration != s.duration {
             return true;
@@ -1852,7 +755,7 @@ impl RFMetricsApp {
     /// Debounced state write (1s after the last detected change): compare
     /// the live snapshot against the last write, arm/re-arm a single
     /// wake-up while dirty, save once it settles.
-    fn autosave_tick(&mut self, ctx: &egui::Context, now: f64) {
+    pub(crate) fn autosave_tick(&mut self, ctx: &egui::Context, now: f64) {
         use crate::state::SAVE_DEBOUNCE_SECS;
         if !self.is_state_dirty() {
             self.pending_save_since = None;
@@ -1908,411 +811,11 @@ impl RFMetricsApp {
         }
     }
 
-    /// Start a run over included rows on one worker thread: each checked
-    /// metric runs sequentially in Python `METRICS` order (Python
-    /// `start`/`_worker` parity). Pre-flight failures land in the cells
-    /// as errors, mirroring Python's `"bad time"` / `"probe failed"` text.
-    fn start_run(&mut self, now: f64) {
-        if self.measuring {
-            return;
-        }
-        if self.bins_probing {
-            self.toast(
-                now,
-                "Binaries still probing — try again in a moment".to_owned(),
-                ToastKind::Info,
-            );
-            return;
-        }
-        let kinds: Vec<MetricKind> = MetricKind::ALL
-            .into_iter()
-            .filter(|k| match k {
-                // Issue #7 backstop: restored/default ticks for missing
-                // filters are forced off at startup, but a ticked-yet-
-                // unsupported metric must never reach the worker either.
-                MetricKind::Psnr => self.m_psnr && self.ffmpeg.supported_metrics.contains(k),
-                MetricKind::Ssim => self.m_ssim && self.ffmpeg.supported_metrics.contains(k),
-                MetricKind::Vmaf => self.m_vmaf && self.ffmpeg.supported_metrics.contains(k),
-                MetricKind::Xpsnr => self.m_xpsnr && self.ffmpeg.supported_metrics.contains(k),
-                MetricKind::Ssim2 => self.m_ssim2,
-                MetricKind::But => self.m_but,
-                MetricKind::Cvvdp => self.m_cvvdp,
-            })
-            .collect();
-        if kinds.is_empty() {
-            self.toast(
-                now,
-                "Tick a metric in the table header to run it".to_owned(),
-                ToastKind::Info,
-            );
-            return;
-        }
-        let targets: Vec<usize> = self
-            .rows
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.include)
-            .map(|(i, _)| i)
-            .collect();
-        if targets.is_empty() {
-            self.toast(
-                now,
-                "Nothing to run — tick the checkbox in the first column".to_owned(),
-                ToastKind::Info,
-            );
-            return;
-        }
-        if self.ref_path.trim().is_empty() || !Path::new(&self.ref_path).is_file() {
-            for &i in &targets {
-                for &kind in &kinds {
-                    *self.rows[i].cell_mut(kind) = crate::metrics::MetricCell::Error {
-                        msg: "no ref".to_owned(),
-                    };
-                    self.rows[i].clear_cached(kind);
-                }
-            }
-            for &kind in &kinds {
-                self.refresh_ranks(kind);
-            }
-            self.toast(
-                now,
-                "Set a reference file first".to_owned(),
-                ToastKind::Error,
-            );
-            return;
-        }
-        let (Some(skip), Some(clip_dur)) = (
-            Self::trim_opt(&self.skip.clone()),
-            Self::trim_opt(&self.duration.clone()),
-        ) else {
-            for &i in &targets {
-                for &kind in &kinds {
-                    *self.rows[i].cell_mut(kind) = crate::metrics::MetricCell::Error {
-                        msg: "bad time".to_owned(),
-                    };
-                    self.rows[i].clear_cached(kind);
-                }
-            }
-            for &kind in &kinds {
-                self.refresh_ranks(kind);
-            }
-            self.toast(
-                now,
-                "Skip/Duration is not a valid time".to_owned(),
-                ToastKind::Error,
-            );
-            return;
-        };
-        // Validated VMAF snapshot: snapshotted before the partition so
-        // VMAF `Done` stamps compare against the settings this run uses.
-        let vmaf_cfg = self.current_vmaf_cfg();
-        // Per metric: rows already holding a valid value sit the rerun out —
-        // but only when the trim settings still match: a value computed
-        // under a different skip/clip is stale and must recompute. VMAF
-        // additionally compares its options stamp, so an options change
-        // recomputes just the VMAF column while other metrics keep skipping.
-        // Every ffmpeg-backed column also compares the scaling stamp, so a
-        // method change recomputes them (FFVship has no scale stage).
-        // Pre-flight error cells above touch `targets` (settings
-        // uncomparable there); everything below touches `fresh` only.
-        let scaler = self.scale_method;
-        let fps_mode = self.fps_mode;
-        let ref_pixfmt = self.ref_pixfmt;
-        let mut work: Vec<(MetricKind, Vec<usize>, Vec<String>)> = Vec::new();
-        for &kind in &kinds {
-            let mut skipped = Vec::new();
-            let mut fresh = Vec::new();
-            for &i in &targets {
-                if !done_is_stale(
-                    kind,
-                    self.rows[i].cell(kind),
-                    skip,
-                    clip_dur,
-                    &vmaf_cfg,
-                    scaler,
-                    fps_mode,
-                    ref_pixfmt,
-                ) && matches!(
-                    self.rows[i].cell(kind),
-                    crate::metrics::MetricCell::Done { .. }
-                ) {
-                    skipped.push(self.rows[i].display.clone());
-                } else {
-                    fresh.push(i);
-                }
-            }
-            work.push((kind, fresh, skipped));
-        }
-        let fresh_total: usize = work.iter().map(|(_, f, _)| f.len()).sum();
-        if fresh_total == 0 {
-            // One combined toast: the slot holds a single message, so per-kind
-            // toasts would overwrite each other and only the last survive.
-            // Identical skip sets merge (`skip_groups`) so shared filenames
-            // print once instead of repeating per metric.
-            let msg = skip_groups(&work)
-                .iter()
-                .map(|(names, skipped)| {
-                    format!(
-                        "Skipped {} with existing {}",
-                        skipped.len(),
-                        names.join(", ")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            self.toast(now, format!("{msg} (Reset to recompute)"), ToastKind::Info);
-            return;
-        }
-        // Per-family binary gates (Python parity: per-row "ffmpeg not
-        // found" / "FFVship not found"). A wrong-GPU FFVship build has a
-        // path but no usable version, so it gates on `usable` as well.
-        // Families are independent: an FFVship-only run needs no ffmpeg.
-        let ffmpeg_exe = self.ffmpeg.path.clone();
-        let ffvship_exe = if self.ffvship.usable {
-            self.ffvship.path.clone()
-        } else {
-            None
-        };
-        let mut missing: Vec<&str> = Vec::new();
-        for (kind, fresh, _) in &work {
-            if fresh.is_empty() {
-                continue;
-            }
-            let (exe, label) = if kind.is_ffvship() {
-                (&ffvship_exe, "FFVship not found")
-            } else {
-                (&ffmpeg_exe, "ffmpeg not found")
-            };
-            if exe.is_none() {
-                for &i in fresh {
-                    *self.rows[i].cell_mut(*kind) = crate::metrics::MetricCell::Error {
-                        msg: label.to_owned(),
-                    };
-                    // Ranks refresh with the rest below, after `Running`
-                    // cells are marked (their caches clear there too).
-                    self.rows[i].clear_cached(*kind);
-                }
-                if !missing.contains(&label) {
-                    missing.push(label);
-                }
-            }
-        }
-        if !missing.is_empty() {
-            self.toast(now, missing.join(" + "), ToastKind::Error);
-            // Downstream early-returns (probing ref, empty jobs) skip the
-            // post-marking refresh, so settle ranks here.
-            for (kind, _, _) in &work {
-                self.refresh_ranks(*kind);
-            }
-        }
-        let Some(ref_info) = self.ref_info_data.clone() else {
-            self.toast(
-                now,
-                "Reference is still probing — try again in a moment".to_owned(),
-                ToastKind::Info,
-            );
-            return;
-        };
-        // Rows whose probe hasn't landed yet sit this run out (cells stay
-        // as-is); running the ready ones beats failing the whole batch.
-        // NOTE: `fresh`, not `targets` — Done rows were partitioned out
-        // above and must never be marked Running here.
-        let mut jobs = Vec::new();
-        for (kind, fresh, _) in &work {
-            // Kinds whose binary is missing were errored above; they
-            // contribute no jobs but must not block the runnable ones.
-            let Some(exe) = (if kind.is_ffvship() {
-                &ffvship_exe
-            } else {
-                &ffmpeg_exe
-            })
-            .clone() else {
-                continue;
-            };
-            for &i in fresh {
-                if let Some(info) = self.rows[i].info.clone() {
-                    jobs.push((
-                        *kind,
-                        self.rows[i].key.clone(),
-                        self.rows[i].path.clone(),
-                        info,
-                        exe.clone(),
-                    ));
-                    *self.rows[i].cell_mut(*kind) = crate::metrics::MetricCell::Running {
-                        frame: 0,
-                        values: Vec::new(),
-                    };
-                    // Leaving the scored set: drop the cached stats now so
-                    // the refresh below can't rank a stale value.
-                    self.rows[i].cached_mut(*kind).stats = None;
-                    self.rows[i].cached_mut(*kind).text.clear();
-                    self.rows[i].cached_mut(*kind).finished = None;
-                }
-            }
-        }
-        for &kind in &kinds {
-            self.refresh_ranks(kind);
-        }
-        if jobs.is_empty() {
-            // An exe-gated family already toasted above; only complain
-            // about probing when binaries were fine.
-            if missing.is_empty() {
-                self.toast(
-                    now,
-                    "Files are still probing — try again in a moment".to_owned(),
-                    ToastKind::Info,
-                );
-            }
-            return;
-        }
-        self.run_generation = self.run_generation.wrapping_add(1);
-        self.pending = jobs.len();
-        self.measuring = true;
-        // Fresh run: tab-follow restarts from the first live job.
-        self.live_kind = None;
-        self.live_key = None;
-        if self.plot_at_start {
-            self.show_plot = true;
-        }
-        // Fresh Arcs per run: a zombie from Reset keeps the old Arc
-        // (still aborted) instead of observing a shared store(false).
-        self.abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.current_child = Arc::new(Mutex::new(None));
-        let tx = self.metric_tx.clone();
-        let generation = self.run_generation;
-        let ref_path = self.ref_path.clone();
-        // CSV setting frozen for the run (mid-run toggles must not half-apply).
-        let csv_cfg = crate::metrics::csv::CsvCfg {
-            enabled: self.csv_export,
-            dir: self.csv_dir.clone(),
-        };
-        let abort = Arc::clone(&self.abort);
-        let child_slot = Arc::clone(&self.current_child);
-        std::thread::spawn(move || {
-            use std::sync::atomic::Ordering;
-            let mut csv_ok = 0usize;
-            let mut csv_errors: Vec<String> = Vec::new();
-            for (kind, key, dist_path, dist_info, exe) in jobs {
-                if abort.load(Ordering::SeqCst) {
-                    break;
-                }
-                let txp = tx.clone();
-                let keyp = key.clone();
-                let txs = tx.clone();
-                let keys = key.clone();
-                let job = crate::metrics::ffmpeg::RunInputs {
-                    kind,
-                    exe: &exe,
-                    ref_path: &ref_path,
-                    dist_path: &dist_path,
-                    ref_info: &ref_info,
-                    dist_info: &dist_info,
-                    skip,
-                    clip_dur,
-                    scaler,
-                    fps_mode,
-                    ref_pixfmt,
-                    abort: &abort,
-                    child_slot: &child_slot,
-                };
-                let progress = |f| {
-                    let _ = txp.send(MetricMsg::Progress {
-                        generation,
-                        kind,
-                        key: keyp.clone(),
-                        frame: f,
-                    });
-                };
-                // Live-curve batches stream regardless of the plot window:
-                // rendering is gated on visibility, but opening Plot
-                // mid-run must show history, so the buffer always grows.
-                let series = |vals: &[f64]| {
-                    let _ = txs.send(MetricMsg::Series {
-                        generation,
-                        kind,
-                        key: keys.clone(),
-                        new_values: vals.to_vec(),
-                    });
-                };
-                let out = if kind == MetricKind::Vmaf {
-                    crate::metrics::vmaf::run_vmaf(&job, &vmaf_cfg, &progress)
-                } else if let Some(fkind) = kind.ffvship_kind() {
-                    crate::metrics::ffvship::run_ffvship(&job, fkind, &progress, &series)
-                } else {
-                    crate::metrics::ffmpeg::run_metric(&job, &progress, &series)
-                };
-                // CSV export rides the worker (never the UI thread); the
-                // one-line summary lands before Finished.
-                if csv_cfg.enabled && out.error.is_none() && !out.values.is_empty() {
-                    match crate::metrics::csv::write_metric_csv(&csv_cfg, kind, &dist_path, &out) {
-                        Ok(path) => {
-                            csv_ok += 1;
-                            log::info!(target: "rfmetrics::csv", "wrote {}", path.display());
-                        }
-                        Err(e) => {
-                            log::warn!(target: "rfmetrics::csv", "export failed: {e}");
-                            csv_errors.push(e);
-                        }
-                    }
-                }
-                let _ = tx.send(MetricMsg::Done {
-                    generation,
-                    kind,
-                    key,
-                    values: out.values,
-                    avg: out.avg,
-                    exec_s: out.exec_s,
-                    error: out.error,
-                    skip,
-                    clip_dur,
-                    scaler,
-                    fps_mode,
-                    ref_pixfmt,
-                    vmaf_cfg: if kind == MetricKind::Vmaf {
-                        Some(vmaf_cfg.clone())
-                    } else {
-                        None
-                    },
-                });
-            }
-            let _ = tx.send(MetricMsg::Finished {
-                generation,
-                aborted: abort.load(Ordering::SeqCst),
-            });
-            if csv_cfg.enabled {
-                let _ = tx.send(MetricMsg::CsvReport {
-                    generation,
-                    ok: csv_ok,
-                    errors: csv_errors,
-                });
-            }
-        });
-        // One combined toast (see above), with identical skip sets merged so
-        // shared filenames print once instead of repeating per metric.
-        let parts: Vec<String> = skip_groups(&work)
-            .into_iter()
-            .map(|(names, skipped)| {
-                let mut list = skipped.join(", ");
-                if list.chars().count() > 80 {
-                    list = format!("{}…", list.chars().take(79).collect::<String>());
-                }
-                format!(
-                    "Skipped {} with existing {}: {list}",
-                    skipped.len(),
-                    names.join(", ")
-                )
-            })
-            .collect();
-        if !parts.is_empty() {
-            self.toast(now, parts.join("\n"), ToastKind::Info);
-        }
-    }
-
     /// Flush a run-end auto-save (armed by the Finished drain arm):
     /// resolves the configured path or the exe-dir default, exports via
     /// the manual path below, and disarms. Headless-testable: the UI
     /// frame only supplies `now`.
-    fn consume_autosave(&mut self, now: f64) {
+    pub(crate) fn consume_autosave(&mut self, now: f64) {
         if !self.results_autosave_pending {
             return;
         }
@@ -2329,7 +832,7 @@ impl RFMetricsApp {
     /// row per queued row in table order, appended to the chosen file
     /// (header only when new/empty). Unscored cells export as empty
     /// blocks; the caller gates on `!run_locked`.
-    fn save_results(&mut self, now: f64, path: std::path::PathBuf) {
+    pub(crate) fn save_results(&mut self, now: f64, path: std::path::PathBuf) {
         use crate::metrics::results::{Block, ORDER, ResultsRow};
         let stamp = wall_now_string();
         let app_version = env!("CARGO_PKG_VERSION");
@@ -2414,1795 +917,9 @@ impl RFMetricsApp {
             }
         }
     }
-
-    /// Signal the worker to stop and kill the in-flight ffmpeg, if any.
-    /// Shared with `reset_psnr` so Reset never leaves an orphaned run.
-    /// Never blocks the UI: the reap runs on a detached thread.
-    fn abort_worker(&self) {
-        use std::sync::atomic::Ordering;
-        self.abort.store(true, Ordering::SeqCst);
-        if let Ok(mut slot) = self.current_child.lock()
-            && let Some(mut child) = slot.take()
-        {
-            let _ = child.kill();
-            std::thread::spawn(move || {
-                match wait_timeout::ChildExt::wait_timeout(&mut child, crate::cmd::REAP_TIMEOUT) {
-                    Ok(Some(_)) => {}
-                    _ => {
-                        log::error!(target: "rfmetrics::app", "stop reap timed out after {:?} — child still alive", crate::cmd::REAP_TIMEOUT);
-                        let _ = child.wait();
-                    }
-                }
-            });
-        }
-    }
-
-    /// Stop button: abort all runners, keep finished results on screen.
-    /// Still-Running cells settle to Idle when the worker's `Finished`
-    /// lands in `drain_metric_results`.
-    fn stop_psnr(&mut self) {
-        if !self.measuring {
-            return;
-        }
-        self.abort_worker();
-        log::info!(target: "rfmetrics::app", "run aborted by user");
-    }
-
-    /// Clear all metric cells. Aborts a running worker first so Reset never
-    /// leaves an orphaned ffmpeg burning CPU in the background.
-    fn reset_psnr(&mut self) {
-        self.abort_worker();
-        self.run_generation = self.run_generation.wrapping_add(1);
-        self.pending = 0;
-        self.measuring = false;
-        self.live_kind = None;
-        self.live_key = None;
-        for row in &mut self.rows {
-            for kind in MetricKind::ALL {
-                *row.cell_mut(kind) = crate::metrics::MetricCell::Idle;
-                *row.cached_mut(kind) = CachedStats::default();
-            }
-        }
-        log::info!(target: "rfmetrics::app", "metric results cleared");
-    }
-
-    /// Clear one metric column (header Reset). No abort/generation bump:
-    /// the menu item is disabled while running, so nothing is in flight.
-    fn reset_metric(&mut self, kind: MetricKind) {
-        for row in &mut self.rows {
-            *row.cell_mut(kind) = crate::metrics::MetricCell::Idle;
-            *row.cached_mut(kind) = CachedStats::default();
-        }
-        self.refresh_ranks(kind);
-        if self.live_kind == Some(kind) {
-            self.live_kind = None;
-            self.live_key = None;
-        }
-        log::info!(target: "rfmetrics::app", "{} results cleared", kind.name());
-    }
-
-    /// Re-freeze every `Done` cell's Avg text at the current Precision.
-    /// Runs only on discrete Precision changes (Options combobox), so the
-    /// per-frame table loop keeps borrowing without formatting.
-    fn refreeze_cell_texts(&mut self) {
-        let prec = self.cell_precision as usize;
-        for row in &mut self.rows {
-            for kind in MetricKind::ALL {
-                if matches!(row.cell(kind), crate::metrics::MetricCell::Done { .. }) {
-                    row.cached_mut(kind).text = row.cell(kind).cell_text_prec(prec);
-                }
-            }
-        }
-    }
-
-    /// Snapshot of finished cells for the bad-frames worker (owned so
-    /// the thread never touches UI state). Current viewer tab only.
-    fn badframe_jobs_for(&self, kind: MetricKind) -> Option<BadframePlan> {
-        use crate::metrics::badframes;
-        let ffmpeg = self.ffmpeg.path.clone()?;
-        let ref_path = self.ref_path.clone();
-        if ref_path.trim().is_empty() || !std::path::Path::new(&ref_path).is_file() {
-            return None;
-        }
-        let skip = Self::trim_opt(&self.skip)?.unwrap_or(0.0);
-        let ref_fps = self
-            .ref_info_data
-            .as_ref()
-            .and_then(|m| m.fps)
-            .filter(|f| *f > 0.0);
-        let n: usize = self.badframes_count.parse().ok().filter(|n| *n >= 1)?;
-        let mut jobs: Vec<BadframeJob> = Vec::new();
-        for row in &self.rows {
-            if !row.include {
-                continue;
-            }
-            let dist_fps = row.info.as_ref().and_then(|m| m.fps).filter(|f| *f > 0.0);
-            let Some(fps) = ref_fps.or(dist_fps) else {
-                continue;
-            };
-            let (values, vmaf_cfg) = match row.cell(kind) {
-                crate::metrics::MetricCell::Done {
-                    values, vmaf_cfg, ..
-                } if !values.is_empty() => (values.clone(), vmaf_cfg.clone()),
-                _ => continue,
-            };
-            let picks = badframes::worst_n(&values, n, kind == MetricKind::But);
-            let stride = badframes::stride_for(kind, vmaf_cfg.as_ref());
-            for (idx, _) in picks {
-                let frame = idx.saturating_mul(stride);
-                jobs.push(BadframeJob {
-                    kind,
-                    dist_path: row.path.clone(),
-                    dist_fps: dist_fps.unwrap_or(fps),
-                    frame,
-                    offset: badframes::frame_offset(skip, frame, fps),
-                });
-            }
-        }
-        if jobs.is_empty() {
-            return None;
-        }
-        Some(BadframePlan {
-            ffmpeg,
-            ref_path,
-            ref_fps: ref_fps.unwrap_or_else(|| {
-                self.rows
-                    .iter()
-                    .filter_map(|r| r.info.as_ref().and_then(|m| m.fps))
-                    .next()
-                    .unwrap_or(30.0)
-            }),
-            tmp: self.badframe_tmp.clone(),
-            jobs,
-        })
-    }
-
-    /// Worst list for one viewer `(file key, tab)`: `(actual_frame, value,
-    /// offset)`, worst-first. Empty when the cell isn't Done or fps unknown.
-    fn badframe_picks(&self, kind: MetricKind, key: &str) -> Vec<(usize, f64, f64)> {
-        use crate::metrics::badframes;
-        let row = match self.rows.iter().find(|r| r.key == key) {
-            Some(r) => r,
-            None => return Vec::new(),
-        };
-        let skip = match Self::trim_opt(&self.skip) {
-            Some(v) => v.unwrap_or(0.0),
-            None => return Vec::new(),
-        };
-        let ref_fps = self
-            .ref_info_data
-            .as_ref()
-            .and_then(|m| m.fps)
-            .filter(|f| *f > 0.0);
-        let dist_fps = row.info.as_ref().and_then(|m| m.fps).filter(|f| *f > 0.0);
-        let Some(fps) = ref_fps.or(dist_fps) else {
-            return Vec::new();
-        };
-        let (values, vmaf_cfg) = match row.cell(kind) {
-            crate::metrics::MetricCell::Done {
-                values, vmaf_cfg, ..
-            } if !values.is_empty() => (values, vmaf_cfg),
-            _ => return Vec::new(),
-        };
-        let n: usize = self
-            .badframes_count
-            .parse()
-            .ok()
-            .filter(|n| *n >= 1)
-            .unwrap_or(5);
-        let stride = badframes::stride_for(kind, vmaf_cfg.as_ref());
-        badframes::worst_n(values, n, kind == MetricKind::But)
-            .into_iter()
-            .map(|(idx, v)| {
-                let frame = idx.saturating_mul(stride);
-                (frame, v, badframes::frame_offset(skip, frame, fps))
-            })
-            .collect()
-    }
-
-    /// Queue rows with a finished cell for the viewer tab (file picker).
-    fn badframe_files_for(&self, kind: MetricKind) -> Vec<(String, String)> {
-        self.rows
-            .iter()
-            .filter(|r| r.include)
-            .filter(|r| {
-                matches!(r.cell(kind), crate::metrics::MetricCell::Done { values, .. } if !values.is_empty())
-            })
-            .map(|r| (r.key.clone(), r.display.clone()))
-            .collect()
-    }
-
-    /// Spawn the bad-frames worker for the viewer tab: sequential accurate
-    /// seeks into the run tmp dir, dist + ref per frame. Abort stops between
-    /// frames (mid-seek ffmpeg is bounded by `BADFRAME_TIMEOUT`).
-    /// ponytail: abort between frames, not mid-seek; a Stop click waits out
-    /// at most one single-frame extract.
-    fn start_badframes(&mut self, now: f64) {
-        use std::sync::atomic::Ordering;
-        if self.measuring || self.badframes_busy {
-            return;
-        }
-        let kind = self.badframe_tab;
-        let Some(plan) = self.badframe_jobs_for(kind) else {
-            self.toast(
-                now,
-                "Nothing to export: run a metric first".to_owned(),
-                ToastKind::Info,
-            );
-            return;
-        };
-        let _ = std::fs::remove_dir_all(&plan.tmp);
-        if let Err(e) = std::fs::create_dir_all(&plan.tmp) {
-            self.toast(
-                now,
-                format!("Could not create tmp dir: {e}"),
-                ToastKind::Error,
-            );
-            return;
-        }
-        let total = plan.jobs.len() * 2;
-        self.badframes_busy = true;
-        self.badframe_done = 0;
-        self.badframe_total = total;
-        self.badframe_abort.store(false, Ordering::SeqCst);
-        let tx = self.badframe_tx.clone();
-        let abort = self.badframe_abort.clone();
-        std::thread::spawn(move || {
-            use crate::metrics::badframes;
-            let mut ok = 0usize;
-            let mut errors: Vec<String> = Vec::new();
-            let mut done = 0usize;
-            for job in &plan.jobs {
-                for (src, fps, dest) in [
-                    (
-                        job.dist_path.as_str(),
-                        job.dist_fps,
-                        badframes::tmp_dest_for(
-                            &plan.tmp,
-                            &job.dist_path,
-                            job.kind.name(),
-                            job.frame,
-                        ),
-                    ),
-                    (
-                        plan.ref_path.as_str(),
-                        plan.ref_fps,
-                        badframes::tmp_dest_ref_for(
-                            &plan.tmp,
-                            &job.dist_path,
-                            job.kind.name(),
-                            job.frame,
-                        ),
-                    ),
-                ] {
-                    if abort.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    if badframes::extract_one(&plan.ffmpeg, src, &dest, job.offset, fps) {
-                        ok += 1;
-                    } else {
-                        errors.push(format!("{} frame {}", job.kind.name(), job.frame));
-                    }
-                    done += 1;
-                    let _ = tx.send(BadframeMsg::Progress { done, total });
-                }
-                if abort.load(Ordering::SeqCst) {
-                    break;
-                }
-            }
-            let _ = tx.send(BadframeMsg::Finished { ok, errors });
-        });
-        log::info!(target: "rfmetrics::app", "bad-frames started: {} extracts", total);
-    }
-
-    /// Stop an in-flight bad-frames export (checked between seeks).
-    fn stop_badframes(&mut self) {
-        use std::sync::atomic::Ordering;
-        if !self.badframes_busy {
-            return;
-        }
-        self.badframe_abort.store(true, Ordering::SeqCst);
-        log::info!(target: "rfmetrics::app", "bad-frames aborted by user");
-    }
-
-    /// Worst-frame pairs for an export scope: Pair = the open pair only,
-    /// Metric = every file × worst-N of the current tab, All = every tab
-    /// with finished values. Rows without usable fps are skipped, like the
-    /// Extract worker.
-    fn export_pairs(&self, scope: BadframeExportScope) -> Vec<BadframeExportPair> {
-        let kinds: Vec<MetricKind> = match scope {
-            BadframeExportScope::Pair | BadframeExportScope::Metric => vec![self.badframe_tab],
-            BadframeExportScope::All => MetricKind::ALL.to_vec(),
-        };
-        let ref_fps = self
-            .ref_info_data
-            .as_ref()
-            .and_then(|m| m.fps)
-            .filter(|f| *f > 0.0);
-        let mut out = Vec::new();
-        for kind in kinds {
-            let keys: Vec<String> = match scope {
-                BadframeExportScope::Pair => self.badframe_file.clone().into_iter().collect(),
-                BadframeExportScope::Metric | BadframeExportScope::All => self
-                    .badframe_files_for(kind)
-                    .into_iter()
-                    .map(|(k, _)| k)
-                    .collect(),
-            };
-            for key in keys {
-                let Some(row) = self.rows.iter().find(|r| r.key == key) else {
-                    continue;
-                };
-                let picks = self.badframe_picks(kind, &key);
-                let frames: Vec<(usize, f64)> = match scope {
-                    BadframeExportScope::Pair => picks
-                        .get(self.badframe_frame_pos)
-                        .map(|(f, _, o)| (*f, *o))
-                        .into_iter()
-                        .collect(),
-                    BadframeExportScope::Metric | BadframeExportScope::All => {
-                        picks.into_iter().map(|(f, _, o)| (f, o)).collect()
-                    }
-                };
-                if frames.is_empty() {
-                    continue;
-                }
-                let dist_fps = row.info.as_ref().and_then(|m| m.fps).filter(|f| *f > 0.0);
-                let Some(dfps) = dist_fps.or(ref_fps) else {
-                    continue;
-                };
-                for (frame, offset) in frames {
-                    out.push(BadframeExportPair {
-                        kind,
-                        dist_path: row.path.clone(),
-                        dist_fps: dfps,
-                        frame,
-                        offset,
-                    });
-                }
-            }
-        }
-        out
-    }
-
-    /// Toast an export outcome (PNG counts; worker PNGs + tmp copies).
-    fn toast_export(&mut self, now: f64, saved: usize, failed: Vec<String>, dest: &str) {
-        if failed.is_empty() {
-            self.toast(
-                now,
-                format!("Exported {saved} PNGs to {dest}"),
-                ToastKind::Info,
-            );
-        } else {
-            let first = failed[0].clone();
-            let s = if failed.len() == 1 { "" } else { "s" };
-            self.toast(
-                now,
-                format!(
-                    "Export: {saved} saved, {} failed{s} ({first}) → {dest}",
-                    failed.len()
-                ),
-                ToastKind::Error,
-            );
-        }
-    }
-
-    /// Export worst-frame PNGs: tmp copies when the pair is already
-    /// extracted (exports exactly what the viewer shows), otherwise a
-    /// background worker extracting straight to the destination (viewer
-    /// tmp untouched). Empty browse line = beside each distorted file.
-    fn start_export(&mut self, scope: BadframeExportScope, now: f64) {
-        use std::sync::atomic::Ordering;
-        if self.measuring || self.badframes_busy {
-            return;
-        }
-        let Some(ffmpeg) = self.ffmpeg.path.clone() else {
-            self.toast(now, "Export needs ffmpeg".to_owned(), ToastKind::Error);
-            return;
-        };
-        let ref_path = self.ref_path.clone();
-        if ref_path.trim().is_empty() || !std::path::Path::new(&ref_path).is_file() {
-            self.toast(
-                now,
-                "Export needs the reference file".to_owned(),
-                ToastKind::Error,
-            );
-            return;
-        }
-        let pairs = self.export_pairs(scope);
-        if pairs.is_empty() {
-            self.toast(
-                now,
-                "Nothing to export: run a metric first".to_owned(),
-                ToastKind::Info,
-            );
-            return;
-        }
-        let export_dir = self.badframes_export_dir.clone();
-        if !export_dir.trim().is_empty()
-            && let Err(e) = std::fs::create_dir_all(&export_dir)
-        {
-            self.toast(
-                now,
-                format!("Could not create export folder: {e}"),
-                ToastKind::Error,
-            );
-            return;
-        }
-        let ref_fps = self
-            .ref_info_data
-            .as_ref()
-            .and_then(|m| m.fps)
-            .filter(|f| *f > 0.0)
-            .unwrap_or_else(|| {
-                self.rows
-                    .iter()
-                    .filter_map(|r| r.info.as_ref().and_then(|m| m.fps))
-                    .next()
-                    .unwrap_or(30.0)
-            });
-        let mut copied = Vec::new();
-        let mut jobs: Vec<BadframeExportJob> = Vec::new();
-        for p in pairs {
-            let name = p.kind.name();
-            let tmp_d = crate::metrics::badframes::tmp_dest_for(
-                &self.badframe_tmp,
-                &p.dist_path,
-                name,
-                p.frame,
-            );
-            let tmp_r = crate::metrics::badframes::tmp_dest_ref_for(
-                &self.badframe_tmp,
-                &p.dist_path,
-                name,
-                p.frame,
-            );
-            let dest_d = crate::metrics::badframes::export_dest_for(
-                &export_dir,
-                &p.dist_path,
-                name,
-                p.frame,
-                false,
-            );
-            let dest_r = crate::metrics::badframes::export_dest_for(
-                &export_dir,
-                &p.dist_path,
-                name,
-                p.frame,
-                true,
-            );
-            if tmp_d.is_file() && tmp_r.is_file() {
-                // Collected for the worker below: batch scopes copy
-                // hundreds of multi-MB PNGs, never on the UI thread.
-                copied.push(BadframeExportCopy {
-                    tmp_dist: tmp_d,
-                    tmp_ref: tmp_r,
-                    dest_dist: dest_d,
-                    dest_ref: dest_r,
-                    name,
-                    frame: p.frame,
-                });
-            } else {
-                jobs.push(BadframeExportJob {
-                    kind: p.kind,
-                    dist_src: p.dist_path,
-                    dist_fps: p.dist_fps,
-                    frame: p.frame,
-                    offset: p.offset,
-                    dest_dist: dest_d,
-                    dest_ref: dest_r,
-                });
-            }
-        }
-        let dest_note = if export_dir.trim().is_empty() {
-            "beside each file".to_owned()
-        } else {
-            export_dir
-        };
-        if jobs.is_empty() && copied.is_empty() {
-            self.toast_export(now, 0, Vec::new(), &dest_note);
-            return;
-        }
-        let plan = BadframeExportPlan {
-            ffmpeg,
-            ref_src: ref_path,
-            ref_fps,
-            jobs,
-        };
-        let total = copied.len() * 2 + plan.jobs.len() * 2;
-        self.badframes_busy = true;
-        self.badframe_done = 0;
-        self.badframe_total = total;
-        self.badframe_abort.store(false, Ordering::SeqCst);
-        self.badframe_export_pending = Some(BadframeExportPending {
-            copied: 0,
-            failed: Vec::new(),
-            dest_note,
-        });
-        let tx = self.badframe_tx.clone();
-        let abort = self.badframe_abort.clone();
-        std::thread::spawn(move || {
-            use crate::metrics::badframes;
-            let mut ok = 0usize;
-            let mut errors: Vec<String> = Vec::new();
-            let mut done = 0usize;
-            // Tmp copies first: local and quick, so no abort gate (Stop
-            // semantics today only interrupt extracts between frames).
-            for c in &copied {
-                match (
-                    std::fs::copy(&c.tmp_dist, &c.dest_dist),
-                    std::fs::copy(&c.tmp_ref, &c.dest_ref),
-                ) {
-                    (Ok(_), Ok(_)) => ok += 2,
-                    _ => errors.push(format!("{} frame {}", c.name, c.frame)),
-                }
-                done += 2;
-                let _ = tx.send(BadframeMsg::Progress { done, total });
-            }
-            for job in &plan.jobs {
-                for (src, fps, dest) in [
-                    (job.dist_src.as_str(), job.dist_fps, job.dest_dist.clone()),
-                    (plan.ref_src.as_str(), plan.ref_fps, job.dest_ref.clone()),
-                ] {
-                    if abort.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    if badframes::extract_one(&plan.ffmpeg, src, &dest, job.offset, fps) {
-                        ok += 1;
-                    } else {
-                        errors.push(format!("{} frame {}", job.kind.name(), job.frame));
-                    }
-                    done += 1;
-                    let _ = tx.send(BadframeMsg::Progress { done, total });
-                }
-                if abort.load(Ordering::SeqCst) {
-                    break;
-                }
-            }
-            let _ = tx.send(BadframeMsg::Finished { ok, errors });
-        });
-        log::info!(target: "rfmetrics::app", "bad-frames export started: {} files", total);
-    }
-
-    /// Drain bad-frames progress; returns true on activity. Viewer runs
-    /// rescan tmp, drop textures and auto-select the first file; export
-    /// runs toast the combined copy + extract outcome instead.
-    fn drain_badframe_results(&mut self, now: f64) -> bool {
-        let mut activity = false;
-        while let Ok(msg) = self.badframe_rx.try_recv() {
-            activity = true;
-            match msg {
-                BadframeMsg::Progress { done, total } => {
-                    self.badframe_done = done;
-                    self.badframe_total = total;
-                }
-                BadframeMsg::Finished { ok, errors } => {
-                    self.badframes_busy = false;
-                    self.badframe_done = 0;
-                    self.badframe_total = 0;
-                    // Deferred close cleanup: the window closed mid-run and
-                    // tmp stayed alive for the worker until now (`Finished`
-                    // is its last send, so nothing touches tmp afterwards).
-                    if self.badframe_tmp_cleanup_pending {
-                        self.badframe_tmp_cleanup_pending = false;
-                        let _ = std::fs::remove_dir_all(&self.badframe_tmp);
-                    }
-                    // Export extracts went straight to the destination:
-                    // toast the combined outcome, viewer tmp untouched.
-                    if let Some(pending) = self.badframe_export_pending.take() {
-                        let mut failed = pending.failed;
-                        failed.extend(errors);
-                        self.toast_export(now, pending.copied + ok, failed, &pending.dest_note);
-                        continue;
-                    }
-                    self.badframe_files = std::fs::read_dir(&self.badframe_tmp)
-                        .map(|entries| {
-                            let mut v: Vec<std::path::PathBuf> = entries
-                                .filter_map(|e| e.ok().map(|e| e.path()))
-                                .filter(|p| p.extension().is_some_and(|x| x == "png"))
-                                .collect();
-                            v.sort();
-                            v
-                        })
-                        .unwrap_or_default();
-                    self.badframe_tex_dist = None;
-                    self.badframe_tex_ref = None;
-                    self.badframe_tex_key = None;
-                    self.badframe_frame_pos = 0;
-                    if self
-                        .badframe_file
-                        .as_ref()
-                        .is_none_or(|k| !self.rows.iter().any(|r| &r.key == k))
-                    {
-                        self.badframe_file = self
-                            .badframe_files_for(self.badframe_tab)
-                            .into_iter()
-                            .next()
-                            .map(|(k, _)| k);
-                    }
-                    self.badframe_report = Some((ok, errors));
-                }
-            }
-        }
-        if let Some((ok, errors)) = self.badframe_report.take() {
-            if errors.is_empty() {
-                let s = if ok == 1 { "" } else { "s" };
-                self.toast(
-                    now,
-                    format!("Extracted {ok} bad-frame PNG{s}"),
-                    ToastKind::Info,
-                );
-            } else {
-                let first = errors[0].clone();
-                let s = if errors.len() == 1 { "" } else { "s" };
-                self.toast(
-                    now,
-                    format!(
-                        "Bad frames: {ok} saved, {} failed{s} ({first})",
-                        errors.len()
-                    ),
-                    ToastKind::Error,
-                );
-            }
-        }
-        activity
-    }
-
-    /// Upload the visible viewer pair as textures when the selection
-    /// changed. Full resolution (inspection needs detail); only two
-    /// textures are ever cached.
-    fn refresh_viewer_textures(&mut self, ctx: &egui::Context) {
-        let key = match &self.badframe_file {
-            Some(k) => (k.clone(), self.badframe_tab, self.badframe_frame_pos),
-            None => return,
-        };
-        if self.badframe_tex_key.as_ref() == Some(&key) {
-            return;
-        }
-        self.badframe_tex_dist = None;
-        self.badframe_tex_ref = None;
-        let picks = self.badframe_picks(key.1, &key.0);
-        let Some((frame, _, _)) = picks.get(key.2).copied() else {
-            return;
-        };
-        let row_path = match self.rows.iter().find(|r| r.key == key.0) {
-            Some(r) => r.path.clone(),
-            None => return,
-        };
-        let load = |p: std::path::PathBuf| -> Option<egui::TextureHandle> {
-            let bytes = std::fs::read(&p).ok()?;
-            if bytes.len() <= 100 {
-                return None;
-            }
-            let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
-            let (w, h) = (img.width(), img.height());
-            if w == 0 || h == 0 {
-                return None;
-            }
-            Some(ctx.load_texture(
-                p.to_string_lossy().into_owned(),
-                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &img.into_raw()),
-                egui::TextureOptions::LINEAR,
-            ))
-        };
-        self.badframe_tex_dist = load(crate::metrics::badframes::tmp_dest_for(
-            &self.badframe_tmp,
-            &row_path,
-            key.1.name(),
-            frame,
-        ));
-        self.badframe_tex_ref = load(crate::metrics::badframes::tmp_dest_ref_for(
-            &self.badframe_tmp,
-            &row_path,
-            key.1.name(),
-            frame,
-        ));
-        self.badframe_tex_key = Some(key);
-    }
-
-    /// Bad-frames viewer in its own OS window (mirrors `show_plots`):
-    /// per-metric tabs, file picker, worst-frame stepper, dist/ref pair
-    /// side by side with shared zoom + scroll-pan, current-tab extractor,
-    /// and an options box with count + save-all-to-folder.
-    ///
-    /// Close while a worker runs defers tmp deletion until its `Finished`
-    /// drains (no abort: an export launched from the viewer may be using
-    /// tmp, and the run is bounded anyway).
-    fn close_badframes(&mut self) {
-        self.show_badframes = false;
-        if self.badframes_busy {
-            self.badframe_tmp_cleanup_pending = true;
-        } else {
-            // Best-effort tmp cleanup; save-all must happen while open.
-            let _ = std::fs::remove_dir_all(&self.badframe_tmp);
-        }
-        self.badframe_files.clear();
-        self.badframe_tex_dist = None;
-        self.badframe_tex_ref = None;
-        self.badframe_tex_key = None;
-    }
-
-    fn show_badframes(&mut self, ctx: &egui::Context) {
-        if !self.show_badframes {
-            return;
-        }
-        let id = egui::ViewportId::from_hash_of("badframes_view");
-        let builder = egui::ViewportBuilder::default()
-            .with_title("Bad frames")
-            .with_inner_size([1100.0, 700.0]);
-        ctx.show_viewport_immediate(id, builder, |vui, _class| {
-            if vui.input(|i| i.viewport().close_requested()) {
-                self.close_badframes();
-                return;
-            }
-            let vnow = vui.input(|i| i.time);
-            let kind = self.badframe_tab;
-            // Tab strip (all 7, like the plot window).
-            egui::Panel::top("bf_tabs").show(vui, |ui| {
-                ui.horizontal(|ui| {
-                    for tab in MetricKind::ALL {
-                        let title = crate::plot::tab_title(tab);
-                        if ui
-                            .add(egui::Button::new(title).selected(self.badframe_tab == tab))
-                            .clicked()
-                        {
-                            self.badframe_tab = tab;
-                            self.badframe_frame_pos = 0;
-                            self.badframe_tex_key = None;
-                        }
-                    }
-                });
-            });
-            // Runner row: extract current tab / stop + progress.
-            egui::Panel::top("bf_run").show(vui, |ui| {
-                ui.horizontal(|ui| {
-                    if self.badframes_busy {
-                        if ui
-                            .add_sized([110.0, 24.0], egui::Button::new("Stop"))
-                            .clicked()
-                        {
-                            self.stop_badframes();
-                        }
-                        ui.label(format!(
-                            "{} {}/{}",
-                            if self.badframe_export_pending.is_some() {
-                                "Exporting"
-                            } else {
-                                "Extracting"
-                            },
-                            self.badframe_done,
-                            self.badframe_total
-                        ));
-                    } else {
-                        let can_run =
-                            self.ffmpeg.path.is_some() && !self.badframe_files_for(kind).is_empty();
-                        if ui
-                            .add_enabled_ui(can_run, |ui| {
-                                ui.add_sized([110.0, 24.0], egui::Button::new("Extract"))
-                            })
-                            .inner
-                            .on_hover_text("Extract worst frames for this tab into tmp")
-                            .clicked()
-                        {
-                            self.start_badframes(vnow);
-                        }
-                        if self.badframe_files_for(kind).is_empty() {
-                            ui.label("Run a metric first");
-                        }
-                    }
-                });
-            });
-            // File + frame controls.
-            let files = self.badframe_files_for(kind);
-            if !files.iter().any(|(k, _)| Some(k) == self.badframe_file.as_ref()) {
-                self.badframe_file = files.first().map(|(k, _)| k.clone());
-                self.badframe_frame_pos = 0;
-                self.badframe_tex_key = None;
-            }
-            egui::Panel::top("bf_pick").show(vui, |ui| {
-                ui.horizontal(|ui| {
-                    let current = self
-                        .badframe_file
-                        .as_ref()
-                        .and_then(|k| files.iter().find(|(fk, _)| fk == k))
-                        .map(|(_, d)| d.clone())
-                        .unwrap_or_else(|| "No file".to_owned());
-                    egui::ComboBox::from_id_salt("bf_file")
-                        .selected_text(current)
-                        .show_ui(ui, |ui| {
-                            for (k, d) in &files {
-                                let _ = ui.selectable_value(
-                                    self.badframe_file.get_or_insert_with(|| k.clone()),
-                                    k.clone(),
-                                    d.as_str(),
-                                );
-                            }
-                        });
-                    let picks = self
-                        .badframe_file
-                        .as_ref()
-                        .map(|k| self.badframe_picks(kind, k))
-                        .unwrap_or_default();
-                    let max_pos = picks.len().saturating_sub(1);
-                    if self.badframe_frame_pos > max_pos {
-                        self.badframe_frame_pos = max_pos;
-                        self.badframe_tex_key = None;
-                    }
-                    if ui.add_enabled(self.badframe_frame_pos > 0, egui::Button::new("◀")).clicked() {
-                        self.badframe_frame_pos = self.badframe_frame_pos.saturating_sub(1);
-                        self.badframe_tex_key = None;
-                    }
-                    let mut pos = self.badframe_frame_pos;
-                    if !picks.is_empty() {
-                        ui.add(
-                            egui::Slider::new(&mut pos, 0..=max_pos)
-                                .show_value(false)
-                                .trailing_fill(true),
-                        );
-                        if pos != self.badframe_frame_pos {
-                            self.badframe_frame_pos = pos;
-                            self.badframe_tex_key = None;
-                        }
-                    }
-                    if ui
-                        .add_enabled(self.badframe_frame_pos < max_pos, egui::Button::new("▶"))
-                        .clicked()
-                    {
-                        self.badframe_frame_pos = self.badframe_frame_pos.saturating_add(1).min(max_pos);
-                        self.badframe_tex_key = None;
-                    }
-                    if let Some((frame, value, _)) = picks.get(self.badframe_frame_pos).copied() {
-                        ui.label(format!("Frame {frame} ({value:.4})"));
-                    }
-                    if ui
-                        .button("Reset view")
-                        .on_hover_text("Fit both images (zoom/pan stay linked)")
-                        .clicked()
-                    {
-                        self.badframe_reset_once = true;
-                    }
-                    ui.separator();
-                    ui.selectable_value(&mut self.badframe_slider, false, "Side")
-                        .on_hover_text("Distorted and reference side by side");
-                    ui.selectable_value(&mut self.badframe_slider, true, "Slider")
-                        .on_hover_text("Before/after wipe — drag the divider");
-                });
-            });
-            // Options box first: egui requires CentralPanel after all
-            // other panels, otherwise the bottom panel gets zero space.
-            egui::Panel::bottom("bf_opts").show(vui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add(egui::Label::new("Bad frames").selectable(false));
-                    let _ = egui::ComboBox::from_id_salt("bf_count")
-                        .selected_text(self.badframes_count.as_str())
-                        .show_ui(ui, |ui| {
-                            for v in crate::metrics::badframes::COUNT_LABELS {
-                                let _ = ui.selectable_value(
-                                    &mut self.badframes_count,
-                                    v.to_owned(),
-                                    v,
-                                );
-                            }
-                        });
-                    let busy = self.badframes_busy || self.measuring;
-                    let can_pair = !busy
-                        && self.badframe_file.as_ref().is_some_and(|k| {
-                            self.badframe_picks(kind, k)
-                                .get(self.badframe_frame_pos)
-                                .is_some()
-                        });
-                    let can_metric =
-                        !busy && !self.badframe_files_for(kind).is_empty();
-                    let can_all = !busy
-                        && MetricKind::ALL
-                            .iter()
-                            .any(|k| !self.badframe_files_for(*k).is_empty());
-                    if ui
-                        .add_enabled(can_pair, egui::Button::new("Export pair"))
-                        .on_hover_text("Export the open pair (this tab, file and frame)")
-                        .clicked()
-                    {
-                        self.start_export(BadframeExportScope::Pair, vnow);
-                    }
-                    if ui
-                        .add_enabled(can_metric, egui::Button::new("Export metric"))
-                        .on_hover_text("Export all worst-frame pairs of this tab")
-                        .clicked()
-                    {
-                        self.start_export(BadframeExportScope::Metric, vnow);
-                    }
-                    if ui
-                        .add_enabled(can_all, egui::Button::new("Export all"))
-                        .on_hover_text(
-                            "Extract missing frames for every finished metric, then export all pairs",
-                        )
-                        .clicked()
-                    {
-                        self.start_export(BadframeExportScope::All, vnow);
-                    }
-                    ui.label(format!("{} PNGs in tmp", self.badframe_files.len()));
-                });
-                ui.horizontal(|ui| {
-                    ui.add(egui::Label::new("Export folder").selectable(false));
-                    // Bounded display (full path stays in the hover).
-                    let full = self.badframes_export_dir.clone();
-                    let shown = if full.trim().is_empty() {
-                        "Beside distorted files".to_owned()
-                    } else if full.chars().count() > 40 {
-                        format!(
-                            "…{}",
-                            full.chars().skip(full.chars().count() - 39).collect::<String>()
-                        )
-                    } else {
-                        full.clone()
-                    };
-                    ui.label(shown).on_hover_text(if full.trim().is_empty() {
-                        "Empty: each pair lands next to its distorted file".to_owned()
-                    } else {
-                        full
-                    });
-                    if ui.button("Browse…").clicked()
-                        && let Some(dir) = rfd::FileDialog::new()
-                            .set_title("Bad-frames export folder")
-                            .pick_folder()
-                    {
-                        self.badframes_export_dir = dir.to_string_lossy().into_owned();
-                    }
-                    if ui
-                        .button("Clear")
-                        .on_hover_text("Back to beside-the-distorted-file")
-                        .clicked()
-                    {
-                        self.badframes_export_dir.clear();
-                    }
-                });
-            });
-            // Side-by-side pair as linked plots (shared zoom/pan): both
-            // images centered at the origin at true pixel size, so one view
-            // transform fits both. Stock plot gestures: drag pans, wheel
-            // zooms, box-select zooms.
-            self.refresh_viewer_textures(vui);
-            // Any selection change re-fits: `Plot::reset()` clears both the
-            // stored bounds and the shared link-group entry (a fresh plot id
-            // alone would inherit the group's zoom).
-            let view_key = (
-                kind,
-                self.badframe_file.clone().unwrap_or_default(),
-                self.badframe_frame_pos,
-            );
-            if self.badframe_view_key.as_ref() != Some(&view_key) {
-                self.badframe_view_key = Some(view_key);
-                self.badframe_reset_once = true;
-            }
-            egui::CentralPanel::default().show(vui, |ui| {
-                // Overlay wipe as a single plot: UV-cropped halves tile
-                // exactly at the divider (ref left, dist right), so stock
-                // plot gestures give pan (drag), zoom (scroll/box) and
-                // double-click fit. Divider drag suppresses pan via last
-                // frame's divider screen x. No default bounds: auto-bounds
-                // + expanding aspect contain-fits the pair (never crops),
-                // on first show, Reset view, double-click and selection
-                // change alike.
-                if self.badframe_slider {
-                    let dist = self.badframe_tex_dist.clone();
-                    let refr = self.badframe_tex_ref.clone();
-                    match (dist, refr) {
-                        (Some(d), Some(r)) => {
-                            ui.label("Reference (left) | Distorted (right) — drag divider to compare · drag to pan · scroll to zoom · double-click to fit");
-                            let (ds, rs) = (d.size(), r.size());
-                            let w = ds[0].max(rs[0]) as f64;
-                            let h = ds[1].max(rs[1]) as f64;
-                            let lay = crate::metrics::badframes::wipe_layout(
-                                w,
-                                self.badframe_split,
-                            );
-                            let hover_x = ui
-                                .ctx()
-                                .pointer_hover_pos()
-                                .map(|p| p.x)
-                                .unwrap_or(f32::NAN);
-                            let suppress = self.badframe_div_drag
-                                || (self.badframe_div_sx.is_finite()
-                                    && (hover_x - self.badframe_div_sx).abs() <= 10.0);
-                            let do_reset = self.badframe_reset_once;
-                            let plot = egui_plot::Plot::new("bf-wipe")
-                                .data_aspect(1.0)
-                                .show_grid(false)
-                                .show_axes(false)
-                                .show_crosshair(false)
-                                .allow_drag(!suppress);
-                            let plot = if do_reset { plot.reset() } else { plot };
-                            let u = lay.u;
-                            let resp = plot.show(ui, |plot_ui| {
-                                plot_ui.image(
-                                    egui_plot::PlotImage::new(
-                                        "bf-wipe-ref",
-                                        r.id(),
-                                        egui_plot::PlotPoint::new(lay.left_cx, 0.0),
-                                        egui::Vec2::new(lay.left_w as f32, h as f32),
-                                    )
-                                    .uv(egui::Rect::from_min_max(
-                                        egui::Pos2::new(0.0, 0.0),
-                                        egui::Pos2::new(u, 1.0),
-                                    ))
-                                    .allow_hover(false),
-                                );
-                                plot_ui.image(
-                                    egui_plot::PlotImage::new(
-                                        "bf-wipe-dist",
-                                        d.id(),
-                                        egui_plot::PlotPoint::new(lay.right_cx, 0.0),
-                                        egui::Vec2::new(lay.right_w as f32, h as f32),
-                                    )
-                                    .uv(egui::Rect::from_min_max(
-                                        egui::Pos2::new(u, 0.0),
-                                        egui::Pos2::new(1.0, 1.0),
-                                    ))
-                                    .allow_hover(false),
-                                );
-                                plot_ui.line(
-                                    egui_plot::Line::new(
-                                        "bf-wipe-div",
-                                        egui_plot::PlotPoints::new(vec![
-                                            [lay.div_x, -h / 2.0],
-                                            [lay.div_x, h / 2.0],
-                                        ]),
-                                    )
-                                    .color(egui::Color32::WHITE)
-                                    .width(2.0)
-                                    .allow_hover(false),
-                                );
-                            });
-                            let p0 = resp.transform.position_from_point(
-                                &egui_plot::PlotPoint::new(-w / 2.0, -h / 2.0),
-                            );
-                            let p1 = resp.transform.position_from_point(
-                                &egui_plot::PlotPoint::new(w / 2.0, h / 2.0),
-                            );
-                            let img = egui::Rect::from_two_pos(p0, p1);
-                            let sx = resp
-                                .transform
-                                .position_from_point(&egui_plot::PlotPoint::new(
-                                    lay.div_x, 0.0,
-                                ))
-                                .x;
-                            self.badframe_div_sx = sx;
-                            // Overlay follows the visible image area so tags,
-                            // handle and grab stay on screen while zoomed or
-                            // panned (half-centers drift off-screen).
-                            let frame = resp.response.rect;
-                            let vis = img.intersect(frame);
-                            let painter =
-                                ui.painter_at(frame).with_clip_rect(frame);
-                            let font = egui::TextStyle::Small.resolve(ui.style());
-                            if vis.is_positive() {
-                                let y = vis.min.y + 16.0;
-                                for (lo, hi, tag) in [
-                                    (img.min.x, sx, "REF"),
-                                    (sx, img.max.x, "DIST"),
-                                ] {
-                                    let (vlo, vhi) =
-                                        (lo.max(vis.min.x), hi.min(vis.max.x));
-                                    let galley = painter.layout_no_wrap(
-                                        tag.to_owned(),
-                                        font.clone(),
-                                        egui::Color32::WHITE,
-                                    );
-                                    let half = galley.size().x / 2.0 + 8.0;
-                                    if vhi - vlo < half * 2.0 + 4.0 {
-                                        continue;
-                                    }
-                                    let c = egui::Pos2::new((vlo + vhi) / 2.0, y);
-                                    let bg = egui::Rect::from_center_size(
-                                        c,
-                                        galley.size() + egui::Vec2::new(12.0, 4.0),
-                                    );
-                                    painter.rect_filled(
-                                        bg,
-                                        4.0,
-                                        egui::Color32::from_black_alpha(150),
-                                    );
-                                    painter.text(
-                                        c,
-                                        egui::Align2::CENTER_CENTER,
-                                        tag,
-                                        font.clone(),
-                                        egui::Color32::WHITE,
-                                    );
-                                }
-                                if sx >= vis.min.x && sx <= vis.max.x {
-                                    let hy = img
-                                        .center()
-                                        .y
-                                        .clamp(vis.min.y, vis.max.y);
-                                    painter.circle_filled(
-                                        egui::Pos2::new(sx, hy),
-                                        9.0,
-                                        egui::Color32::from_black_alpha(160),
-                                    );
-                                    painter.circle_stroke(
-                                        egui::Pos2::new(sx, hy),
-                                        9.0,
-                                        egui::Stroke::new(1.5, egui::Color32::WHITE),
-                                    );
-                                }
-                            }
-                            let grab = egui::Rect::from_x_y_ranges(
-                                (sx - 8.0)..=(sx + 8.0),
-                                vis.y_range(),
-                            )
-                            .intersect(frame);
-                            let grab = if grab.is_positive() {
-                                grab
-                            } else {
-                                egui::Rect::from_center_size(
-                                    frame.center(),
-                                    egui::Vec2::ZERO,
-                                )
-                            };
-                            let grab_resp = ui.interact(
-                                grab,
-                                ui.id().with("bf_wipe_grab"),
-                                egui::Sense::drag(),
-                            );
-                            if grab_resp.hovered() || grab_resp.dragged() {
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
-                            }
-                            if grab_resp.dragged()
-                                && let Some(pos) = grab_resp.interact_pointer_pos()
-                                && img.width() > 10.0
-                            {
-                                self.badframe_split =
-                                    crate::metrics::badframes::clamp_split(
-                                        (pos.x - img.min.x) / img.width(),
-                                    );
-                            }
-                            self.badframe_div_drag = grab_resp.dragged();
-                            if do_reset {
-                                self.badframe_reset_once = false;
-                            }
-                        }
-                        (Some(d), None) => {
-                            let _ = (d,);
-                            ui.label("Reference — not extracted");
-                        }
-                        (None, Some(r)) => {
-                            let _ = (r,);
-                            ui.label("Distorted — not extracted");
-                        }
-                        (None, None) => {
-                            ui.label("Extract frames to compare");
-                        }
-                    }
-                    return;
-                }
-                // Union-fit defaults (stored memory wins once the user
-                // pans/zooms within a selection).
-                let (dxmin, dxmax, dymin, dymax) =
-                    match (&self.badframe_tex_dist, &self.badframe_tex_ref) {
-                        (Some(d), Some(r)) => {
-                            let (ds, rs) = (d.size(), r.size());
-                            crate::metrics::badframes::viewer_fit(
-                                ds[0] as u32,
-                                ds[1] as u32,
-                                rs[0] as u32,
-                                rs[1] as u32,
-                            )
-                        }
-                        _ => (-1.0, 1.0, -1.0, 1.0),
-                    };
-                let do_reset = self.badframe_reset_once;
-                ui.columns(2, |cols| {
-                    if let Some(tex) = &self.badframe_tex_ref {
-                        let (w, h) = (tex.size()[0] as f32, tex.size()[1] as f32);
-                        cols[0].label("Reference");
-                        let plot = egui_plot::Plot::new("bf-ref")
-                            .link_axis("bf_img", true)
-                            .data_aspect(1.0)
-                            .show_grid(false)
-                            .show_axes(false)
-                            .show_crosshair(false)
-                            .default_x_bounds(dxmin, dxmax)
-                            .default_y_bounds(dymin, dymax);
-                        let plot = if do_reset { plot.reset() } else { plot };
-                        plot.show(&mut cols[0], |plot_ui| {
-                            plot_ui.image(
-                                egui_plot::PlotImage::new(
-                                    "bf-ref-img",
-                                    tex.id(),
-                                    egui_plot::PlotPoint::new(0.0, 0.0),
-                                    egui::Vec2::new(w, h),
-                                )
-                                .allow_hover(false),
-                            );
-                        });
-                    } else {
-                        cols[0].label("Reference — not extracted");
-                    }
-                    if let Some(tex) = &self.badframe_tex_dist {
-                        let (w, h) = (tex.size()[0] as f32, tex.size()[1] as f32);
-                        cols[1].label("Distorted");
-                        let plot = egui_plot::Plot::new("bf-dist")
-                            .link_axis("bf_img", true)
-                            .data_aspect(1.0)
-                            .show_grid(false)
-                            .show_axes(false)
-                            .show_crosshair(false)
-                            .default_x_bounds(dxmin, dxmax)
-                            .default_y_bounds(dymin, dymax);
-                        let plot = if do_reset { plot.reset() } else { plot };
-                        plot.show(&mut cols[1], |plot_ui| {
-                            plot_ui.image(
-                                egui_plot::PlotImage::new(
-                                    "bf-dist-img",
-                                    tex.id(),
-                                    egui_plot::PlotPoint::new(0.0, 0.0),
-                                    egui::Vec2::new(w, h),
-                                )
-                                .allow_hover(false),
-                            );
-                        });
-                    } else {
-                        cols[1].label("Distorted — not extracted");
-                    }
-                });
-                if do_reset {
-                    self.badframe_reset_once = false;
-                }
-            });
-            // Keep progress live while the worker runs (viewport repaints
-            // with the parent only on input otherwise).
-            if self.badframes_busy {
-                vui.request_repaint_after(std::time::Duration::from_millis(100));
-            }
-        });
-    }
-
-    /// Metric plots in their own OS window (Python `show_plot` parity,
-    /// all 7 tabs). Series are read live from `rows` every frame, so the
-    /// viewport needs no update plumbing: curves appear on Done data and
-    /// empty on Reset by themselves. Interaction stays on the stock
-    /// `egui_plot` binds (drag pan, box-zoom select, ctrl+scroll zoom,
-    /// double-click reset); the Python custom keybinds are out of scope.
-    fn show_plots(&mut self, ctx: &egui::Context) {
-        if !self.show_plot {
-            return;
-        }
-        let id = egui::ViewportId::from_hash_of("metrics_plot");
-        let builder = egui::ViewportBuilder::default()
-            .with_title("Metrics")
-            .with_inner_size([1100.0, 700.0]);
-        ctx.show_viewport_immediate(id, builder, |vui, _class| {
-            // Window-manager close withdraws (Python `withdraw` parity);
-            // Plot reopens it.
-            if vui.input(|i| i.viewport().close_requested()) {
-                self.show_plot = false;
-            }
-            // While measuring, follow the live job's tab so its growing
-            // curve is visible; idle windows stay user-driven.
-            self.plot_tab = crate::plot::follow_live_tab(
-                self.measuring,
-                self.live_kind,
-                self.plot_tab,
-            );
-            let kind = self.plot_tab;
-            let def = crate::plot::plot_def(kind);
-            // Finished series plus live `Running` buffers, so curves grow
-            // mid-run (a cell is ever only one of the two — no dupes).
-            // Streaming runs whether the window is open or not, so a
-            // mid-run Plot click shows history; painting itself only
-            // happens here, i.e. never unseen.
-            let mut any_running = false;
-            // Names + values feed fit/hover and the drawn lines (decimated
-            // at draw time, x = 1-based frame — no full-res point cache).
-            // First-column `include` doubles as plot visibility (#3):
-            // unchecked rows are excluded from runs (start_run) and hidden
-            // here, so fit/hover/export below re-fit to visible only.
-            // Data keeps streaming in the background, so re-checking shows
-            // history instantly, including mid-run Running curves.
-            // `done` carries the row's permanent color slot alongside the
-            // display name so lines/export use the stable per-file color
-            // (hiding or removing one curve never recolors the rest).
-            let done: Vec<(&str, usize, &[f64])> = self
-                .rows
-                .iter()
-                .filter(|r| r.include)
-                .filter_map(|r| match r.cell(kind) {
-                    crate::metrics::MetricCell::Done { values, .. }
-                        if !values.is_empty() =>
-                    {
-                        Some((r.display.as_str(), r.color_idx, values.as_slice()))
-                    }
-                    crate::metrics::MetricCell::Running { values, .. }
-                        if !values.is_empty() =>
-                    {
-                        any_running = true;
-                        Some((r.display.as_str(), r.color_idx, values.as_slice()))
-                    }
-                    _ => None,
-                })
-                .collect();
-            let borrowed: Vec<&[f64]> = done.iter().map(|(_, _, v)| *v).collect();
-            let fresh = crate::plot::fit_limits(&borrowed, def.lo, def.hi);
-            // Grow-only live bounds: axes expand with arriving points but
-            // never jump inward mid-run; cleared once all settle so the
-            // finished graph fits exactly again. `follow` arms the
-            // one-shot auto-follow poke below (new live phase on this tab,
-            // or a still-owed retry).
-            let (follow, (xlim, (ymin, ymax))) = if any_running {
-                let grown = match self.plot_live_fit {
-                    Some((t, prev)) if t == kind => crate::plot::union_bounds(prev, fresh),
-                    _ => fresh,
-                };
-                let follow = !matches!(self.plot_live_fit, Some((t, _)) if t == kind)
-                    || self.plot_follow_pending;
-                self.plot_live_fit = Some((kind, grown));
-                (follow, grown)
-            } else {
-                self.plot_live_fit = None;
-                // One-shot re-fit owed by a no-live-feed first Done (VMAF):
-                // consumed like the follow retry above, so a stale arm can
-                // never yank a later zoom.
-                let follow = self.plot_follow_pending;
-                self.plot_follow_pending = false;
-                (follow, fresh)
-            };
-            // Empty plot (no Done data): axes only, y on the metric
-            // default range; x falls back to a unit span.
-            let (xmin, xmax) = xlim.unwrap_or((0.0, 1.0));
-            // Per-tab plot id (zoom state persists per metric); hoisted so
-            // the help-bar Reset below pokes the same memory entry the
-            // canvas, snap clamp, and export snapshot use.
-            let plot_id = format!("plot-{}", crate::plot::tab_title(kind).to_lowercase());
-            // Help bar pinned to the bottom (Python `side="bottom"` parity).
-            egui::Panel::bottom("plot_help").show(vui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::Label::new(
-                            "Drag: pan • Right-drag select: box zoom • Ctrl+scroll: zoom • Double-click: reset",
-                        )
-                        .selectable(false),
-                    );
-                    ui.checkbox(&mut self.plot_snap, "Snap to data").on_hover_text(
-                        "Lock panning to the first/last frame and the plotted min/max; zoom and pan inside freely",
-                    );
-                    // Explicit re-fit (double-click parity): only arms the
-                    // flag — the poke runs in the central panel below,
-                    // where the plot id scope lives (a help-bar `Ui`
-                    // derives different persistent ids than the canvas).
-                    if ui
-                        .add_enabled(
-                            !borrowed.is_empty(),
-                            egui::Button::new("Reset view"),
-                        )
-                        .on_hover_text("Fit the whole series (same as double-click)")
-                        .clicked()
-                    {
-                        self.plot_reset_pending = true;
-                    }
-                    let save_label = if self.png_saving { "Saving…" } else { "Save PNG" };
-                    let save_hover = if self.png_saving {
-                        "Writing PNG in the background…"
-                    } else {
-                        "Save the current view as a PNG file (legend and axes included)"
-                    };
-                    let save_btn = ui
-                        .add_enabled(!self.png_saving, egui::Button::new(save_label))
-                        .on_hover_text(save_hover);
-                    if save_btn.clicked() && !self.png_saving {
-                        // Filename captured now; the export itself runs in
-                        // the central panel below, where the plot id scope
-                        // (for the current view bounds) lives.
-                        self.plot_save_pending = Some(PlotExport::Save {
-                            name: format!("{}.png", crate::plot::tab_title(self.plot_tab)),
-                        });
-                    }
-                    let copy_label = if self.png_saving { "Copying…" } else { "Copy" };
-                    let copy_hover = if self.png_saving {
-                        "Rendering plot in the background…"
-                    } else {
-                        "Copy the current view as an image to the clipboard (legend and axes included)"
-                    };
-                    let copy_btn = ui
-                        .add_enabled(!self.png_saving, egui::Button::new(copy_label))
-                        .on_hover_text(copy_hover);
-                    if copy_btn.clicked() && !self.png_saving {
-                        self.plot_save_pending = Some(PlotExport::Copy);
-                    }
-                });
-            });
-            egui::CentralPanel::default().show(vui, |ui| {
-                // FPS HUD (egui demo pattern): smoothed frame rate
-                // top-right. Full repaint rate only while measuring (live
-                // curves need it); idle repaints at ~10 Hz plus
-                // input-driven ones — a static plot at 60 fps is pure
-                // main+plot re-render cost, and immediate viewports
-                // repaint the parent together with the child.
-                if self.measuring {
-                    ui.ctx().request_repaint();
-                } else {
-                    ui.ctx()
-                        .request_repaint_after(std::time::Duration::from_millis(100));
-                }
-                let fps = 1.0 / ui.input(|i| i.stable_dt);
-                egui::Area::new(egui::Id::new("plot_fps"))
-                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 8.0))
-                    .order(egui::Order::Foreground)
-                    .show(ui.ctx(), |ui| {
-                        egui::Frame::popup(ui.style()).show(ui, |ui| {
-                            // Single-line HUD: never wrap the counter.
-                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                            ui.label(format!("FPS: {fps:.0}"));
-                        });
-                    });
-                // Tab strip (Python `CTkTabview` parity): all 7 tabs
-                // always visible; empty tabs show empty axes. Compact
-                // box hugging the buttons, centered via last frame's
-                // measured width: egui cannot center content of unknown
-                // width upfront (`with_layout`/`horizontal_centered`
-                // reserve the full remaining rect and starve the plot),
-                // but tab texts are static so one measured offset stays
-                // pixel-exact. First frame falls back to the left edge.
-                let pad = if self.plot_tabs_w <= 0.0 {
-                    0.0
-                } else {
-                    ((ui.available_width() - self.plot_tabs_w) / 2.0).max(0.0)
-                };
-                ui.horizontal(|ui| {
-                    if pad > 0.0 {
-                        ui.add_space(pad);
-                    }
-                    let frame_resp = egui::Frame::group(ui.style()).show(ui, |ui| {
-                        egui::Grid::new("plot_tabs").show(ui, |ui| {
-                            for tab in MetricKind::ALL {
-                                let title = crate::plot::tab_title(tab);
-                                let btn =
-                                    egui::Button::new(title).selected(self.plot_tab == tab);
-                                if ui.add(btn).clicked() {
-                                    self.plot_tab = tab;
-                                }
-                            }
-                            ui.end_row();
-                        });
-                    });
-                    self.plot_tabs_w = frame_resp.response.rect.width();
-                });
-                // Per-tab plot id shared with the help-bar Reset above.
-                // One-shot live-follow: explicit default bounds seed fresh
-                // PlotMemory with auto OFF, freezing the first-shown
-                // (often still empty) view until a double-click. Flip auto
-                // back on once per live phase so bounds track the growing
-                // fit; user pan/zoom afterwards still takes over (it flips
-                // auto off again). Retried while memory is missing: on the
-                // opening frame there is nothing to poke yet, memory
-                // appears on the next shown frame.
-                if follow {
-                    // NOTE: the id must be derived exactly like
-                    // `Plot::show` does (`new` stores `Id::new(source)`,
-                    // show hashes *that*); hashing the raw string hits a
-                    // different memory entry and the poke never lands.
-                    let pid = ui.make_persistent_id(egui::Id::new(plot_id.clone()));
-                    if let Some(mut mem) = egui_plot::PlotMemory::load(ui.ctx(), pid) {
-                        mem.auto_bounds = true.into();
-                        mem.store(ui.ctx(), pid);
-                        self.plot_follow_pending = false;
-                    } else {
-                        self.plot_follow_pending = true;
-                    }
-                }
-                // Snap-to-data lock: clamp the stored view into the data
-                // extent ([1, N] frames, fit min/max) before show, so the
-                // user cannot pan past the first/last frame or leave the
-                // plotted min/max — zooming and in-limits panning stay
-                // free. Done on the stored bounds (not via
-                // `set_plot_bounds`) so auto-follow keeps working.
-                if self.plot_snap && !borrowed.is_empty() {
-                    let n = borrowed.iter().map(|s| s.len()).max().unwrap_or(0);
-                    let pid = ui.make_persistent_id(egui::Id::new(plot_id.clone()));
-                    if let Some(mut mem) = egui_plot::PlotMemory::load(ui.ctx(), pid) {
-                        let b = mem.bounds();
-                        let (cx0, cx1) = if n >= 2 {
-                            crate::plot::clamp_range((b.min()[0], b.max()[0]), (1.0, n as f64))
-                        } else {
-                            (b.min()[0], b.max()[0])
-                        };
-                        let (cy0, cy1) = crate::plot::clamp_range(
-                            (b.min()[1], b.max()[1]),
-                            (ymin, ymax),
-                        );
-                        mem.set_bounds(egui_plot::PlotBounds::from_min_max(
-                            [cx0, cy0],
-                            [cx1, cy1],
-                        ));
-                        mem.store(ui.ctx(), pid);
-                    }
-                }
-                // Reset-view button (help bar arms the flag — this `Ui`
-                // owns the plot id scope): write the computed fit into
-                // this tab's stored bounds and take over from auto-follow
-                // (a user takeover, like pan/zoom). After snap so the
-                // exact fit wins over the clamp. Retried while memory is
-                // missing, like the follow poke.
-                if self.plot_reset_pending && !borrowed.is_empty() {
-                    let pid = ui.make_persistent_id(egui::Id::new(plot_id.clone()));
-                    if let Some(mut mem) = egui_plot::PlotMemory::load(ui.ctx(), pid) {
-                        mem.auto_bounds = false.into();
-                        mem.set_bounds(egui_plot::PlotBounds::from_min_max(
-                            [xmin, ymin],
-                            [xmax, ymax],
-                        ));
-                        mem.store(ui.ctx(), pid);
-                        self.plot_reset_pending = false;
-                    }
-                }
-                // Draw budget: ~2 points per horizontal pixel (the y-axis
-                // gutter makes this a slight over-estimate, harmless).
-                let target = (ui.available_width() as usize * 2).clamp(512, 8192);
-                // Pending plot export (Save PNG / Copy button): snapshot
-                // the CURRENT view (stored bounds when strict, else the
-                // fit) plus owned series data, then render on a one-shot
-                // worker thread. Crosshair/tooltip never enter: this is a
-                // fresh render, not a screenshot. Direct field writes below
-                // (not `self.toast()`): `done` still borrows rows here.
-                if let Some(job) = self.plot_save_pending.take() {
-                    // Re-entrant click while an export is in flight: drop
-                    // it (both buttons are disabled, so this is a guard).
-                    if !self.png_saving {
-                        let pid = ui.make_persistent_id(egui::Id::new(plot_id.clone()));
-                        let ((vx0, vx1), (vy0, vy1)) =
-                            match egui_plot::PlotMemory::load(ui.ctx(), pid) {
-                                Some(mem) => {
-                                    let b = mem.bounds();
-                                    let (a0, a1) = (b.min()[0], b.max()[0]);
-                                    let (c0, c1) = (b.min()[1], b.max()[1]);
-                                    (
-                                        if a1 > a0 { (a0, a1) } else { (xmin, xmax) },
-                                        if c1 > c0 { (c0, c1) } else { (ymin, ymax) },
-                                    )
-                                }
-                                None => ((xmin, xmax), (ymin, ymax)),
-                            };
-                        // Owned snapshot: the worker outlives this frame and
-                        // cannot borrow `done`/`self.rows`.
-                        let owned: Vec<(String, usize, Vec<f64>)> = done
-                            .iter()
-                            .map(|(n, s, v)| ((*n).to_owned(), *s, (*v).to_vec()))
-                            .collect();
-                        let title = crate::plot::tab_title(kind).to_owned();
-                        let y_label = def.label.to_owned();
-                        let view = ((vx0, vx1), (vy0, vy1));
-                        // Size preset snapshot: a mid-render combobox change
-                        // only affects the next export.
-                        let size = self.plot_size.dims();
-                        match job {
-                            PlotExport::Save { name } => {
-                                // Picker cancelled: silent no-op. Runs on
-                                // the UI thread (native modal); only the
-                                // render moves off.
-                                if let Some(mut path) = rfd::FileDialog::new()
-                                    .set_title("Save plot as PNG")
-                                    .set_file_name(&name)
-                                    .add_filter("PNG image", &["png"])
-                                    .save_file()
-                                {
-                                    path.set_extension("png");
-                                    self.png_saving = true;
-                                    let tx = self.png_tx.clone();
-                                    let ctx = ui.ctx().clone();
-                                    std::thread::spawn(move || {
-                                        let series: Vec<(&str, usize, &[f64])> = owned
-                                            .iter()
-                                            .map(|(n, s, v)| (n.as_str(), *s, v.as_slice()))
-                                            .collect();
-                                        let msg = match crate::plot::export_png(
-                                            &path,
-                                            &title,
-                                            &y_label,
-                                            &series,
-                                            view,
-                                            size,
-                                        ) {
-                                            Ok(()) => {
-                                                log::info!(target: "rfmetrics::plot", "plot saved to {}", path.display());
-                                                PngSaveMsg::Saved { path }
-                                            }
-                                            Err(e) => {
-                                                log::warn!(target: "rfmetrics::plot", "plot save failed: {e}");
-                                                PngSaveMsg::SaveFailed { err: e }
-                                            }
-                                        };
-                                        let _ = tx.send(msg);
-                                        ctx.request_repaint();
-                                    });
-                                }
-                            }
-                            PlotExport::Copy => {
-                                self.png_saving = true;
-                                let tx = self.png_tx.clone();
-                                let ctx = ui.ctx().clone();
-                                std::thread::spawn(move || {
-                                    let series: Vec<(&str, usize, &[f64])> = owned
-                                        .iter()
-                                        .map(|(n, s, v)| (n.as_str(), *s, v.as_slice()))
-                                        .collect();
-                                    let msg = match crate::plot::render_rgba(
-                                        &title, &y_label, &series, view, size,
-                                    ) {
-                                        Ok((w, h, rgba)) => {
-                                            log::info!(target: "rfmetrics::plot", "plot rendered for clipboard ({w}x{h})");
-                                            PngSaveMsg::CopyReady { w, h, rgba }
-                                        }
-                                        Err(e) => {
-                                            log::warn!(target: "rfmetrics::plot", "plot copy failed: {e}");
-                                            PngSaveMsg::CopyFailed { err: e }
-                                        }
-                                    };
-                                    let _ = tx.send(msg);
-                                    ctx.request_repaint();
-                                });
-                            }
-                        }
-                    }
-                }
-                let plot_resp = egui_plot::Plot::new(plot_id)
-                    .x_axis_label("Frames")
-                    .y_axis_label(def.label)
-                    .legend(
-                        egui_plot::Legend::default()
-                            .position(egui_plot::Corner::RightBottom),
-                    )
-                    .default_x_bounds(xmin, xmax)
-                    .default_y_bounds(ymin, ymax)
-                    .show(ui, |plot_ui| {
-                        // Lines decimate from values to ~2 px buckets (fit +
-                        // hover still use full resolution).
-                        // Stable per-file colors: keyed by permanent queue
-                        // slot, so hiding/removing one curve never recolors
-                        // the rest.
-                        for (name, slot, values) in &done {
-                            let thin = crate::plot::decimate_minmax(values, target);
-                            plot_ui.line(
-                                egui_plot::Line::new(*name, thin)
-                                    .color(crate::plot::series_egui_color(*slot)),
-                            );
-                        }
-                        // Hover inspect (Python `_on_hover` parity):
-                        // nearest data point within 30 screen px gets a
-                        // crosshair; the `{name}\nFrame=N, Metric=V.4f`
-                        // text returns to the caller, which draws it as a
-                        // native tooltip (plot-canvas text is tiny and has
-                        // no background). Suppressed while
-                        // panning/zooming, like the ref.
-                        let hovering = plot_ui.response().hovered()
-                            && !plot_ui.response().dragged();
-                        let hover_pos = plot_ui.response().hover_pos();
-                        let ptr = plot_ui.pointer_coordinate();
-                        if let (true, Some(mouse), Some(p)) = (hovering, hover_pos, ptr) {
-                            let to_screen = |fx: f64, fy: f64| {
-                                let sp = plot_ui.screen_from_plot(
-                                    egui_plot::PlotPoint::new(fx, fy),
-                                );
-                                (sp.x, sp.y)
-                            };
-                            if let Some((si, frame, value)) = crate::plot::nearest_hover(
-                                &borrowed,
-                                p.x,
-                                to_screen,
-                                (mouse.x, mouse.y),
-                            ) {
-                                let fx = frame as f64;
-                                plot_ui.vline(egui_plot::VLine::new("", fx));
-                                plot_ui.hline(egui_plot::HLine::new("", value));
-                                return Some(format!(
-                                    "{}\nFrame={frame}, Metric={value:.4}",
-                                    done[si].0
-                                ));
-                            }
-                        }
-                        None
-                    });
-                // Native tooltip at the pointer: readable body text on a
-                // theme background (Python yellow annotation-box parity).
-                if let Some(text) = plot_resp.inner {
-                    egui::Tooltip::for_widget(&plot_resp.response)
-                        .at_pointer()
-                        .gap(12.0)
-                        .show(|ui| {
-                            ui.label(text);
-                        });
-                }
-                // Mirror the main-window toast here (PNG saver results land
-                // while this OS window has focus; the main toast behind it
-                // is invisible). Expiry is owned by the main viewport.
-                if let Some(toast) = self.toast.clone()
-                    && ui.input(|i| i.time) < toast.until
-                {
-                    let corner = ui.max_rect().right_bottom();
-                    let mut frame = egui::Frame::popup(ui.style());
-                    if let Some(outline) = toast.kind.outline() {
-                        frame = frame.stroke(egui::Stroke::new(1.5, outline));
-                    }
-                    egui::Area::new(egui::Id::new("plot_toast"))
-                        .order(egui::Order::Foreground)
-                        .fixed_pos(corner + egui::vec2(-10.0, -10.0))
-                        .pivot(egui::Align2::RIGHT_BOTTOM)
-                        .show(ui.ctx(), |ui| {
-                            frame.show(ui, |ui| {
-                                ui.label(&toast.text);
-                            });
-                        });
-                }
-            });
-        });
-    }
 }
-/// Local wall-clock stamp (`%Y-%m-%d %H:%M:%S`) for results CSV
-/// `DateTime` columns (original `DateTime` parity).
-fn wall_now_string() -> String {
-    jiff::Timestamp::now()
-        .to_zoned(jiff::tz::TimeZone::system())
-        .strftime("%Y-%m-%d %H:%M:%S")
-        .to_string()
-}
-/// Kinds sharing an identical skip set merge into one toast line
-/// ("Skipped 2 with existing PSNR, SSIM: a, b") so filenames print once
-/// instead of repeating per metric. First-seen kind order is kept.
-fn skip_groups(work: &[(MetricKind, Vec<usize>, Vec<String>)]) -> Vec<(Vec<&str>, &Vec<String>)> {
-    let mut groups: Vec<(Vec<&str>, &Vec<String>)> = Vec::new();
-    for (kind, _, skipped) in work {
-        if skipped.is_empty() {
-            continue;
-        }
-        if let Some(g) = groups
-            .iter_mut()
-            .find(|(_, s)| s.as_slice() == skipped.as_slice())
-        {
-            g.0.push(kind.name());
-        } else {
-            groups.push((vec![kind.name()], skipped));
-        }
-    }
-    groups
-}
-
-/// Whether a `Done` cell's stamped options no longer match the current
-/// settings — the same comparison `start_run` uses to decide recompute
-/// vs. skip. Pure so the badge and the partition can never disagree.
-/// Non-`Done` cells are never stale.
-#[allow(clippy::too_many_arguments)]
-fn done_is_stale(
-    kind: MetricKind,
-    cell: &crate::metrics::MetricCell,
-    skip: Option<f64>,
-    clip_dur: Option<f64>,
-    vmaf_cfg: &crate::metrics::vmaf::VmafCfg,
-    scaler: ScaleMethod,
-    fps_mode: crate::metrics::ffmpeg::InputFpsMode,
-    ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt,
-) -> bool {
-    if let crate::metrics::MetricCell::Done {
-        skip: s,
-        clip_dur: c,
-        vmaf_cfg: v,
-        scaler: sc,
-        fps_mode: fm,
-        ref_pixfmt: pf,
-        ..
-    } = cell
-    {
-        !(*s == skip
-            && *c == clip_dur
-            && (kind != MetricKind::Vmaf || v.as_ref() == Some(vmaf_cfg))
-            && (kind.is_ffvship() || *sc == scaler)
-            && (kind.is_ffvship() || *fm == fps_mode)
-            && (kind.is_ffvship() || *pf == ref_pixfmt))
-    } else {
-        false
-    }
-}
-
 /// 1px vertical divider in an exact 3px grid column.
-fn vline(ui: &mut egui::Ui, color: egui::Color32) {
+pub(crate) fn vline(ui: &mut egui::Ui, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 18.0), egui::Sense::hover());
     let x = rect.center().x;
     ui.painter().line_segment(
@@ -4215,7 +932,7 @@ fn vline(ui: &mut egui::Ui, color: egui::Color32) {
 /// UI font has no ▲▼⇅ glyphs (tofu squares). Active direction in text
 /// color, inactive as a faint up+down pair (sortable affordance).
 /// Returns the click response; the caller attaches hover text + action.
-fn sort_mark(ui: &mut egui::Ui, dir: Option<SortDir>) -> egui::Response {
+pub(crate) fn sort_mark(ui: &mut egui::Ui, dir: Option<SortDir>) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         let c = rect.center();
@@ -4253,7 +970,7 @@ fn sort_mark(ui: &mut egui::Ui, dir: Option<SortDir>) -> egui::Response {
 }
 
 /// Panel frame with Python's drag-enter green (#2FA572) while hovered.
-fn panel_frame(ui: &egui::Ui, hovering: bool) -> egui::Frame {
+pub(crate) fn panel_frame(ui: &egui::Ui, hovering: bool) -> egui::Frame {
     let mut frame = egui::Frame::group(ui.style());
     if hovering {
         frame = frame.stroke(egui::Stroke::new(
@@ -4267,15 +984,15 @@ fn panel_frame(ui: &egui::Ui, hovering: bool) -> egui::Frame {
 /// Screenshot green/red fills, muted for the dark theme (light text stays
 /// readable): best green, worst red, all-tied dim yellow. Colors apply only
 /// with 2+ scored rows; a lone result stays uncolored.
-const BEST_FILL: egui::Color32 = egui::Color32::from_rgb(0x2E, 0x6B, 0x3E);
-const WORST_FILL: egui::Color32 = egui::Color32::from_rgb(0x7A, 0x36, 0x36);
-const TIE_FILL: egui::Color32 = egui::Color32::from_rgb(0x6B, 0x5F, 0x2A);
+pub(crate) const BEST_FILL: egui::Color32 = egui::Color32::from_rgb(0x2E, 0x6B, 0x3E);
+pub(crate) const WORST_FILL: egui::Color32 = egui::Color32::from_rgb(0x7A, 0x36, 0x36);
+pub(crate) const TIE_FILL: egui::Color32 = egui::Color32::from_rgb(0x6B, 0x5F, 0x2A);
 /// Cross-format warning tint for Media cells (upstream #47): readable on
 /// the dark default theme without touching layout.
-const WARN_TEXT: egui::Color32 = egui::Color32::from_rgb(0xE5, 0xA6, 0x3B);
+pub(crate) const WARN_TEXT: egui::Color32 = egui::Color32::from_rgb(0xE5, 0xA6, 0x3B);
 
 /// Cell/chip background for a stat rank; `None` = no highlight.
-fn rank_fill(rank: crate::metrics::StatRank) -> Option<egui::Color32> {
+pub(crate) fn rank_fill(rank: crate::metrics::StatRank) -> Option<egui::Color32> {
     match rank {
         crate::metrics::StatRank::Best => Some(BEST_FILL),
         crate::metrics::StatRank::Worst => Some(WORST_FILL),
@@ -4287,7 +1004,7 @@ fn rank_fill(rank: crate::metrics::StatRank) -> Option<egui::Color32> {
 /// Indeterminate bounce position for `Running` cells: triangle wave
 /// `0 → 1 → 0`, one leg per `LEG_S` seconds. Pure (no `Ui`) so tests
 /// cover the ping-pong without a GUI harness.
-fn running_sweep_pos(time_s: f64) -> f32 {
+pub(crate) fn running_sweep_pos(time_s: f64) -> f32 {
     const LEG_S: f64 = 0.7;
     let phase = (time_s / LEG_S).rem_euclid(2.0);
     (if phase < 1.0 { phase } else { 2.0 - phase }) as f32
@@ -4297,7 +1014,7 @@ fn running_sweep_pos(time_s: f64) -> f32 {
 /// translucent `#2FA572` segment bouncing left ↔ right. Painted before
 /// the label so the `Frame: N` text stays on top; driven by the
 /// existing ~10Hz measuring heartbeat, so no extra repaint cost.
-fn paint_running_sweep(ui: &mut egui::Ui) {
+pub(crate) fn paint_running_sweep(ui: &mut egui::Ui) {
     let rect = ui.available_rect_before_wrap();
     if rect.width() <= 0.0 || rect.height() <= 0.0 {
         return;
@@ -4315,199 +1032,13 @@ fn paint_running_sweep(ui: &mut egui::Ui) {
     );
 }
 
-/// Alt+click solo/select-all for the first-column include checkboxes
-/// (egui_plot legend parity): operates on the POST-toggle flags — the
-/// single checkbox already flipped before this runs, and the other rows
-/// are untouched, so "any other checked" is identical pre/post.
-/// Others checked → isolate (only `idx` stays on); no others checked
-/// (was all-off, or was solo on `idx`) → select all. Out-of-range `idx`
-/// is a no-op. Runs only on discrete Alt+clicks, never per frame.
-fn apply_alt_include(includes: &mut [bool], idx: usize) {
-    if idx >= includes.len() {
-        return;
-    }
-    if includes.iter().enumerate().any(|(j, &v)| j != idx && v) {
-        for (j, v) in includes.iter_mut().enumerate() {
-            *v = j == idx;
-        }
-    } else {
-        for v in includes.iter_mut() {
-            *v = true;
-        }
-    }
-}
-
-/// Shift+click range for the first-column include checkboxes
-/// (Gmail-style): the closed `(lo, hi)` span between the anchor row and
-/// the clicked row. The caller fills the span with the clicked box's
-/// post-toggle value. `None` when the anchor or `idx` points past the
-/// queue (stale anchor after row removal). Runs only on discrete
-/// Shift+clicks, never per frame.
-fn shift_include_range(len: usize, anchor: usize, idx: usize) -> Option<(usize, usize)> {
-    if anchor >= len || idx >= len {
-        return None;
-    }
-    Some((anchor.min(idx), anchor.max(idx)))
-}
-
-/// Sortable table columns: queue path + the 7 metric columns (checkbox,
-/// play, and Media info columns stay unsorted).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SortColumn {
-    Path,
-    Metric(MetricKind),
-}
-
-/// Rendered direction: first click lands the initial direction (best
-/// first — ascending names, descending scores, ascending Butteraugli),
-/// second click flips it, third click clears back to insertion order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SortDir {
-    Asc,
-    Desc,
-}
-
-impl SortDir {
-    fn flipped(self) -> SortDir {
-        match self {
-            SortDir::Asc => SortDir::Desc,
-            SortDir::Desc => SortDir::Asc,
-        }
-    }
-}
-
-/// First-click direction per column (best first).
-fn initial_dir(col: SortColumn, stat: crate::metrics::CellStat) -> SortDir {
-    use crate::metrics::CellStat;
-    match col {
-        SortColumn::Path => SortDir::Asc,
-        // Butteraugli is lower-better on every stat, StdDev on every
-        // metric (mirrors the rank logic).
-        SortColumn::Metric(MetricKind::But) => SortDir::Asc,
-        SortColumn::Metric(_) if stat == CellStat::StdDev => SortDir::Asc,
-        SortColumn::Metric(_) => SortDir::Desc,
-    }
-}
-
-/// Header-click cycle: new column starts at its initial direction, a
-/// repeat click flips, a third click clears to insertion order.
-fn cycle_sort(
-    current: Option<(SortColumn, SortDir)>,
-    col: SortColumn,
-    stat: crate::metrics::CellStat,
-) -> Option<(SortColumn, SortDir)> {
-    match current {
-        None => Some((col, initial_dir(col, stat))),
-        Some((c, _)) if c != col => Some((col, initial_dir(col, stat))),
-        Some((_, dir)) if dir == initial_dir(col, stat) => Some((col, dir.flipped())),
-        Some(_) => None,
-    }
-}
-
-/// Scored selector value for sorting; unscored cells (Idle/Running/Error)
-/// sort after every scored row in both directions. Reads the
-/// arrival-cached stats (O(1)); uncached `Done` cells only exist in
-/// tests and compute from the values instead.
-fn sort_stat(row: &QueueRow, kind: MetricKind, stat: crate::metrics::CellStat) -> Option<f64> {
-    use crate::metrics::CellStat;
-    if let Some(s) = &row.cached(kind).stats {
-        return Some(s.value(stat));
-    }
-    match row.cell(kind) {
-        crate::metrics::MetricCell::Done { values, avg, .. } if !values.is_empty() => {
-            Some(match stat {
-                CellStat::Avg => *avg,
-                CellStat::Mean => crate::metrics::mean(values),
-                CellStat::Harm => crate::metrics::harm_mean(values),
-                CellStat::Min => values
-                    .iter()
-                    .copied()
-                    .max_by(|a, b| a.total_cmp(b).reverse())?,
-                CellStat::Max => values.iter().copied().max_by(|a, b| a.total_cmp(b))?,
-                CellStat::StdDev => crate::metrics::pstdev(values),
-                CellStat::P1 | CellStat::P5 | CellStat::P10 | CellStat::P25 => {
-                    let mut s = values.to_vec();
-                    s.sort_by(|a, b| a.total_cmp(b));
-                    let pct = match stat {
-                        CellStat::P1 => 1.0,
-                        CellStat::P5 => 5.0,
-                        CellStat::P10 => 10.0,
-                        CellStat::P25 => 25.0,
-                        _ => 1.0,
-                    };
-                    crate::metrics::percentile(&s, pct)
-                }
-            })
-        }
-        _ => None,
-    }
-}
-
-fn cmp_rows(
-    col: SortColumn,
-    dir: SortDir,
-    a: &QueueRow,
-    b: &QueueRow,
-    stat: crate::metrics::CellStat,
-) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    match col {
-        SortColumn::Path => match dir {
-            SortDir::Asc => a.display.cmp(&b.display),
-            SortDir::Desc => b.display.cmp(&a.display),
-        },
-        SortColumn::Metric(kind) => match (sort_stat(a, kind, stat), sort_stat(b, kind, stat)) {
-            (Some(x), Some(y)) => {
-                let ord = x.total_cmp(&y);
-                match dir {
-                    SortDir::Asc => ord,
-                    SortDir::Desc => ord.reverse(),
-                }
-            }
-            // Scored rows always precede unscored ones, either direction.
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => Ordering::Equal,
-        },
-    }
-}
-
-/// Display order as underlying row indices (identity when unsorted).
-/// Stable sort, so ties keep insertion order. Rebuilt per frame while a
-/// sort is active — trivial at queue sizes, and `None` skips it entirely.
-/// Values come from the arrival-cached stats, so sorting stays O(1) per
-/// comparison no matter which selector is active.
-fn sort_view(
-    rows: &[QueueRow],
-    spec: Option<(SortColumn, SortDir)>,
-    stat: crate::metrics::CellStat,
-) -> Vec<usize> {
-    let mut view: Vec<usize> = (0..rows.len()).collect();
-    if let Some((col, dir)) = spec {
-        view.sort_by(|&a, &b| cmp_rows(col, dir, &rows[a], &rows[b], stat));
-    }
-    view
-}
-
-/// Table metric-column layout, left to right — MUST match the header
-/// checkbox order.
-const METRIC_COLUMNS: [(Option<MetricKind>, &str); 7] = [
-    (Some(MetricKind::Psnr), "PSNR"),
-    (Some(MetricKind::Ssim), "SSIM"),
-    (Some(MetricKind::Vmaf), "VMAF"),
-    (Some(MetricKind::Xpsnr), "XPSNR"),
-    (Some(MetricKind::Ssim2), "SSIM2"),
-    (Some(MetricKind::But), "BUTTER"),
-    (Some(MetricKind::Cvvdp), "CVVDP"),
-];
-
 /// Filter-metric Done tooltip in FFMetrics order: Avg, Exec, Frames, a blank
 /// line, Mean..StdDev, another blank line, then Percentiles. Each comparable
 /// value is chipped by its cross-row rank; Exec time and Frames count are
 /// display-only (no chip).
 /// Plain horizontal rows with content-hugging widths: grids and expanding
 /// layouts feed back into the tooltip auto-size and balloon while hovered.
-fn metric_stat_tooltip(
+pub(crate) fn metric_stat_tooltip(
     ui: &mut egui::Ui,
     title: &str,
     stats: &crate::metrics::DoneStats,
@@ -4544,7 +1075,7 @@ fn metric_stat_tooltip(
 }
 
 /// One tooltip row: fixed label + right-aligned value, chipped when ranked.
-fn tip_stat_row(
+pub(crate) fn tip_stat_row(
     ui: &mut egui::Ui,
     label: impl Into<egui::WidgetText>,
     val: &str,
@@ -4573,47 +1104,8 @@ fn tip_stat_row(
 }
 
 /// Display-only tooltip row (Exec time, Frames count): never chipped.
-fn tip_plain_row(ui: &mut egui::Ui, label: &str, val: &str) {
+pub(crate) fn tip_plain_row(ui: &mut egui::Ui, label: &str, val: &str) {
     tip_stat_row(ui, label, val, crate::metrics::StatRank::Plain);
-}
-
-/// Drop routing decision: pure so the guard rails stay unit-tested.
-/// Mid-run drops are `Blocked` (toast) — the worker snapshotted its jobs
-/// at Start, so ref/queue changes must wait for Stop.
-#[derive(Debug, PartialEq, Eq)]
-enum DropAction {
-    Ignore,
-    Blocked,
-    SetRef {
-        first: std::path::PathBuf,
-        extra: usize,
-    },
-    Queue(Vec<std::path::PathBuf>),
-}
-
-fn route_drop(
-    measuring: bool,
-    is_over_ref: bool,
-    is_over_table: bool,
-    dropped: Vec<std::path::PathBuf>,
-) -> DropAction {
-    if dropped.is_empty() {
-        return DropAction::Ignore;
-    }
-    if measuring {
-        return DropAction::Blocked;
-    }
-    if is_over_ref {
-        let mut iter = dropped.into_iter();
-        // `dropped` is non-empty (checked above), so `first` exists.
-        let first = iter.next().unwrap_or_default();
-        let extra = iter.len();
-        DropAction::SetRef { first, extra }
-    } else if is_over_table {
-        DropAction::Queue(dropped)
-    } else {
-        DropAction::Ignore
-    }
 }
 
 impl eframe::App for RFMetricsApp {
