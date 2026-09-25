@@ -1,8 +1,44 @@
-//! Plot viewport domain: PNG export message types + viewport.
-//!
-//! Extracted from `app.rs` (High 1 split).
+//! Plot viewport domain: `PlotRuntime` state, PNG export message types,
+//! and the metrics viewport (own OS window).
 
 use crate::metrics::ffmpeg::MetricKind;
+use std::sync::mpsc::{Receiver, Sender};
+
+/// Metric plot viewport state (own OS viewport while open).
+/// Session-only, like the Python window — never persisted.
+pub(crate) struct PlotRuntime {
+    /// PSNR plot viewport open (Python `plot["win"]` parity: closing the
+    /// window withdraws it, Plot reopens it).
+    pub(crate) open: bool,
+    /// Selected plot viewport tab (session-only, like the Python window).
+    pub(crate) tab: MetricKind,
+    /// Last measured tab-strip box width, for centering the strip
+    /// (session-only; texts are static so it converges in one frame).
+    pub(crate) tabs_w: f32,
+    /// Grow-only live fit per open tab while any series is running;
+    /// cleared once all settle, so finished graphs fit exactly again.
+    pub(crate) live_fit: Option<(MetricKind, crate::plot::FitBounds)>,
+    /// Follow poke still owed: set when a live phase starts without plot
+    /// memory present (window just opened), retried until it lands.
+    pub(crate) follow_pending: bool,
+    /// Reset-view click still owed: the help-bar `Ui` scopes persistent
+    /// ids differently than the canvas `Ui`, so the button only arms this
+    /// flag and the central panel (plot id scope) executes the poke.
+    /// Retried until plot memory exists, like the follow poke.
+    pub(crate) reset_pending: bool,
+    /// Snap-to-data lock (plot window checkbox, session-only): panning is
+    /// clamped to the first/last frame on x and the plotted min/max on y;
+    /// zooming and in-limits panning stay free.
+    pub(crate) snap: bool,
+    /// Pending plot export (Save PNG / Copy button), executed in the
+    /// central panel where the plot id scope lives.
+    pub(crate) save_pending: Option<PlotExport>,
+    /// Plot export worker channel + busy flag: while `png_saving` both the
+    /// Save PNG and Copy buttons are disabled so 5 s renders can't overlap.
+    pub(crate) png_tx: Sender<PngSaveMsg>,
+    pub(crate) png_rx: Receiver<PngSaveMsg>,
+    pub(crate) png_saving: bool,
+}
 
 /// PNG export result from the one-shot saver thread. The supersampled
 /// render + Lanczos3 downscale blocks for seconds, so it never runs on the
@@ -24,19 +60,24 @@ pub(crate) enum PlotExport {
     Copy,
 }
 
-impl crate::app::RFMetricsApp {
+impl PlotRuntime {
     /// Apply plot export thread results; clears the Saving…/Copying…
     /// lock so the buttons re-arm. Copy pixels land here because
     /// `ctx.copy_image()` must run on the UI thread. Runs on the main
     /// viewport each frame. Returns whether any message arrived.
-    pub(crate) fn drain_png_results(&mut self, ctx: &egui::Context, now: f64) -> bool {
+    pub(crate) fn drain_png_results(
+        &mut self,
+        ctx: &egui::Context,
+        now: f64,
+        ui: &mut crate::app::UiState,
+    ) -> bool {
         let mut activity = false;
         while let Ok(msg) = self.png_rx.try_recv() {
             activity = true;
             self.png_saving = false;
             match msg {
                 PngSaveMsg::Saved { path } => {
-                    self.toast(
+                    ui.toast(
                         now,
                         format!("Plot saved to {}", path.display()),
                         crate::app::ToastKind::Info,
@@ -47,21 +88,21 @@ impl crate::app::RFMetricsApp {
                         [w as usize, h as usize],
                         &rgba,
                     ));
-                    self.toast(
+                    ui.toast(
                         now,
                         "Plot copied to clipboard".to_owned(),
                         crate::app::ToastKind::Info,
                     );
                 }
                 PngSaveMsg::SaveFailed { err } => {
-                    self.toast(
+                    ui.toast(
                         now,
                         format!("Could not save plot: {err}"),
                         crate::app::ToastKind::Error,
                     );
                 }
                 PngSaveMsg::CopyFailed { err } => {
-                    self.toast(
+                    ui.toast(
                         now,
                         format!("Could not copy plot: {err}"),
                         crate::app::ToastKind::Error,
@@ -71,7 +112,9 @@ impl crate::app::RFMetricsApp {
         }
         activity
     }
+}
 
+impl crate::app::RFMetricsApp {
     /// Metric plots in their own OS window (Python `show_plot` parity,
     /// all 7 tabs). Series are read live from `rows` every frame, so the
     /// viewport needs no update plumbing: curves appear on Done data and
@@ -79,7 +122,7 @@ impl crate::app::RFMetricsApp {
     /// `egui_plot` binds (drag pan, box-zoom select, ctrl+scroll zoom,
     /// double-click reset); the Python custom keybinds are out of scope.
     pub(crate) fn show_plots(&mut self, ctx: &egui::Context) {
-        if !self.show_plot {
+        if !self.plots.open {
             return;
         }
         let id = egui::ViewportId::from_hash_of("metrics_plot");
@@ -90,16 +133,16 @@ impl crate::app::RFMetricsApp {
             // Window-manager close withdraws (Python `withdraw` parity);
             // Plot reopens it.
             if vui.input(|i| i.viewport().close_requested()) {
-                self.show_plot = false;
+                self.plots.open = false;
             }
             // While measuring, follow the live job's tab so its growing
             // curve is visible; idle windows stay user-driven.
-            self.plot_tab = crate::plot::follow_live_tab(
-                self.measuring,
-                self.live_kind,
-                self.plot_tab,
+            self.plots.tab = crate::plot::follow_live_tab(
+                self.run.measuring,
+                self.run.live_kind,
+                self.plots.tab,
             );
-            let kind = self.plot_tab;
+            let kind = self.plots.tab;
             let def = crate::plot::plot_def(kind);
             // Finished series plus live `Running` buffers, so curves grow
             // mid-run (a cell is ever only one of the two — no dupes).
@@ -118,7 +161,7 @@ impl crate::app::RFMetricsApp {
             // display name so lines/export use the stable per-file color
             // (hiding or removing one curve never recolors the rest).
             let done: Vec<(&str, usize, &[f64])> = self
-                .rows
+                .queue.rows
                 .iter()
                 .filter(|r| r.include)
                 .filter_map(|r| match r.cell(kind) {
@@ -144,21 +187,21 @@ impl crate::app::RFMetricsApp {
             // one-shot auto-follow poke below (new live phase on this tab,
             // or a still-owed retry).
             let (follow, (xlim, (ymin, ymax))) = if any_running {
-                let grown = match self.plot_live_fit {
+                let grown = match self.plots.live_fit {
                     Some((t, prev)) if t == kind => crate::plot::union_bounds(prev, fresh),
                     _ => fresh,
                 };
-                let follow = !matches!(self.plot_live_fit, Some((t, _)) if t == kind)
-                    || self.plot_follow_pending;
-                self.plot_live_fit = Some((kind, grown));
+                let follow = !matches!(self.plots.live_fit, Some((t, _)) if t == kind)
+                    || self.plots.follow_pending;
+                self.plots.live_fit = Some((kind, grown));
                 (follow, grown)
             } else {
-                self.plot_live_fit = None;
+                self.plots.live_fit = None;
                 // One-shot re-fit owed by a no-live-feed first Done (VMAF):
                 // consumed like the follow retry above, so a stale arm can
                 // never yank a later zoom.
-                let follow = self.plot_follow_pending;
-                self.plot_follow_pending = false;
+                let follow = self.plots.follow_pending;
+                self.plots.follow_pending = false;
                 (follow, fresh)
             };
             // Empty plot (no Done data): axes only, y on the metric
@@ -177,7 +220,7 @@ impl crate::app::RFMetricsApp {
                         )
                         .selectable(false),
                     );
-                    ui.checkbox(&mut self.plot_snap, "Snap to data").on_hover_text(
+                    ui.checkbox(&mut self.plots.snap, "Snap to data").on_hover_text(
                         "Lock panning to the first/last frame and the plotted min/max; zoom and pan inside freely",
                     );
                     // Explicit re-fit (double-click parity): only arms the
@@ -192,36 +235,36 @@ impl crate::app::RFMetricsApp {
                         .on_hover_text("Fit the whole series (same as double-click)")
                         .clicked()
                     {
-                        self.plot_reset_pending = true;
+                        self.plots.reset_pending = true;
                     }
-                    let save_label = if self.png_saving { "Saving…" } else { "Save PNG" };
-                    let save_hover = if self.png_saving {
+                    let save_label = if self.plots.png_saving { "Saving…" } else { "Save PNG" };
+                    let save_hover = if self.plots.png_saving {
                         "Writing PNG in the background…"
                     } else {
                         "Save the current view as a PNG file (legend and axes included)"
                     };
                     let save_btn = ui
-                        .add_enabled(!self.png_saving, egui::Button::new(save_label))
+                        .add_enabled(!self.plots.png_saving, egui::Button::new(save_label))
                         .on_hover_text(save_hover);
-                    if save_btn.clicked() && !self.png_saving {
+                    if save_btn.clicked() && !self.plots.png_saving {
                         // Filename captured now; the export itself runs in
                         // the central panel below, where the plot id scope
                         // (for the current view bounds) lives.
-                        self.plot_save_pending = Some(PlotExport::Save {
-                            name: format!("{}.png", crate::plot::tab_title(self.plot_tab)),
+                        self.plots.save_pending = Some(PlotExport::Save {
+                            name: format!("{}.png", crate::plot::tab_title(self.plots.tab)),
                         });
                     }
-                    let copy_label = if self.png_saving { "Copying…" } else { "Copy" };
-                    let copy_hover = if self.png_saving {
+                    let copy_label = if self.plots.png_saving { "Copying…" } else { "Copy" };
+                    let copy_hover = if self.plots.png_saving {
                         "Rendering plot in the background…"
                     } else {
                         "Copy the current view as an image to the clipboard (legend and axes included)"
                     };
                     let copy_btn = ui
-                        .add_enabled(!self.png_saving, egui::Button::new(copy_label))
+                        .add_enabled(!self.plots.png_saving, egui::Button::new(copy_label))
                         .on_hover_text(copy_hover);
-                    if copy_btn.clicked() && !self.png_saving {
-                        self.plot_save_pending = Some(PlotExport::Copy);
+                    if copy_btn.clicked() && !self.plots.png_saving {
+                        self.plots.save_pending = Some(PlotExport::Copy);
                     }
                 });
             });
@@ -232,7 +275,7 @@ impl crate::app::RFMetricsApp {
                 // input-driven ones — a static plot at 60 fps is pure
                 // main+plot re-render cost, and immediate viewports
                 // repaint the parent together with the child.
-                if self.measuring {
+                if self.run.measuring {
                     ui.ctx().request_repaint();
                 } else {
                     ui.ctx()
@@ -257,10 +300,10 @@ impl crate::app::RFMetricsApp {
                 // reserve the full remaining rect and starve the plot),
                 // but tab texts are static so one measured offset stays
                 // pixel-exact. First frame falls back to the left edge.
-                let pad = if self.plot_tabs_w <= 0.0 {
+                let pad = if self.plots.tabs_w <= 0.0 {
                     0.0
                 } else {
-                    ((ui.available_width() - self.plot_tabs_w) / 2.0).max(0.0)
+                    ((ui.available_width() - self.plots.tabs_w) / 2.0).max(0.0)
                 };
                 ui.horizontal(|ui| {
                     if pad > 0.0 {
@@ -271,15 +314,15 @@ impl crate::app::RFMetricsApp {
                             for tab in MetricKind::ALL {
                                 let title = crate::plot::tab_title(tab);
                                 let btn =
-                                    egui::Button::new(title).selected(self.plot_tab == tab);
+                                    egui::Button::new(title).selected(self.plots.tab == tab);
                                 if ui.add(btn).clicked() {
-                                    self.plot_tab = tab;
+                                    self.plots.tab = tab;
                                 }
                             }
                             ui.end_row();
                         });
                     });
-                    self.plot_tabs_w = frame_resp.response.rect.width();
+                    self.plots.tabs_w = frame_resp.response.rect.width();
                 });
                 // Per-tab plot id shared with the help-bar Reset above.
                 // One-shot live-follow: explicit default bounds seed fresh
@@ -299,9 +342,9 @@ impl crate::app::RFMetricsApp {
                     if let Some(mut mem) = egui_plot::PlotMemory::load(ui.ctx(), pid) {
                         mem.auto_bounds = true.into();
                         mem.store(ui.ctx(), pid);
-                        self.plot_follow_pending = false;
+                        self.plots.follow_pending = false;
                     } else {
-                        self.plot_follow_pending = true;
+                        self.plots.follow_pending = true;
                     }
                 }
                 // Snap-to-data lock: clamp the stored view into the data
@@ -310,7 +353,7 @@ impl crate::app::RFMetricsApp {
                 // plotted min/max — zooming and in-limits panning stay
                 // free. Done on the stored bounds (not via
                 // `set_plot_bounds`) so auto-follow keeps working.
-                if self.plot_snap && !borrowed.is_empty() {
+                if self.plots.snap && !borrowed.is_empty() {
                     let n = borrowed.iter().map(|s| s.len()).max().unwrap_or(0);
                     let pid = ui.make_persistent_id(egui::Id::new(plot_id.clone()));
                     if let Some(mut mem) = egui_plot::PlotMemory::load(ui.ctx(), pid) {
@@ -337,7 +380,7 @@ impl crate::app::RFMetricsApp {
                 // (a user takeover, like pan/zoom). After snap so the
                 // exact fit wins over the clamp. Retried while memory is
                 // missing, like the follow poke.
-                if self.plot_reset_pending && !borrowed.is_empty() {
+                if self.plots.reset_pending && !borrowed.is_empty() {
                     let pid = ui.make_persistent_id(egui::Id::new(plot_id.clone()));
                     if let Some(mut mem) = egui_plot::PlotMemory::load(ui.ctx(), pid) {
                         mem.auto_bounds = false.into();
@@ -346,7 +389,7 @@ impl crate::app::RFMetricsApp {
                             [xmax, ymax],
                         ));
                         mem.store(ui.ctx(), pid);
-                        self.plot_reset_pending = false;
+                        self.plots.reset_pending = false;
                     }
                 }
                 // Draw budget: ~2 points per horizontal pixel (the y-axis
@@ -357,11 +400,11 @@ impl crate::app::RFMetricsApp {
                 // fit) plus owned series data, then render on a one-shot
                 // worker thread. Crosshair/tooltip never enter: this is a
                 // fresh render, not a screenshot. Direct field writes below
-                // (not `self.toast()`): `done` still borrows rows here.
-                if let Some(job) = self.plot_save_pending.take() {
+                // (not `self.ui.toast()`): `done` still borrows rows here.
+                if let Some(job) = self.plots.save_pending.take() {
                     // Re-entrant click while an export is in flight: drop
                     // it (both buttons are disabled, so this is a guard).
-                    if !self.png_saving {
+                    if !self.plots.png_saving {
                         let pid = ui.make_persistent_id(egui::Id::new(plot_id.clone()));
                         let ((vx0, vx1), (vy0, vy1)) =
                             match egui_plot::PlotMemory::load(ui.ctx(), pid) {
@@ -377,7 +420,7 @@ impl crate::app::RFMetricsApp {
                                 None => ((xmin, xmax), (ymin, ymax)),
                             };
                         // Owned snapshot: the worker outlives this frame and
-                        // cannot borrow `done`/`self.rows`.
+                        // cannot borrow `done`/`self.queue.rows`.
                         let owned: Vec<(String, usize, Vec<f64>)> = done
                             .iter()
                             .map(|(n, s, v)| ((*n).to_owned(), *s, (*v).to_vec()))
@@ -387,7 +430,7 @@ impl crate::app::RFMetricsApp {
                         let view = ((vx0, vx1), (vy0, vy1));
                         // Size preset snapshot: a mid-render combobox change
                         // only affects the next export.
-                        let size = self.plot_size.dims();
+                        let size = self.config.view.plot_size.dims();
                         match job {
                             PlotExport::Save { name } => {
                                 // Picker cancelled: silent no-op. Runs on
@@ -400,8 +443,8 @@ impl crate::app::RFMetricsApp {
                                     .save_file()
                                 {
                                     path.set_extension("png");
-                                    self.png_saving = true;
-                                    let tx = self.png_tx.clone();
+                                    self.plots.png_saving = true;
+                                    let tx = self.plots.png_tx.clone();
                                     let ctx = ui.ctx().clone();
                                     std::thread::spawn(move || {
                                         let series: Vec<(&str, usize, &[f64])> = owned
@@ -431,8 +474,8 @@ impl crate::app::RFMetricsApp {
                                 }
                             }
                             PlotExport::Copy => {
-                                self.png_saving = true;
-                                let tx = self.png_tx.clone();
+                                self.plots.png_saving = true;
+                                let tx = self.plots.png_tx.clone();
                                 let ctx = ui.ctx().clone();
                                 std::thread::spawn(move || {
                                     let series: Vec<(&str, usize, &[f64])> = owned
@@ -528,7 +571,7 @@ impl crate::app::RFMetricsApp {
                 // Mirror the main-window toast here (PNG saver results land
                 // while this OS window has focus; the main toast behind it
                 // is invisible). Expiry is owned by the main viewport.
-                if let Some(toast) = self.toast.clone()
+                if let Some(toast) = self.ui.toast.clone()
                     && ui.input(|i| i.time) < toast.until
                 {
                     let corner = ui.max_rect().right_bottom();

@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::metrics::ffmpeg::{
-    FrameDetail, NORM, RunInputs, RunOutcome, ScaleMethod, pump_process, rate_args, scale_filter,
-    setrange_segment, trim_window,
+    FrameDetail, NORM, RunInputs, RunOutcome, ScaleMethod, last_err_line, no_data_outcome,
+    pump_process, rate_args, scale_filter, setrange_segment, trim_window,
 };
 use crate::probe::MediaInfo;
 
@@ -502,13 +502,7 @@ pub fn run_vmaf(job: &RunInputs, cfg: &VmafCfg, on_progress: &(dyn Fn(u64) + Syn
             .rev()
             .map(str::trim)
             .find(|l| !l.is_empty() && is_fatal_line(l))
-            .or_else(|| {
-                pumped
-                    .stderr
-                    .lines()
-                    .map(str::trim)
-                    .rfind(|l| !l.is_empty())
-            })
+            .or_else(|| last_err_line(&pumped.stderr))
             .unwrap_or(&format!("FFmpeg failed with code {:?}", pumped.code))
             .to_owned();
         let dump = crate::metrics::ffmpeg::stderr_tail(
@@ -542,24 +536,14 @@ pub fn run_vmaf(job: &RunInputs, cfg: &VmafCfg, on_progress: &(dyn Fn(u64) + Syn
         _ => (Vec::new(), None, FrameDetail::None),
     };
     if values.is_empty() {
-        let tail = pumped
-            .stderr
-            .lines()
-            .map(str::trim)
-            .rfind(|l| !l.is_empty());
-        let msg = tail.unwrap_or("no VMAF data").to_owned();
-        let dump = crate::metrics::ffmpeg::stderr_tail(
+        return no_data_outcome(
+            "VMAF",
+            dist_path,
+            pumped.code,
+            pumped.exec_s,
             &pumped.stderr,
-            crate::metrics::ffmpeg::STDERR_TAIL_LINES,
+            "no VMAF data",
         );
-        log::warn!(target: "rfmetrics::metric", "VMAF no data for \"{dist_path}\" (exit {:?}, {:.1}s): {msg}\n{dump}", pumped.code, pumped.exec_s);
-        return RunOutcome {
-            values,
-            avg: None,
-            exec_s: pumped.exec_s,
-            error: Some(msg),
-            detail: FrameDetail::None,
-        };
     }
     let show = avg.unwrap_or_else(|| values.iter().sum::<f64>() / values.len() as f64);
     log::info!(

@@ -95,10 +95,12 @@ pub fn viewer_fit(w1: u32, h1: u32, w2: u32, h2: u32) -> (f64, f64, f64, f64) {
     (-hw, hw, -hh, hh)
 }
 
-/// Wipe divider fraction clamped to a draggable interior band so the
-/// line never collapses fully to an edge (keeps a grab target).
+/// Wipe divider fraction clamped to the full 0..1 range so the divider
+/// reaches both edges (whole-picture ref at 0, whole-picture dist at 1).
+/// Out-of-range drags pin to the nearest edge; the +-8px grab rect stays
+/// hoverable at the extremes, so no interior band is needed.
 pub fn clamp_split(v: f32) -> f32 {
-    v.clamp(0.02, 0.98)
+    v.clamp(0.0, 1.0)
 }
 
 /// Wipe geometry for the slider view in plot units: both frames share a

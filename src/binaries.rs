@@ -51,13 +51,10 @@ fn ffvship_back_re() -> &'static Regex {
 #[derive(Debug, Clone)]
 pub struct BinaryInfo {
     pub path: Option<PathBuf>,
-    #[allow(dead_code)]
-    pub origin: &'static str,
     pub short: String,
     pub detail: String,
     /// False when the binary is absent or its `--version` gave nothing
     /// parseable (e.g. wrong-GPU FFVship build). Measure step gates on this.
-    #[allow(dead_code)]
     pub usable: bool,
     /// ffmpeg filter-backed metrics this build can run (`-filters` probe).
     /// Meaningless for FFVship (always empty); fail-open to all four when
@@ -76,7 +73,6 @@ impl BinaryInfo {
     pub fn probing(short: &str) -> Self {
         Self {
             path: None,
-            origin: "",
             short: short.to_owned(),
             detail: "Probing…".to_owned(),
             usable: false,
@@ -336,7 +332,6 @@ pub fn ffmpeg_info() -> BinaryInfo {
         log::warn!(target: "rfmetrics::binaries", "ffmpeg not found (checked next to app and PATH)");
         return BinaryInfo {
             path: None,
-            origin: "",
             short: "ffmpeg not found in PATH".to_owned(),
             detail: "Checked next to app and in PATH, none found".to_owned(),
             usable: false,
@@ -346,7 +341,6 @@ pub fn ffmpeg_info() -> BinaryInfo {
     };
     let missing = |msg: String| BinaryInfo {
         path: Some(exe.clone()),
-        origin,
         short: "ffmpeg not found in PATH".to_owned(),
         detail: msg,
         usable: false,
@@ -388,7 +382,6 @@ pub fn ffmpeg_info() -> BinaryInfo {
     log::info!(target: "rfmetrics::binaries", "ffmpeg filters: {line}");
     BinaryInfo {
         path: Some(exe.clone()),
-        origin,
         short,
         detail: format!("{full}\n{} ({origin})\n{line}", exe.display()),
         usable: true,
@@ -441,7 +434,6 @@ pub fn ffvship_info() -> BinaryInfo {
         log::warn!(target: "rfmetrics::binaries", "FFVship not found (checked next to app, FFVship folder, PATH)");
         return BinaryInfo {
             path: None,
-            origin: "",
             short: "FFVship: not found".to_owned(),
             detail: "Checked next to app, FFVship folder, and in PATH, none found".to_owned(),
             usable: false,
@@ -452,7 +444,6 @@ pub fn ffvship_info() -> BinaryInfo {
     };
     let missing = |msg: String| BinaryInfo {
         path: Some(exe.clone()),
-        origin,
         short: "FFVship: not found".to_owned(),
         detail: msg,
         usable: false,
@@ -471,7 +462,6 @@ pub fn ffvship_info() -> BinaryInfo {
         log::info!(target: "rfmetrics::binaries", "FFVship: {vs} at {} ({origin})", exe.display());
         return BinaryInfo {
             path: Some(exe.clone()),
-            origin,
             short: format!("FFVship: {vs}"),
             detail: format!("{raw}\n{} ({origin})", exe.display()),
             usable: true,
@@ -498,7 +488,6 @@ pub fn ffvship_info() -> BinaryInfo {
     log::warn!(target: "rfmetrics::binaries", "FFVship at {} ({origin}) gave no version (exit {})", exe.display(), exit_str(v.code));
     BinaryInfo {
         path: Some(exe.clone()),
-        origin,
         short: "FFVship: found (version unknown)".to_owned(),
         detail,
         usable: false,

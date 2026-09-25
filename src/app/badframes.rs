@@ -1,9 +1,74 @@
-//! Bad-frames viewer domain: worker message + plan types.
-//!
-//! Extracted from `app.rs` (High 1 split). Viewer/export method bodies
-//! move here in a follow-up step.
+//! Bad-frames domain: `BadframesRuntime` state plus the extract worker,
+//! viewer viewport, and export. Worker threads only `send`; the UI thread
+//! drains via `try_recv`.
 
 use crate::metrics::ffmpeg::MetricKind;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::{Receiver, Sender};
+
+/// Bad-frames extract + viewer state (own OS viewport while open).
+/// Session-only, never persisted.
+pub(crate) struct BadframesRuntime {
+    /// Bad-frames worker channel + state: `busy` while accurate seeks
+    /// run, `done`/`total` for the button label, `abort` for
+    /// Stop-between-frames (mid-seek ffmpeg is bounded by
+    /// `BADFRAME_TIMEOUT`, so no child kill needed).
+    pub(crate) tx: Sender<BadframeMsg>,
+    pub(crate) rx: Receiver<BadframeMsg>,
+    pub(crate) busy: bool,
+    pub(crate) done: usize,
+    pub(crate) total: usize,
+    pub(crate) abort: Arc<AtomicBool>,
+    /// Pending bad-frames summary, toasted at the next UI frame like
+    /// `csv_report` above. `(files_written, error_strings)`.
+    pub(crate) report: Option<(usize, Vec<String>)>,
+    /// Bad-frames viewer window (own OS viewport like the plot window).
+    /// Frames live as tmp PNGs (`tmp`); only the visible dist/ref
+    /// pair is uploaded as textures, keyed by `tex_key`.
+    pub(crate) open: bool,
+    pub(crate) tab: MetricKind,
+    /// Selected queue-row key for the viewer (None = auto-pick first).
+    pub(crate) file: Option<String>,
+    /// Position in the worst-N list for `(file, tab)`.
+    pub(crate) frame_pos: usize,
+    /// One-frame view reset for the viewer plots (Reset view button /
+    /// selection change): applies `Plot::reset()`, which also clears the
+    /// shared link-group bounds a fresh plot id alone would keep.
+    pub(crate) reset_once: bool,
+    /// Last selection the viewer plots were fit for; a change arms
+    /// `reset_once` so every tab/file/frame lands fit.
+    pub(crate) view_key: Option<(MetricKind, String, usize)>,
+    /// Overlay compare mode: false = side-by-side plots (default),
+    /// true = single wipe view with a draggable divider.
+    pub(crate) slider: bool,
+    /// Wipe divider fraction (0..1, ref on the left). Drag-only.
+    pub(crate) split: f32,
+    /// Last-frame divider screen x for pre-show pan suppression
+    /// (NaN until the wipe plot paints once).
+    pub(crate) div_sx: f32,
+    /// Divider drag in progress: keeps plot pan off while held.
+    pub(crate) div_drag: bool,
+    pub(crate) tex_dist: Option<egui::TextureHandle>,
+    pub(crate) tex_ref: Option<egui::TextureHandle>,
+    pub(crate) tex_key: Option<(String, MetricKind, usize)>,
+    /// Changed-pixels heatmap toggle + cached diff overlay texture for the
+    /// visible pair (ref-sized purple, alpha ∝ change, max 50%).
+    /// Session-only, never persisted.
+    pub(crate) show_diff: bool,
+    pub(crate) tex_diff: Option<egui::TextureHandle>,
+    /// Tmp dir holding this run's viewer PNGs (per-process).
+    pub(crate) tmp: std::path::PathBuf,
+    /// Close requested while a bad-frames worker runs: tmp deletion waits
+    /// for its `Finished` drain (the worker reads/writes tmp until then).
+    /// Session-only, never persisted.
+    pub(crate) tmp_cleanup_pending: bool,
+    /// All tmp PNGs from the last Extract run.
+    pub(crate) files: Vec<std::path::PathBuf>,
+    /// In-flight export summary (copies done, worker PNGs pending).
+    /// Session-only, never persisted.
+    pub(crate) export_pending: Option<BadframeExportPending>,
+}
 
 /// Progress + summary from the bad-frames worker (one thread, sequential
 /// accurate seeks; abort stops between frames).
@@ -93,20 +158,27 @@ impl crate::app::RFMetricsApp {
     /// the thread never touches UI state). Current viewer tab only.
     pub(crate) fn badframe_jobs_for(&self, kind: MetricKind) -> Option<BadframePlan> {
         use crate::metrics::badframes;
-        let ffmpeg = self.ffmpeg.path.clone()?;
-        let ref_path = self.ref_path.clone();
-        if ref_path.trim().is_empty() || !std::path::Path::new(&ref_path).is_file() {
+        let ffmpeg = self.binaries.ffmpeg.path.clone()?;
+        let ref_path = self.config.reference.path.clone();
+        if !crate::probe::path_usable(&ref_path) {
             return None;
         }
-        let skip = Self::trim_opt(&self.skip)?.unwrap_or(0.0);
+        let skip = crate::app::config::trim_opt(&self.config.reference.skip)?.unwrap_or(0.0);
         let ref_fps = self
-            .ref_info_data
+            .ref_probe
+            .info_data
             .as_ref()
             .and_then(|m| m.fps)
             .filter(|f| *f > 0.0);
-        let n: usize = self.badframes_count.parse().ok().filter(|n| *n >= 1)?;
+        let n: usize = self
+            .config
+            .export
+            .badframes_count
+            .parse()
+            .ok()
+            .filter(|n| *n >= 1)?;
         let mut jobs: Vec<BadframeJob> = Vec::new();
-        for row in &self.rows {
+        for row in &self.queue.rows {
             if !row.include {
                 continue;
             }
@@ -140,13 +212,14 @@ impl crate::app::RFMetricsApp {
             ffmpeg,
             ref_path,
             ref_fps: ref_fps.unwrap_or_else(|| {
-                self.rows
+                self.queue
+                    .rows
                     .iter()
                     .filter_map(|r| r.info.as_ref().and_then(|m| m.fps))
                     .next()
                     .unwrap_or(30.0)
             }),
-            tmp: self.badframe_tmp.clone(),
+            tmp: self.badframes.tmp.clone(),
             jobs,
         })
     }
@@ -155,16 +228,17 @@ impl crate::app::RFMetricsApp {
     /// offset)`, worst-first. Empty when the cell isn't Done or fps unknown.
     pub(crate) fn badframe_picks(&self, kind: MetricKind, key: &str) -> Vec<(usize, f64, f64)> {
         use crate::metrics::badframes;
-        let row = match self.rows.iter().find(|r| r.key == key) {
+        let row = match self.queue.rows.iter().find(|r| r.key == key) {
             Some(r) => r,
             None => return Vec::new(),
         };
-        let skip = match Self::trim_opt(&self.skip) {
+        let skip = match crate::app::config::trim_opt(&self.config.reference.skip) {
             Some(v) => v.unwrap_or(0.0),
             None => return Vec::new(),
         };
         let ref_fps = self
-            .ref_info_data
+            .ref_probe
+            .info_data
             .as_ref()
             .and_then(|m| m.fps)
             .filter(|f| *f > 0.0);
@@ -179,6 +253,8 @@ impl crate::app::RFMetricsApp {
             _ => return Vec::new(),
         };
         let n: usize = self
+            .config
+            .export
             .badframes_count
             .parse()
             .ok()
@@ -196,7 +272,7 @@ impl crate::app::RFMetricsApp {
 
     /// Queue rows with a finished cell for the viewer tab (file picker).
     pub(crate) fn badframe_files_for(&self, kind: MetricKind) -> Vec<(String, String)> {
-        self.rows
+        self.queue.rows
             .iter()
             .filter(|r| r.include)
             .filter(|r| {
@@ -213,12 +289,12 @@ impl crate::app::RFMetricsApp {
     /// at most one single-frame extract.
     pub(crate) fn start_badframes(&mut self, now: f64) {
         use std::sync::atomic::Ordering;
-        if self.measuring || self.badframes_busy {
+        if self.run.measuring || self.badframes.busy {
             return;
         }
-        let kind = self.badframe_tab;
+        let kind = self.badframes.tab;
         let Some(plan) = self.badframe_jobs_for(kind) else {
-            self.toast(
+            self.ui.toast(
                 now,
                 "Nothing to export: run a metric first".to_owned(),
                 crate::app::ToastKind::Info,
@@ -227,7 +303,7 @@ impl crate::app::RFMetricsApp {
         };
         let _ = std::fs::remove_dir_all(&plan.tmp);
         if let Err(e) = std::fs::create_dir_all(&plan.tmp) {
-            self.toast(
+            self.ui.toast(
                 now,
                 format!("Could not create tmp dir: {e}"),
                 crate::app::ToastKind::Error,
@@ -235,12 +311,12 @@ impl crate::app::RFMetricsApp {
             return;
         }
         let total = plan.jobs.len() * 2;
-        self.badframes_busy = true;
-        self.badframe_done = 0;
-        self.badframe_total = total;
-        self.badframe_abort.store(false, Ordering::SeqCst);
-        let tx = self.badframe_tx.clone();
-        let abort = self.badframe_abort.clone();
+        self.badframes.busy = true;
+        self.badframes.done = 0;
+        self.badframes.total = total;
+        self.badframes.abort.store(false, Ordering::SeqCst);
+        let tx = self.badframes.tx.clone();
+        let abort = self.badframes.abort.clone();
         std::thread::spawn(move || {
             use crate::metrics::badframes;
             let mut ok = 0usize;
@@ -292,10 +368,10 @@ impl crate::app::RFMetricsApp {
     /// Stop an in-flight bad-frames export (checked between seeks).
     pub(crate) fn stop_badframes(&mut self) {
         use std::sync::atomic::Ordering;
-        if !self.badframes_busy {
+        if !self.badframes.busy {
             return;
         }
-        self.badframe_abort.store(true, Ordering::SeqCst);
+        self.badframes.abort.store(true, Ordering::SeqCst);
         log::info!(target: "rfmetrics::app", "bad-frames aborted by user");
     }
 
@@ -305,18 +381,19 @@ impl crate::app::RFMetricsApp {
     /// Extract worker.
     pub(crate) fn export_pairs(&self, scope: BadframeExportScope) -> Vec<BadframeExportPair> {
         let kinds: Vec<MetricKind> = match scope {
-            BadframeExportScope::Pair | BadframeExportScope::Metric => vec![self.badframe_tab],
+            BadframeExportScope::Pair | BadframeExportScope::Metric => vec![self.badframes.tab],
             BadframeExportScope::All => MetricKind::ALL.to_vec(),
         };
         let ref_fps = self
-            .ref_info_data
+            .ref_probe
+            .info_data
             .as_ref()
             .and_then(|m| m.fps)
             .filter(|f| *f > 0.0);
         let mut out = Vec::new();
         for kind in kinds {
             let keys: Vec<String> = match scope {
-                BadframeExportScope::Pair => self.badframe_file.clone().into_iter().collect(),
+                BadframeExportScope::Pair => self.badframes.file.clone().into_iter().collect(),
                 BadframeExportScope::Metric | BadframeExportScope::All => self
                     .badframe_files_for(kind)
                     .into_iter()
@@ -324,13 +401,13 @@ impl crate::app::RFMetricsApp {
                     .collect(),
             };
             for key in keys {
-                let Some(row) = self.rows.iter().find(|r| r.key == key) else {
+                let Some(row) = self.queue.rows.iter().find(|r| r.key == key) else {
                     continue;
                 };
                 let picks = self.badframe_picks(kind, &key);
                 let frames: Vec<(usize, f64)> = match scope {
                     BadframeExportScope::Pair => picks
-                        .get(self.badframe_frame_pos)
+                        .get(self.badframes.frame_pos)
                         .map(|(f, _, o)| (*f, *o))
                         .into_iter()
                         .collect(),
@@ -362,7 +439,7 @@ impl crate::app::RFMetricsApp {
     /// Toast an export outcome (PNG counts; worker PNGs + tmp copies).
     pub(crate) fn toast_export(&mut self, now: f64, saved: usize, failed: Vec<String>, dest: &str) {
         if failed.is_empty() {
-            self.toast(
+            self.ui.toast(
                 now,
                 format!("Exported {saved} PNGs to {dest}"),
                 crate::app::ToastKind::Info,
@@ -370,7 +447,7 @@ impl crate::app::RFMetricsApp {
         } else {
             let first = failed[0].clone();
             let s = if failed.len() == 1 { "" } else { "s" };
-            self.toast(
+            self.ui.toast(
                 now,
                 format!(
                     "Export: {saved} saved, {} failed{s} ({first}) → {dest}",
@@ -387,20 +464,20 @@ impl crate::app::RFMetricsApp {
     /// tmp untouched). Empty browse line = beside each distorted file.
     pub(crate) fn start_export(&mut self, scope: BadframeExportScope, now: f64) {
         use std::sync::atomic::Ordering;
-        if self.measuring || self.badframes_busy {
+        if self.run.measuring || self.badframes.busy {
             return;
         }
-        let Some(ffmpeg) = self.ffmpeg.path.clone() else {
-            self.toast(
+        let Some(ffmpeg) = self.binaries.ffmpeg.path.clone() else {
+            self.ui.toast(
                 now,
                 "Export needs ffmpeg".to_owned(),
                 crate::app::ToastKind::Error,
             );
             return;
         };
-        let ref_path = self.ref_path.clone();
-        if ref_path.trim().is_empty() || !std::path::Path::new(&ref_path).is_file() {
-            self.toast(
+        let ref_path = self.config.reference.path.clone();
+        if !crate::probe::path_usable(&ref_path) {
+            self.ui.toast(
                 now,
                 "Export needs the reference file".to_owned(),
                 crate::app::ToastKind::Error,
@@ -409,18 +486,18 @@ impl crate::app::RFMetricsApp {
         }
         let pairs = self.export_pairs(scope);
         if pairs.is_empty() {
-            self.toast(
+            self.ui.toast(
                 now,
                 "Nothing to export: run a metric first".to_owned(),
                 crate::app::ToastKind::Info,
             );
             return;
         }
-        let export_dir = self.badframes_export_dir.clone();
+        let export_dir = self.config.export.badframes_export_dir.clone();
         if !export_dir.trim().is_empty()
             && let Err(e) = std::fs::create_dir_all(&export_dir)
         {
-            self.toast(
+            self.ui.toast(
                 now,
                 format!("Could not create export folder: {e}"),
                 crate::app::ToastKind::Error,
@@ -428,12 +505,14 @@ impl crate::app::RFMetricsApp {
             return;
         }
         let ref_fps = self
-            .ref_info_data
+            .ref_probe
+            .info_data
             .as_ref()
             .and_then(|m| m.fps)
             .filter(|f| *f > 0.0)
             .unwrap_or_else(|| {
-                self.rows
+                self.queue
+                    .rows
                     .iter()
                     .filter_map(|r| r.info.as_ref().and_then(|m| m.fps))
                     .next()
@@ -444,13 +523,13 @@ impl crate::app::RFMetricsApp {
         for p in pairs {
             let name = p.kind.name();
             let tmp_d = crate::metrics::badframes::tmp_dest_for(
-                &self.badframe_tmp,
+                &self.badframes.tmp,
                 &p.dist_path,
                 name,
                 p.frame,
             );
             let tmp_r = crate::metrics::badframes::tmp_dest_ref_for(
-                &self.badframe_tmp,
+                &self.badframes.tmp,
                 &p.dist_path,
                 name,
                 p.frame,
@@ -508,17 +587,17 @@ impl crate::app::RFMetricsApp {
             jobs,
         };
         let total = copied.len() * 2 + plan.jobs.len() * 2;
-        self.badframes_busy = true;
-        self.badframe_done = 0;
-        self.badframe_total = total;
-        self.badframe_abort.store(false, Ordering::SeqCst);
-        self.badframe_export_pending = Some(BadframeExportPending {
+        self.badframes.busy = true;
+        self.badframes.done = 0;
+        self.badframes.total = total;
+        self.badframes.abort.store(false, Ordering::SeqCst);
+        self.badframes.export_pending = Some(BadframeExportPending {
             copied: 0,
             failed: Vec::new(),
             dest_note,
         });
-        let tx = self.badframe_tx.clone();
-        let abort = self.badframe_abort.clone();
+        let tx = self.badframes.tx.clone();
+        let abort = self.badframes.abort.clone();
         std::thread::spawn(move || {
             use crate::metrics::badframes;
             let mut ok = 0usize;
@@ -567,33 +646,33 @@ impl crate::app::RFMetricsApp {
     /// runs toast the combined copy + extract outcome instead.
     pub(crate) fn drain_badframe_results(&mut self, now: f64) -> bool {
         let mut activity = false;
-        while let Ok(msg) = self.badframe_rx.try_recv() {
+        while let Ok(msg) = self.badframes.rx.try_recv() {
             activity = true;
             match msg {
                 BadframeMsg::Progress { done, total } => {
-                    self.badframe_done = done;
-                    self.badframe_total = total;
+                    self.badframes.done = done;
+                    self.badframes.total = total;
                 }
                 BadframeMsg::Finished { ok, errors } => {
-                    self.badframes_busy = false;
-                    self.badframe_done = 0;
-                    self.badframe_total = 0;
+                    self.badframes.busy = false;
+                    self.badframes.done = 0;
+                    self.badframes.total = 0;
                     // Deferred close cleanup: the window closed mid-run and
                     // tmp stayed alive for the worker until now (`Finished`
                     // is its last send, so nothing touches tmp afterwards).
-                    if self.badframe_tmp_cleanup_pending {
-                        self.badframe_tmp_cleanup_pending = false;
-                        let _ = std::fs::remove_dir_all(&self.badframe_tmp);
+                    if self.badframes.tmp_cleanup_pending {
+                        self.badframes.tmp_cleanup_pending = false;
+                        let _ = std::fs::remove_dir_all(&self.badframes.tmp);
                     }
                     // Export extracts went straight to the destination:
                     // toast the combined outcome, viewer tmp untouched.
-                    if let Some(pending) = self.badframe_export_pending.take() {
+                    if let Some(pending) = self.badframes.export_pending.take() {
                         let mut failed = pending.failed;
                         failed.extend(errors);
                         self.toast_export(now, pending.copied + ok, failed, &pending.dest_note);
                         continue;
                     }
-                    self.badframe_files = std::fs::read_dir(&self.badframe_tmp)
+                    self.badframes.files = std::fs::read_dir(&self.badframes.tmp)
                         .map(|entries| {
                             let mut v: Vec<std::path::PathBuf> = entries
                                 .filter_map(|e| e.ok().map(|e| e.path()))
@@ -603,30 +682,31 @@ impl crate::app::RFMetricsApp {
                             v
                         })
                         .unwrap_or_default();
-                    self.badframe_tex_dist = None;
-                    self.badframe_tex_ref = None;
-                    self.badframe_tex_diff = None;
-                    self.badframe_tex_key = None;
-                    self.badframe_frame_pos = 0;
+                    self.badframes.tex_dist = None;
+                    self.badframes.tex_ref = None;
+                    self.badframes.tex_diff = None;
+                    self.badframes.tex_key = None;
+                    self.badframes.frame_pos = 0;
                     if self
-                        .badframe_file
+                        .badframes
+                        .file
                         .as_ref()
-                        .is_none_or(|k| !self.rows.iter().any(|r| &r.key == k))
+                        .is_none_or(|k| !self.queue.rows.iter().any(|r| &r.key == k))
                     {
-                        self.badframe_file = self
-                            .badframe_files_for(self.badframe_tab)
+                        self.badframes.file = self
+                            .badframe_files_for(self.badframes.tab)
                             .into_iter()
                             .next()
                             .map(|(k, _)| k);
                     }
-                    self.badframe_report = Some((ok, errors));
+                    self.badframes.report = Some((ok, errors));
                 }
             }
         }
-        if let Some((ok, errors)) = self.badframe_report.take() {
+        if let Some((ok, errors)) = self.badframes.report.take() {
             if errors.is_empty() {
                 let s = if ok == 1 { "" } else { "s" };
-                self.toast(
+                self.ui.toast(
                     now,
                     format!("Extracted {ok} bad-frame PNG{s}"),
                     crate::app::ToastKind::Info,
@@ -634,7 +714,7 @@ impl crate::app::RFMetricsApp {
             } else {
                 let first = errors[0].clone();
                 let s = if errors.len() == 1 { "" } else { "s" };
-                self.toast(
+                self.ui.toast(
                     now,
                     format!(
                         "Bad frames: {ok} saved, {} failed{s} ({first})",
@@ -651,21 +731,21 @@ impl crate::app::RFMetricsApp {
     /// changed. Full resolution (inspection needs detail); only the pair
     /// plus the optional diff overlay are ever cached.
     pub(crate) fn refresh_viewer_textures(&mut self, ctx: &egui::Context) {
-        let key = match &self.badframe_file {
-            Some(k) => (k.clone(), self.badframe_tab, self.badframe_frame_pos),
+        let key = match &self.badframes.file {
+            Some(k) => (k.clone(), self.badframes.tab, self.badframes.frame_pos),
             None => return,
         };
-        if self.badframe_tex_key.as_ref() == Some(&key) {
+        if self.badframes.tex_key.as_ref() == Some(&key) {
             return;
         }
-        self.badframe_tex_dist = None;
-        self.badframe_tex_ref = None;
-        self.badframe_tex_diff = None;
+        self.badframes.tex_dist = None;
+        self.badframes.tex_ref = None;
+        self.badframes.tex_diff = None;
         let picks = self.badframe_picks(key.1, &key.0);
         let Some((frame, _, _)) = picks.get(key.2).copied() else {
             return;
         };
-        let row_path = match self.rows.iter().find(|r| r.key == key.0) {
+        let row_path = match self.queue.rows.iter().find(|r| r.key == key.0) {
             Some(r) => r.path.clone(),
             None => return,
         };
@@ -691,27 +771,27 @@ impl crate::app::RFMetricsApp {
             )
         };
         let dist_p = crate::metrics::badframes::tmp_dest_for(
-            &self.badframe_tmp,
+            &self.badframes.tmp,
             &row_path,
             key.1.name(),
             frame,
         );
         let ref_p = crate::metrics::badframes::tmp_dest_ref_for(
-            &self.badframe_tmp,
+            &self.badframes.tmp,
             &row_path,
             key.1.name(),
             frame,
         );
         let dist_img = decode(dist_p.clone());
         let ref_img = decode(ref_p.clone());
-        self.badframe_tex_dist = dist_img
+        self.badframes.tex_dist = dist_img
             .as_ref()
             .map(|img| upload(dist_p.to_string_lossy().into_owned(), img));
-        self.badframe_tex_ref = ref_img
+        self.badframes.tex_ref = ref_img
             .as_ref()
             .map(|img| upload(ref_p.to_string_lossy().into_owned(), img));
-        self.badframe_tex_diff = match (&dist_img, &ref_img) {
-            (Some(d), Some(r)) if self.badframe_show_diff => {
+        self.badframes.tex_diff = match (&dist_img, &ref_img) {
+            (Some(d), Some(r)) if self.badframes.show_diff => {
                 let overlay = crate::metrics::badframes::changed_overlay(d, r);
                 Some(upload(
                     format!("{}-{}-{frame}-diff", key.0, key.1.name()),
@@ -720,7 +800,7 @@ impl crate::app::RFMetricsApp {
             }
             _ => None,
         };
-        self.badframe_tex_key = Some(key);
+        self.badframes.tex_key = Some(key);
     }
 
     /// Bad-frames viewer in its own OS window (mirrors `show_plots`):
@@ -732,22 +812,22 @@ impl crate::app::RFMetricsApp {
     /// drains (no abort: an export launched from the viewer may be using
     /// tmp, and the run is bounded anyway).
     pub(crate) fn close_badframes(&mut self) {
-        self.show_badframes = false;
-        if self.badframes_busy {
-            self.badframe_tmp_cleanup_pending = true;
+        self.badframes.open = false;
+        if self.badframes.busy {
+            self.badframes.tmp_cleanup_pending = true;
         } else {
             // Best-effort tmp cleanup; save-all must happen while open.
-            let _ = std::fs::remove_dir_all(&self.badframe_tmp);
+            let _ = std::fs::remove_dir_all(&self.badframes.tmp);
         }
-        self.badframe_files.clear();
-        self.badframe_tex_dist = None;
-        self.badframe_tex_ref = None;
-        self.badframe_tex_diff = None;
-        self.badframe_tex_key = None;
+        self.badframes.files.clear();
+        self.badframes.tex_dist = None;
+        self.badframes.tex_ref = None;
+        self.badframes.tex_diff = None;
+        self.badframes.tex_key = None;
     }
 
     pub(crate) fn show_badframes(&mut self, ctx: &egui::Context) {
-        if !self.show_badframes {
+        if !self.badframes.open {
             return;
         }
         let id = egui::ViewportId::from_hash_of("badframes_view");
@@ -760,19 +840,19 @@ impl crate::app::RFMetricsApp {
                 return;
             }
             let vnow = vui.input(|i| i.time);
-            let kind = self.badframe_tab;
+            let kind = self.badframes.tab;
             // Tab strip (all 7, like the plot window).
             egui::Panel::top("bf_tabs").show(vui, |ui| {
                 ui.horizontal(|ui| {
                     for tab in MetricKind::ALL {
                         let title = crate::plot::tab_title(tab);
                         if ui
-                            .add(egui::Button::new(title).selected(self.badframe_tab == tab))
+                            .add(egui::Button::new(title).selected(self.badframes.tab == tab))
                             .clicked()
                         {
-                            self.badframe_tab = tab;
-                            self.badframe_frame_pos = 0;
-                            self.badframe_tex_key = None;
+                            self.badframes.tab = tab;
+                            self.badframes.frame_pos = 0;
+                            self.badframes.tex_key = None;
                         }
                     }
                 });
@@ -780,7 +860,7 @@ impl crate::app::RFMetricsApp {
             // Runner row: extract current tab / stop + progress.
             egui::Panel::top("bf_run").show(vui, |ui| {
                 ui.horizontal(|ui| {
-                    if self.badframes_busy {
+                    if self.badframes.busy {
                         if ui
                             .add_sized([110.0, 24.0], egui::Button::new("Stop"))
                             .clicked()
@@ -789,17 +869,17 @@ impl crate::app::RFMetricsApp {
                         }
                         ui.label(format!(
                             "{} {}/{}",
-                            if self.badframe_export_pending.is_some() {
+                            if self.badframes.export_pending.is_some() {
                                 "Exporting"
                             } else {
                                 "Extracting"
                             },
-                            self.badframe_done,
-                            self.badframe_total
+                            self.badframes.done,
+                            self.badframes.total
                         ));
                     } else {
                         let can_run =
-                            self.ffmpeg.path.is_some() && !self.badframe_files_for(kind).is_empty();
+                            self.binaries.ffmpeg.path.is_some() && !self.badframe_files_for(kind).is_empty();
                         if ui
                             .add_enabled_ui(can_run, |ui| {
                                 ui.add_sized([110.0, 24.0], egui::Button::new("Extract"))
@@ -818,15 +898,15 @@ impl crate::app::RFMetricsApp {
             });
             // File + frame controls.
             let files = self.badframe_files_for(kind);
-            if !files.iter().any(|(k, _)| Some(k) == self.badframe_file.as_ref()) {
-                self.badframe_file = files.first().map(|(k, _)| k.clone());
-                self.badframe_frame_pos = 0;
-                self.badframe_tex_key = None;
+            if !files.iter().any(|(k, _)| Some(k) == self.badframes.file.as_ref()) {
+                self.badframes.file = files.first().map(|(k, _)| k.clone());
+                self.badframes.frame_pos = 0;
+                self.badframes.tex_key = None;
             }
             egui::Panel::top("bf_pick").show(vui, |ui| {
                 ui.horizontal(|ui| {
                     let current = self
-                        .badframe_file
+                        .badframes.file
                         .as_ref()
                         .and_then(|k| files.iter().find(|(fk, _)| fk == k))
                         .map(|(_, d)| d.clone())
@@ -836,46 +916,46 @@ impl crate::app::RFMetricsApp {
                         .show_ui(ui, |ui| {
                             for (k, d) in &files {
                                 let _ = ui.selectable_value(
-                                    self.badframe_file.get_or_insert_with(|| k.clone()),
+                                    self.badframes.file.get_or_insert_with(|| k.clone()),
                                     k.clone(),
                                     d.as_str(),
                                 );
                             }
                         });
                     let picks = self
-                        .badframe_file
+                        .badframes.file
                         .as_ref()
                         .map(|k| self.badframe_picks(kind, k))
                         .unwrap_or_default();
                     let max_pos = picks.len().saturating_sub(1);
-                    if self.badframe_frame_pos > max_pos {
-                        self.badframe_frame_pos = max_pos;
-                        self.badframe_tex_key = None;
+                    if self.badframes.frame_pos > max_pos {
+                        self.badframes.frame_pos = max_pos;
+                        self.badframes.tex_key = None;
                     }
-                    if ui.add_enabled(self.badframe_frame_pos > 0, egui::Button::new("◀")).clicked() {
-                        self.badframe_frame_pos = self.badframe_frame_pos.saturating_sub(1);
-                        self.badframe_tex_key = None;
+                    if ui.add_enabled(self.badframes.frame_pos > 0, egui::Button::new("◀")).clicked() {
+                        self.badframes.frame_pos = self.badframes.frame_pos.saturating_sub(1);
+                        self.badframes.tex_key = None;
                     }
-                    let mut pos = self.badframe_frame_pos;
+                    let mut pos = self.badframes.frame_pos;
                     if !picks.is_empty() {
                         ui.add(
                             egui::Slider::new(&mut pos, 0..=max_pos)
                                 .show_value(false)
                                 .trailing_fill(true),
                         );
-                        if pos != self.badframe_frame_pos {
-                            self.badframe_frame_pos = pos;
-                            self.badframe_tex_key = None;
+                        if pos != self.badframes.frame_pos {
+                            self.badframes.frame_pos = pos;
+                            self.badframes.tex_key = None;
                         }
                     }
                     if ui
-                        .add_enabled(self.badframe_frame_pos < max_pos, egui::Button::new("▶"))
+                        .add_enabled(self.badframes.frame_pos < max_pos, egui::Button::new("▶"))
                         .clicked()
                     {
-                        self.badframe_frame_pos = self.badframe_frame_pos.saturating_add(1).min(max_pos);
-                        self.badframe_tex_key = None;
+                        self.badframes.frame_pos = self.badframes.frame_pos.saturating_add(1).min(max_pos);
+                        self.badframes.tex_key = None;
                     }
-                    if let Some((frame, value, _)) = picks.get(self.badframe_frame_pos).copied() {
+                    if let Some((frame, value, _)) = picks.get(self.badframes.frame_pos).copied() {
                         ui.label(format!("Frame {frame} ({value:.4})"));
                     }
                     if ui
@@ -883,23 +963,23 @@ impl crate::app::RFMetricsApp {
                         .on_hover_text("Fit both images (zoom/pan stay linked)")
                         .clicked()
                     {
-                        self.badframe_reset_once = true;
+                        self.badframes.reset_once = true;
                     }
                     ui.separator();
-                    ui.selectable_value(&mut self.badframe_slider, false, "Side")
+                    ui.selectable_value(&mut self.badframes.slider, false, "Side")
                         .on_hover_text("Distorted and reference side by side");
-                    ui.selectable_value(&mut self.badframe_slider, true, "Slider")
+                    ui.selectable_value(&mut self.badframes.slider, true, "Slider")
                         .on_hover_text("Before/after wipe — drag the divider");
                     ui.separator();
                     if ui
-                        .checkbox(&mut self.badframe_show_diff, "Changed pixels")
+                        .checkbox(&mut self.badframes.show_diff, "Changed pixels")
                         .on_hover_text(
                             "Purple heatmap of ref-vs-dist change on the distorted image",
                         )
                         .changed()
                     {
                         // Toggle recomputes the cached overlay on next refresh.
-                        self.badframe_tex_key = None;
+                        self.badframes.tex_key = None;
                     }
                 });
             });
@@ -909,21 +989,21 @@ impl crate::app::RFMetricsApp {
                 ui.horizontal(|ui| {
                     ui.add(egui::Label::new("Bad frames").selectable(false));
                     let _ = egui::ComboBox::from_id_salt("bf_count")
-                        .selected_text(self.badframes_count.as_str())
+                        .selected_text(self.config.export.badframes_count.as_str())
                         .show_ui(ui, |ui| {
                             for v in crate::metrics::badframes::COUNT_LABELS {
                                 let _ = ui.selectable_value(
-                                    &mut self.badframes_count,
+                                    &mut self.config.export.badframes_count,
                                     v.to_owned(),
                                     v,
                                 );
                             }
                         });
-                    let busy = self.badframes_busy || self.measuring;
+                    let busy = self.badframes.busy || self.run.measuring;
                     let can_pair = !busy
-                        && self.badframe_file.as_ref().is_some_and(|k| {
+                        && self.badframes.file.as_ref().is_some_and(|k| {
                             self.badframe_picks(kind, k)
-                                .get(self.badframe_frame_pos)
+                                .get(self.badframes.frame_pos)
                                 .is_some()
                         });
                     let can_metric =
@@ -955,12 +1035,12 @@ impl crate::app::RFMetricsApp {
                     {
                         self.start_export(BadframeExportScope::All, vnow);
                     }
-                    ui.label(format!("{} PNGs in tmp", self.badframe_files.len()));
+                    ui.label(format!("{} PNGs in tmp", self.badframes.files.len()));
                 });
                 ui.horizontal(|ui| {
                     ui.add(egui::Label::new("Export folder").selectable(false));
                     // Bounded display (full path stays in the hover).
-                    let full = self.badframes_export_dir.clone();
+                    let full = self.config.export.badframes_export_dir.clone();
                     let shown = if full.trim().is_empty() {
                         "Beside distorted files".to_owned()
                     } else if full.chars().count() > 40 {
@@ -981,14 +1061,14 @@ impl crate::app::RFMetricsApp {
                             .set_title("Bad-frames export folder")
                             .pick_folder()
                     {
-                        self.badframes_export_dir = dir.to_string_lossy().into_owned();
+                        self.config.export.badframes_export_dir = dir.to_string_lossy().into_owned();
                     }
                     if ui
                         .button("Clear")
                         .on_hover_text("Back to beside-the-distorted-file")
                         .clicked()
                     {
-                        self.badframes_export_dir.clear();
+                        self.config.export.badframes_export_dir.clear();
                     }
                 });
             });
@@ -1002,12 +1082,12 @@ impl crate::app::RFMetricsApp {
             // alone would inherit the group's zoom).
             let view_key = (
                 kind,
-                self.badframe_file.clone().unwrap_or_default(),
-                self.badframe_frame_pos,
+                self.badframes.file.clone().unwrap_or_default(),
+                self.badframes.frame_pos,
             );
-            if self.badframe_view_key.as_ref() != Some(&view_key) {
-                self.badframe_view_key = Some(view_key);
-                self.badframe_reset_once = true;
+            if self.badframes.view_key.as_ref() != Some(&view_key) {
+                self.badframes.view_key = Some(view_key);
+                self.badframes.reset_once = true;
             }
             egui::CentralPanel::default().show(vui, |ui| {
                 // Overlay wipe as a single plot: UV-cropped halves tile
@@ -1018,10 +1098,10 @@ impl crate::app::RFMetricsApp {
                 // + expanding aspect contain-fits the pair (never crops),
                 // on first show, Reset view, double-click and selection
                 // change alike.
-                if self.badframe_slider {
-                    let dist = self.badframe_tex_dist.clone();
-                    let refr = self.badframe_tex_ref.clone();
-                    let diff = self.badframe_tex_diff.clone();
+                if self.badframes.slider {
+                    let dist = self.badframes.tex_dist.clone();
+                    let refr = self.badframes.tex_ref.clone();
+                    let diff = self.badframes.tex_diff.clone();
                     match (dist, refr) {
                         (Some(d), Some(r)) => {
                             ui.label("Reference (left) | Distorted (right) — drag divider to compare · drag to pan · scroll to zoom · double-click to fit");
@@ -1030,17 +1110,17 @@ impl crate::app::RFMetricsApp {
                             let h = ds[1].max(rs[1]) as f64;
                             let lay = crate::metrics::badframes::wipe_layout(
                                 w,
-                                self.badframe_split,
+                                self.badframes.split,
                             );
                             let hover_x = ui
                                 .ctx()
                                 .pointer_hover_pos()
                                 .map(|p| p.x)
                                 .unwrap_or(f32::NAN);
-                            let suppress = self.badframe_div_drag
-                                || (self.badframe_div_sx.is_finite()
-                                    && (hover_x - self.badframe_div_sx).abs() <= 10.0);
-                            let do_reset = self.badframe_reset_once;
+                            let suppress = self.badframes.div_drag
+                                || (self.badframes.div_sx.is_finite()
+                                    && (hover_x - self.badframes.div_sx).abs() <= 10.0);
+                            let do_reset = self.badframes.reset_once;
                             let plot = egui_plot::Plot::new("bf-wipe")
                                 .data_aspect(1.0)
                                 .show_grid(false)
@@ -1124,7 +1204,7 @@ impl crate::app::RFMetricsApp {
                                     lay.div_x, 0.0,
                                 ))
                                 .x;
-                            self.badframe_div_sx = sx;
+                            self.badframes.div_sx = sx;
                             // Overlay follows the visible image area so tags,
                             // handle and grab stay on screen while zoomed or
                             // panned (half-centers drift off-screen).
@@ -1210,14 +1290,14 @@ impl crate::app::RFMetricsApp {
                                 && let Some(pos) = grab_resp.interact_pointer_pos()
                                 && img.width() > 10.0
                             {
-                                self.badframe_split =
+                                self.badframes.split =
                                     crate::metrics::badframes::clamp_split(
                                         (pos.x - img.min.x) / img.width(),
                                     );
                             }
-                            self.badframe_div_drag = grab_resp.dragged();
+                            self.badframes.div_drag = grab_resp.dragged();
                             if do_reset {
-                                self.badframe_reset_once = false;
+                                self.badframes.reset_once = false;
                             }
                         }
                         (Some(d), None) => {
@@ -1237,7 +1317,7 @@ impl crate::app::RFMetricsApp {
                 // Union-fit defaults (stored memory wins once the user
                 // pans/zooms within a selection).
                 let (dxmin, dxmax, dymin, dymax) =
-                    match (&self.badframe_tex_dist, &self.badframe_tex_ref) {
+                    match (&self.badframes.tex_dist, &self.badframes.tex_ref) {
                         (Some(d), Some(r)) => {
                             let (ds, rs) = (d.size(), r.size());
                             crate::metrics::badframes::viewer_fit(
@@ -1249,10 +1329,10 @@ impl crate::app::RFMetricsApp {
                         }
                         _ => (-1.0, 1.0, -1.0, 1.0),
                     };
-                let do_reset = self.badframe_reset_once;
-                let diff = self.badframe_tex_diff.clone();
+                let do_reset = self.badframes.reset_once;
+                let diff = self.badframes.tex_diff.clone();
                 ui.columns(2, |cols| {
-                    if let Some(tex) = &self.badframe_tex_ref {
+                    if let Some(tex) = &self.badframes.tex_ref {
                         let (w, h) = (tex.size()[0] as f32, tex.size()[1] as f32);
                         cols[0].label("Reference");
                         let plot = egui_plot::Plot::new("bf-ref")
@@ -1278,7 +1358,7 @@ impl crate::app::RFMetricsApp {
                     } else {
                         cols[0].label("Reference — not extracted");
                     }
-                    if let Some(tex) = &self.badframe_tex_dist {
+                    if let Some(tex) = &self.badframes.tex_dist {
                         let (w, h) = (tex.size()[0] as f32, tex.size()[1] as f32);
                         cols[1].label("Distorted");
                         let plot = egui_plot::Plot::new("bf-dist")
@@ -1317,12 +1397,12 @@ impl crate::app::RFMetricsApp {
                     }
                 });
                 if do_reset {
-                    self.badframe_reset_once = false;
+                    self.badframes.reset_once = false;
                 }
             });
             // Keep progress live while the worker runs (viewport repaints
             // with the parent only on input otherwise).
-            if self.badframes_busy {
+            if self.badframes.busy {
                 vui.request_repaint_after(std::time::Duration::from_millis(100));
             }
         });

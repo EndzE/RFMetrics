@@ -211,3 +211,15 @@ fn total_frames_rejects_garbage() {
     let m = parse_media(&v, &f);
     assert_eq!(m.total_frames, Some(1889)); // falls back to duration × fps
 }
+
+#[test]
+fn path_usable_guard() {
+    assert!(!path_usable(""));
+    assert!(!path_usable("   "));
+    assert!(!path_usable("C:/no/such/rfmetrics-file.mp4"));
+    let p = std::env::temp_dir().join("rfmetrics-path-usable.tmp");
+    std::fs::write(&p, b"x").unwrap();
+    assert!(path_usable(&p.to_string_lossy()));
+    std::fs::remove_file(&p).ok();
+    assert!(!path_usable(&std::env::temp_dir().to_string_lossy()));
+}

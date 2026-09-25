@@ -1,6 +1,8 @@
 use super::ScaleMethod;
-use super::{DropAction, METRIC_COLUMNS, ProbeMsg, QueueRow, RFMetricsApp, norm_key, route_drop};
-use crate::app_queue::{CachedStats, display_names};
+use super::queue::QueueRow;
+use super::run::ProbeMsg;
+use super::{DropAction, METRIC_COLUMNS, RFMetricsApp, norm_key, route_drop};
+use crate::app::queue::{CachedStats, display_names};
 use crate::binaries::BinaryInfo;
 use crate::metrics::ffmpeg::InputFpsMode;
 
@@ -127,65 +129,58 @@ fn same_basename_keeps_parent() {
 #[test]
 fn refresh_media_info_reprobes_ref_and_rows() {
     // Hermetic: no ffprobe, so workers resolve to text without spawning.
-    let mut app = RFMetricsApp {
-        ffprobe: None,
-        ..RFMetricsApp::default()
-    };
-    app.rows.push(psnr_test_row("C:/no/such/a.mp4", true));
-    app.rows[0].media = "old".to_owned();
-    app.last_spawned_ref = "sentinel".to_owned();
-    app.last_thumb_path = "sentinel".to_owned();
-    app.ref_path = "C:/no/such/ref.mp4".to_owned();
+    let mut app = RFMetricsApp::default();
+    app.binaries.ffprobe = None;
+    app.queue.rows.push(psnr_test_row("C:/no/such/a.mp4", true));
+    app.queue.rows[0].media = "old".to_owned();
+    app.ref_probe.last_spawned = "sentinel".to_owned();
+    app.ref_probe.last_thumb_path = "sentinel".to_owned();
+    app.config.reference.path = "C:/no/such/ref.mp4".to_owned();
     app.refresh_media_info();
-    assert!(app.last_spawned_ref.is_empty());
-    assert!(app.last_thumb_path.is_empty());
-    assert_eq!(app.rows[0].media, "Probing…");
+    assert!(app.ref_probe.last_spawned.is_empty());
+    assert!(app.ref_probe.last_thumb_path.is_empty());
+    assert_eq!(app.queue.rows[0].media, "Probing…");
     for _ in 0..200 {
         app.drain_probe_results();
-        if app.rows[0].media != "Probing…" {
+        if app.queue.rows[0].media != "Probing…" {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert_ne!(app.rows[0].media, "Probing…");
+    assert_ne!(app.queue.rows[0].media, "Probing…");
     // Reference cheap case resolves inline on the next refresh tick.
     app.refresh_ref_info();
-    assert_eq!(app.ref_info, "File not found");
+    assert_eq!(app.ref_probe.info, "File not found");
 }
 
 #[test]
 fn refresh_media_info_empty_queue_only_clears_markers() {
-    let mut app = RFMetricsApp {
-        last_spawned_ref: "sentinel".to_owned(),
-        ..RFMetricsApp::default()
-    };
+    let mut app = RFMetricsApp::default();
+    app.ref_probe.last_spawned = "sentinel".to_owned();
     app.refresh_media_info();
-    assert!(app.last_spawned_ref.is_empty());
-    assert!(app.probe_rx.try_recv().is_err());
+    assert!(app.ref_probe.last_spawned.is_empty());
+    assert!(app.ref_probe.probe_rx.try_recv().is_err());
 }
 
 #[test]
 fn ref_cheap_cases_stay_synchronous() {
-    let mut app = RFMetricsApp {
-        ref_path: String::new(),
-        ..RFMetricsApp::default()
-    };
+    let mut app = RFMetricsApp::default();
+    app.config.reference.path = String::new();
     app.refresh_ref_info();
-    assert!(app.ref_info.contains("-unknown-"));
-    app.ref_path = "C:/no/such/file.mp4".to_owned();
+    assert!(app.ref_probe.info.contains("-unknown-"));
+    app.config.reference.path = "C:/no/such/file.mp4".to_owned();
     app.refresh_ref_info();
-    assert_eq!(app.ref_info, "File not found");
+    assert_eq!(app.ref_probe.info, "File not found");
     // Neither case spawns a worker: the channel stays empty.
-    assert!(app.probe_rx.try_recv().is_err());
+    assert!(app.ref_probe.probe_rx.try_recv().is_err());
 }
 
 #[test]
 fn stale_reference_result_discarded() {
-    let mut app = RFMetricsApp {
-        ref_info: "sentinel".to_owned(),
-        ..RFMetricsApp::default()
-    };
-    app.probe_tx
+    let mut app = RFMetricsApp::default();
+    app.ref_probe.info = "sentinel".to_owned();
+    app.ref_probe
+        .probe_tx
         .send(ProbeMsg::Reference {
             generation: 999,
             text: "stale".to_owned(),
@@ -194,38 +189,36 @@ fn stale_reference_result_discarded() {
         })
         .unwrap();
     app.refresh_ref_info();
-    assert_eq!(app.ref_info, "sentinel");
-    app.probe_tx
+    assert_eq!(app.ref_probe.info, "sentinel");
+    app.ref_probe
+        .probe_tx
         .send(ProbeMsg::Reference {
-            generation: app.ref_generation,
+            generation: app.ref_probe.generation,
             text: "fresh".to_owned(),
             info: None,
             timed_out: false,
         })
         .unwrap();
     app.refresh_ref_info();
-    assert_eq!(app.ref_info, "fresh");
+    assert_eq!(app.ref_probe.info, "fresh");
 }
 
 #[test]
 fn bin_probe_drain_swaps_placeholders_and_reprobes() {
     use crate::metrics::ffmpeg::MetricKind;
-    let mut app = RFMetricsApp {
-        bins_probing: true,
-        ..RFMetricsApp::default()
-    };
+    let mut app = RFMetricsApp::default();
+    app.binaries.probing = true;
     // A row that settled while binaries were unknown re-probes fresh.
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].media = "ffprobe not found".to_owned();
-    app.rows[0].info = None;
-    app.next_probe_seq = 1;
-    let old_gen = app.rows[0].probe_gen;
-    app.last_spawned_ref = "C:/vids/ref.mp4".to_owned();
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].media = "ffprobe not found".to_owned();
+    app.queue.rows[0].info = None;
+    app.queue.next_probe_seq = 1;
+    let old_gen = app.queue.rows[0].probe_gen;
+    app.ref_probe.last_spawned = "C:/vids/ref.mp4".to_owned();
     let (tx, rx) = std::sync::mpsc::channel();
-    app.bin_rx = rx;
+    app.binaries.bin_rx = rx;
     let ffmpeg = BinaryInfo {
         path: Some(std::path::PathBuf::from("C:/ffmpeg.exe")),
-        origin: "test",
         short: "FFmpeg: test".to_owned(),
         detail: "test".to_owned(),
         usable: true,
@@ -235,17 +228,24 @@ fn bin_probe_drain_swaps_placeholders_and_reprobes() {
     let ffvship = BinaryInfo::probing("Probing for FFVship…");
     tx.send((ffmpeg, ffvship, None)).unwrap();
     assert!(app.drain_bin_results());
-    assert!(!app.bins_probing);
-    assert_eq!(app.ffmpeg.short, "FFmpeg: test");
-    assert!(!app.m_vmaf, "unsupported VMAF unticked on land");
-    assert!(app.last_spawned_ref.is_empty(), "ref re-probes next frame");
-    assert_ne!(app.rows[0].probe_gen, old_gen, "stale token dropped");
-    let fresh_gen = app.rows[0].probe_gen;
+    assert!(!app.binaries.probing);
+    assert_eq!(app.binaries.ffmpeg.short, "FFmpeg: test");
+    assert!(
+        !app.config.metrics.vmaf,
+        "unsupported VMAF unticked on land"
+    );
+    assert!(
+        app.ref_probe.last_spawned.is_empty(),
+        "ref re-probes next frame"
+    );
+    assert_ne!(app.queue.rows[0].probe_gen, old_gen, "stale token dropped");
+    let fresh_gen = app.queue.rows[0].probe_gen;
     assert!(!app.drain_bin_results(), "channel drained");
     // Stale no-binary results carry the old token and drop on arrival.
-    app.probe_tx
+    app.ref_probe
+        .probe_tx
         .send(ProbeMsg::RowMedia {
-            key: app.rows[0].key.clone(),
+            key: app.queue.rows[0].key.clone(),
             probe_gen: old_gen,
             media: "STALE".to_owned(),
             tip: "STALE".to_owned(),
@@ -254,12 +254,12 @@ fn bin_probe_drain_swaps_placeholders_and_reprobes() {
         })
         .unwrap();
     app.drain_probe_results();
-    assert_ne!(app.rows[0].media, "STALE");
+    assert_ne!(app.queue.rows[0].media, "STALE");
     // The re-probe worker carries the fresh token (spawn proof).
     let mut seen_fresh = false;
     for _ in 0..200 {
         app.drain_probe_results();
-        if app.rows[0].probe_gen == fresh_gen && app.rows[0].media != "Probing…" {
+        if app.queue.rows[0].probe_gen == fresh_gen && app.queue.rows[0].media != "Probing…" {
             seen_fresh = true;
             break;
         }
@@ -270,14 +270,13 @@ fn bin_probe_drain_swaps_placeholders_and_reprobes() {
 
 #[test]
 fn start_run_while_bins_probing_toasts() {
-    let mut app = RFMetricsApp {
-        bins_probing: true,
-        ..RFMetricsApp::default()
-    };
+    let mut app = RFMetricsApp::default();
+    app.binaries.probing = true;
     app.start_run(1.0);
-    assert!(!app.measuring);
+    assert!(!app.run.measuring);
     assert!(
-        app.toast
+        app.ui
+            .toast
             .as_ref()
             .is_some_and(|t| t.text.contains("still probing")),
         "accurate toast, not 'not found'"
@@ -287,7 +286,7 @@ fn start_run_while_bins_probing_toasts() {
 #[test]
 fn row_media_applies_by_key() {
     let mut app = RFMetricsApp::default();
-    app.rows.push(QueueRow {
+    app.queue.rows.push(QueueRow {
         path: "C:/vids/a.mp4".to_owned(),
         key: norm_key("C:/vids/a.mp4"),
         display: "a.mp4".to_owned(),
@@ -314,17 +313,19 @@ fn row_media_applies_by_key() {
         cvvdp_cache: CachedStats::default(),
     });
     let key = norm_key("C:/vids/a.mp4");
-    app.probe_tx
+    app.ref_probe
+        .probe_tx
         .send(ProbeMsg::RowMedia {
             key,
-            probe_gen: app.rows[0].probe_gen,
+            probe_gen: app.queue.rows[0].probe_gen,
             media: "h264, 1080p".to_owned(),
             tip: "tip".to_owned(),
             info: None,
             timed_out: false,
         })
         .unwrap();
-    app.probe_tx
+    app.ref_probe
+        .probe_tx
         .send(ProbeMsg::RowMedia {
             key: "nope".to_owned(),
             probe_gen: 0,
@@ -335,37 +336,38 @@ fn row_media_applies_by_key() {
         })
         .unwrap();
     app.refresh_ref_info();
-    assert_eq!(app.rows[0].media, "h264, 1080p");
-    assert_eq!(app.rows[0].media_tip, "tip");
+    assert_eq!(app.queue.rows[0].media, "h264, 1080p");
+    assert_eq!(app.queue.rows[0].media_tip, "tip");
 }
 
 #[test]
 fn row_probe_token_rejects_stale_after_readd() {
-    use super::ProbeMsg;
+    use super::run::ProbeMsg;
     // The token advances across remove/re-add through the real insert path
     // (spawned probe threads are never drained here, so no timing involved).
     let mut app = RFMetricsApp::default();
     let p = std::path::PathBuf::from("C:/no/such/repro.mp4");
     app.add_queue_files(vec![p.clone()]);
-    assert_eq!(app.rows.len(), 1);
-    let first_gen = app.rows[0].probe_gen;
-    app.rows.remove(0);
+    assert_eq!(app.queue.rows.len(), 1);
+    let first_gen = app.queue.rows[0].probe_gen;
+    app.queue.rows.remove(0);
     app.add_queue_files(vec![p]);
-    assert_eq!(app.rows.len(), 1);
+    assert_eq!(app.queue.rows.len(), 1);
     assert_ne!(
-        app.rows[0].probe_gen, first_gen,
+        app.queue.rows[0].probe_gen, first_gen,
         "re-added row must take a fresh probe token"
     );
 
     // Drain contract with hand-set tokens (no threads at all).
     let mut app = RFMetricsApp::default();
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].probe_gen = 5;
-    app.rows[0].media = "current".to_owned();
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].probe_gen = 5;
+    app.queue.rows[0].media = "current".to_owned();
     let key = norm_key("C:/vids/a.mp4");
     // Orphaned probe from the removed row's generation: dropped, and its
     // timeout stays silent.
-    app.probe_tx
+    app.ref_probe
+        .probe_tx
         .send(ProbeMsg::RowMedia {
             key: key.clone(),
             probe_gen: 2,
@@ -376,10 +378,11 @@ fn row_probe_token_rejects_stale_after_readd() {
         })
         .unwrap();
     app.drain_probe_results();
-    assert_eq!(app.rows[0].media, "current");
-    assert!(app.probe_timeout_note.is_none());
+    assert_eq!(app.queue.rows[0].media, "current");
+    assert!(app.ref_probe.timeout_note.is_none());
     // Live probe for this row's generation: applied.
-    app.probe_tx
+    app.ref_probe
+        .probe_tx
         .send(ProbeMsg::RowMedia {
             key,
             probe_gen: 5,
@@ -390,7 +393,7 @@ fn row_probe_token_rejects_stale_after_readd() {
         })
         .unwrap();
     app.drain_probe_results();
-    assert_eq!(app.rows[0].media, "fresh");
+    assert_eq!(app.queue.rows[0].media, "fresh");
 }
 
 #[test]
@@ -405,13 +408,21 @@ fn plot_color_slots_survive_removal() {
         std::path::PathBuf::from("C:/no/such/c3.mp4"),
     ]);
     assert_eq!(
-        app.rows.iter().map(|r| r.color_idx).collect::<Vec<_>>(),
+        app.queue
+            .rows
+            .iter()
+            .map(|r| r.color_idx)
+            .collect::<Vec<_>>(),
         vec![0, 1, 2]
     );
-    app.rows.remove(1);
+    app.queue.rows.remove(1);
     app.add_queue_files(vec![std::path::PathBuf::from("C:/no/such/c4.mp4")]);
     assert_eq!(
-        app.rows.iter().map(|r| r.color_idx).collect::<Vec<_>>(),
+        app.queue
+            .rows
+            .iter()
+            .map(|r| r.color_idx)
+            .collect::<Vec<_>>(),
         vec![0, 2, 3]
     );
 }
@@ -420,17 +431,17 @@ fn plot_color_slots_survive_removal() {
 fn queue_shows_probing_placeholder() {
     let mut app = RFMetricsApp::default();
     app.add_queue_files(vec![std::path::PathBuf::from("C:/no/such/file.mp4")]);
-    assert_eq!(app.rows.len(), 1);
-    assert_eq!(app.rows[0].media, "Probing…");
+    assert_eq!(app.queue.rows.len(), 1);
+    assert_eq!(app.queue.rows[0].media, "Probing…");
     // Missing files resolve without spawning ffprobe; poll briefly.
     for _ in 0..200 {
         app.drain_probe_results();
-        if app.rows[0].media != "Probing…" {
+        if app.queue.rows[0].media != "Probing…" {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert!(app.rows[0].media.contains("-unknown-"));
+    assert!(app.queue.rows[0].media.contains("-unknown-"));
 }
 
 fn psnr_test_row(path: &str, include: bool) -> QueueRow {
@@ -465,71 +476,74 @@ fn psnr_test_row(path: &str, include: bool) -> QueueRow {
 #[test]
 fn start_psnr_gated_on_checkbox() {
     let mut app = RFMetricsApp::default();
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.m_psnr = false;
-    app.m_vmaf = false;
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.config.metrics.psnr = false;
+    app.config.metrics.vmaf = false;
     app.start_run(0.0);
-    assert!(!app.measuring);
-    assert!(matches!(app.rows[0].psnr, crate::metrics::MetricCell::Idle));
-    assert!(app.toast.is_some());
+    assert!(!app.run.measuring);
+    assert!(matches!(
+        app.queue.rows[0].psnr,
+        crate::metrics::MetricCell::Idle
+    ));
+    assert!(app.ui.toast.is_some());
 }
 
 #[test]
 fn start_psnr_needs_included_rows() {
-    let mut app = RFMetricsApp {
-        m_psnr: true,
-        m_vmaf: false,
-        ..RFMetricsApp::default()
-    };
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = true;
+    app.config.metrics.vmaf = false;
     // Unchecked include box: the row must not be processed.
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", false));
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", false));
     app.start_run(0.0);
-    assert!(!app.measuring);
-    assert!(matches!(app.rows[0].psnr, crate::metrics::MetricCell::Idle));
+    assert!(!app.run.measuring);
+    assert!(matches!(
+        app.queue.rows[0].psnr,
+        crate::metrics::MetricCell::Idle
+    ));
 }
 
 #[test]
 fn start_psnr_bad_time_marks_cells() {
     let p = std::env::temp_dir().join("rfmetrics-psnr-ref.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_psnr: true,
-        m_ssim: true,
-        m_vmaf: false,
-        ref_path: p.to_string_lossy().into_owned(),
-        skip: "abc".to_owned(),
-        ..RFMetricsApp::default()
-    };
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = true;
+    app.config.metrics.ssim = true;
+    app.config.metrics.vmaf = false;
+    app.config.reference.path = p.to_string_lossy().into_owned();
+    app.config.reference.skip = "abc".to_owned();
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
-    assert!(!app.measuring);
+    assert!(!app.run.measuring);
     assert!(matches!(
-        &app.rows[0].psnr,
+        &app.queue.rows[0].psnr,
         crate::metrics::MetricCell::Error { msg } if msg == "bad time"
     ));
     assert!(matches!(
-        &app.rows[0].ssim,
+        &app.queue.rows[0].ssim,
         crate::metrics::MetricCell::Error { msg } if msg == "bad time"
     ));
 }
 
 #[test]
 fn psnr_progress_keeps_max_and_finished_clears() {
-    use super::MetricMsg;
+    use super::run::MetricMsg;
     use crate::metrics::MetricCell;
     let mut app = RFMetricsApp::default();
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].psnr = MetricCell::Running {
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].psnr = MetricCell::Running {
         frame: 10,
         values: Vec::new(),
     };
-    app.run_generation = 1;
-    app.pending = 1;
-    app.measuring = true;
+    app.run.generation = 1;
+    app.run.pending = 1;
+    app.run.measuring = true;
     let key = norm_key("C:/vids/a.mp4");
     // Stale frame ignored, fresh frame applied.
-    app.metric_tx
+    app.run
+        .metric_tx
         .send(MetricMsg::Progress {
             generation: 1,
             kind: crate::metrics::ffmpeg::MetricKind::Psnr,
@@ -537,7 +551,8 @@ fn psnr_progress_keeps_max_and_finished_clears() {
             frame: 5,
         })
         .unwrap();
-    app.metric_tx
+    app.run
+        .metric_tx
         .send(MetricMsg::Progress {
             generation: 1,
             kind: crate::metrics::ffmpeg::MetricKind::Psnr,
@@ -547,12 +562,13 @@ fn psnr_progress_keeps_max_and_finished_clears() {
         .unwrap();
     app.drain_metric_results();
     assert!(matches!(
-        app.rows[0].psnr,
+        app.queue.rows[0].psnr,
         MetricCell::Running { frame: 25, .. }
     ));
     // No-summary avg falls back to the arithmetic mean; run ends.
     // Settings stamp through: the cell remembers this trim.
-    app.metric_tx
+    app.run
+        .metric_tx
         .send(MetricMsg::Done {
             generation: 1,
             kind: crate::metrics::ffmpeg::MetricKind::Psnr,
@@ -571,33 +587,34 @@ fn psnr_progress_keeps_max_and_finished_clears() {
         .unwrap();
     app.drain_metric_results();
     assert!(matches!(
-        &app.rows[0].psnr,
+        &app.queue.rows[0].psnr,
         MetricCell::Done { avg, skip, clip_dur, .. }
             if (*avg - 31.0).abs() < 1e-9 && skip.is_none() && *clip_dur == Some(5.0)
     ));
     // Last `Done` leaves the run open; `Finished` ends it.
-    assert!(app.measuring);
-    app.metric_tx
+    assert!(app.run.measuring);
+    app.run
+        .metric_tx
         .send(MetricMsg::Finished {
             generation: 1,
             aborted: false,
         })
         .unwrap();
     app.drain_metric_results();
-    assert!(!app.measuring);
+    assert!(!app.run.measuring);
 }
 
 #[test]
 fn series_appends_in_order_and_done_replaces() {
-    use super::MetricMsg;
+    use super::run::MetricMsg;
     use crate::metrics::MetricCell;
     let mut app = RFMetricsApp::default();
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].psnr = MetricCell::Running {
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].psnr = MetricCell::Running {
         frame: 0,
         values: Vec::new(),
     };
-    app.run_generation = 1;
+    app.run.generation = 1;
     let key = norm_key("C:/vids/a.mp4");
     let series = |generation: u64, vals: Vec<f64>| MetricMsg::Series {
         generation,
@@ -606,13 +623,13 @@ fn series_appends_in_order_and_done_replaces() {
         new_values: vals,
     };
     // Stale generation and empty batches drop silently.
-    app.metric_tx.send(series(0, vec![99.0])).unwrap();
-    app.metric_tx.send(series(1, vec![])).unwrap();
-    app.metric_tx.send(series(1, vec![30.0, 31.0])).unwrap();
-    app.metric_tx.send(series(1, vec![32.0])).unwrap();
+    app.run.metric_tx.send(series(0, vec![99.0])).unwrap();
+    app.run.metric_tx.send(series(1, vec![])).unwrap();
+    app.run.metric_tx.send(series(1, vec![30.0, 31.0])).unwrap();
+    app.run.metric_tx.send(series(1, vec![32.0])).unwrap();
     app.drain_metric_results();
     assert!(matches!(
-        &app.rows[0].psnr,
+        &app.queue.rows[0].psnr,
         MetricCell::Running { values, .. } if values == &[30.0, 31.0, 32.0]
     ));
     // Plot decimates straight from values (x = 1-based frame).
@@ -622,16 +639,17 @@ fn series_appends_in_order_and_done_replaces() {
     assert_eq!((pts[0].x, pts[0].y), (1.0, 30.0));
     assert_eq!((pts[2].x, pts[2].y), (3.0, 32.0));
     // Batches for a settled cell are ignored, not resurrected.
-    app.rows[0].psnr = MetricCell::Idle;
-    app.metric_tx.send(series(1, vec![33.0])).unwrap();
+    app.queue.rows[0].psnr = MetricCell::Idle;
+    app.run.metric_tx.send(series(1, vec![33.0])).unwrap();
     app.drain_metric_results();
-    assert!(matches!(app.rows[0].psnr, MetricCell::Idle));
+    assert!(matches!(app.queue.rows[0].psnr, MetricCell::Idle));
     // Done replaces the live buffer with the strict series.
-    app.rows[0].psnr = MetricCell::Running {
+    app.queue.rows[0].psnr = MetricCell::Running {
         frame: 3,
         values: vec![30.0, 31.0, 32.0],
     };
-    app.metric_tx
+    app.run
+        .metric_tx
         .send(MetricMsg::Done {
             generation: 1,
             kind: crate::metrics::ffmpeg::MetricKind::Psnr,
@@ -650,7 +668,7 @@ fn series_appends_in_order_and_done_replaces() {
         .unwrap();
     app.drain_metric_results();
     assert!(matches!(
-        &app.rows[0].psnr,
+        &app.queue.rows[0].psnr,
         MetricCell::Done { values, .. } if values == &[29.0, 31.0]
     ));
     // Done draws from the strict series (not the partials).
@@ -663,20 +681,21 @@ fn series_appends_in_order_and_done_replaces() {
 
 #[test]
 fn progress_and_series_track_live_kind() {
-    use super::MetricMsg;
+    use super::run::MetricMsg;
     use crate::metrics::MetricCell;
     use crate::metrics::ffmpeg::MetricKind;
     let mut app = RFMetricsApp::default();
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].psnr = MetricCell::Running {
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].psnr = MetricCell::Running {
         frame: 0,
         values: Vec::new(),
     };
-    app.run_generation = 1;
+    app.run.generation = 1;
     let key = norm_key("C:/vids/a.mp4");
-    assert_eq!(app.live_kind, None);
+    assert_eq!(app.run.live_kind, None);
     // Stale generation touches nothing.
-    app.metric_tx
+    app.run
+        .metric_tx
         .send(MetricMsg::Progress {
             generation: 0,
             kind: MetricKind::Xpsnr,
@@ -685,9 +704,10 @@ fn progress_and_series_track_live_kind() {
         })
         .unwrap();
     app.drain_metric_results();
-    assert_eq!(app.live_kind, None);
+    assert_eq!(app.run.live_kind, None);
     // Live feeds record the executing job's kind.
-    app.metric_tx
+    app.run
+        .metric_tx
         .send(MetricMsg::Progress {
             generation: 1,
             kind: MetricKind::Psnr,
@@ -696,8 +716,9 @@ fn progress_and_series_track_live_kind() {
         })
         .unwrap();
     app.drain_metric_results();
-    assert_eq!(app.live_kind, Some(MetricKind::Psnr));
-    app.metric_tx
+    assert_eq!(app.run.live_kind, Some(MetricKind::Psnr));
+    app.run
+        .metric_tx
         .send(MetricMsg::Series {
             generation: 1,
             kind: MetricKind::Ssim,
@@ -706,29 +727,30 @@ fn progress_and_series_track_live_kind() {
         })
         .unwrap();
     app.drain_metric_results();
-    assert_eq!(app.live_kind, Some(MetricKind::Ssim));
+    assert_eq!(app.run.live_kind, Some(MetricKind::Ssim));
 }
 
 #[test]
 fn live_key_tracks_executing_job() {
-    use super::MetricMsg;
+    use super::run::MetricMsg;
     use crate::metrics::MetricCell;
     use crate::metrics::ffmpeg::MetricKind;
     let mut app = RFMetricsApp::default();
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows.push(psnr_test_row("C:/vids/b.mp4", true));
-    for row in &mut app.rows {
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows.push(psnr_test_row("C:/vids/b.mp4", true));
+    for row in &mut app.queue.rows {
         row.psnr = MetricCell::Running {
             frame: 0,
             values: Vec::new(),
         };
     }
-    app.run_generation = 1;
+    app.run.generation = 1;
     let key_a = norm_key("C:/vids/a.mp4");
     let key_b = norm_key("C:/vids/b.mp4");
-    assert_eq!(app.live_key, None);
+    assert_eq!(app.run.live_key, None);
     // Stale generation touches nothing.
-    app.metric_tx
+    app.run
+        .metric_tx
         .send(MetricMsg::Progress {
             generation: 0,
             kind: MetricKind::Psnr,
@@ -737,9 +759,10 @@ fn live_key_tracks_executing_job() {
         })
         .unwrap();
     app.drain_metric_results();
-    assert_eq!(app.live_key, None);
+    assert_eq!(app.run.live_key, None);
     // First job goes live…
-    app.metric_tx
+    app.run
+        .metric_tx
         .send(MetricMsg::Progress {
             generation: 1,
             kind: MetricKind::Psnr,
@@ -748,9 +771,10 @@ fn live_key_tracks_executing_job() {
         })
         .unwrap();
     app.drain_metric_results();
-    assert_eq!(app.live_key, Some(key_a.clone()));
+    assert_eq!(app.run.live_key, Some(key_a.clone()));
     // …then the worker moves to the next file: only that cell is live.
-    app.metric_tx
+    app.run
+        .metric_tx
         .send(MetricMsg::Progress {
             generation: 1,
             kind: MetricKind::Psnr,
@@ -759,9 +783,10 @@ fn live_key_tracks_executing_job() {
         })
         .unwrap();
     app.drain_metric_results();
-    assert_eq!(app.live_key, Some(key_b.clone()));
+    assert_eq!(app.run.live_key, Some(key_b.clone()));
     // Its Done clears the live slot (inter-job gap shows no sweep).
-    app.metric_tx
+    app.run
+        .metric_tx
         .send(MetricMsg::Done {
             generation: 1,
             kind: MetricKind::Psnr,
@@ -779,10 +804,11 @@ fn live_key_tracks_executing_job() {
         })
         .unwrap();
     app.drain_metric_results();
-    assert_eq!(app.live_key, None);
+    assert_eq!(app.run.live_key, None);
     // A Done for any other job never clears a live one (ordered
     // channel, but the guard makes it robust).
-    app.metric_tx
+    app.run
+        .metric_tx
         .send(MetricMsg::Progress {
             generation: 1,
             kind: MetricKind::Psnr,
@@ -791,8 +817,9 @@ fn live_key_tracks_executing_job() {
         })
         .unwrap();
     app.drain_metric_results();
-    assert_eq!(app.live_key, Some(key_a.clone()));
-    app.metric_tx
+    assert_eq!(app.run.live_key, Some(key_a.clone()));
+    app.run
+        .metric_tx
         .send(MetricMsg::Done {
             generation: 1,
             kind: MetricKind::Psnr,
@@ -810,17 +837,18 @@ fn live_key_tracks_executing_job() {
         })
         .unwrap();
     app.drain_metric_results();
-    assert_eq!(app.live_key, Some(key_a.clone()));
+    assert_eq!(app.run.live_key, Some(key_a.clone()));
 }
 
 #[test]
 fn psnr_stale_generation_dropped() {
-    use super::MetricMsg;
+    use super::run::MetricMsg;
     use crate::metrics::MetricCell;
     let mut app = RFMetricsApp::default();
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.run_generation = 2; // run 1's messages are orphans after Reset
-    app.metric_tx
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.run.generation = 2; // run 1's messages are orphans after Reset
+    app.run
+        .metric_tx
         .send(MetricMsg::Done {
             generation: 1,
             kind: crate::metrics::ffmpeg::MetricKind::Psnr,
@@ -838,7 +866,7 @@ fn psnr_stale_generation_dropped() {
         })
         .unwrap();
     app.drain_metric_results();
-    assert!(matches!(app.rows[0].psnr, MetricCell::Idle));
+    assert!(matches!(app.queue.rows[0].psnr, MetricCell::Idle));
 }
 
 #[test]
@@ -846,20 +874,21 @@ fn stop_is_noop_when_idle() {
     use std::sync::atomic::Ordering;
     let mut app = RFMetricsApp::default();
     app.stop_psnr();
-    assert!(!app.abort.load(Ordering::SeqCst));
+    assert!(!app.run.abort.load(Ordering::SeqCst));
 }
 
 #[test]
 fn drain_caches_stats_and_ranks_once() {
-    use super::MetricMsg;
+    use super::run::MetricMsg;
     use crate::metrics::StatRank;
     use crate::metrics::ffmpeg::MetricKind;
     let mut app = RFMetricsApp::default();
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows.push(psnr_test_row("C:/vids/b.mp4", true));
-    app.run_generation = 1;
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows.push(psnr_test_row("C:/vids/b.mp4", true));
+    app.run.generation = 1;
     for (path, avg) in [("C:/vids/a.mp4", 30.0), ("C:/vids/b.mp4", 40.0)] {
-        app.metric_tx
+        app.run
+            .metric_tx
             .send(MetricMsg::Done {
                 generation: 1,
                 kind: MetricKind::Psnr,
@@ -879,15 +908,15 @@ fn drain_caches_stats_and_ranks_once() {
     }
     app.drain_metric_results();
     // Stats cached on arrival (no per-frame clone+sort in the render).
-    assert!(app.rows[0].psnr_cache.stats.is_some());
-    assert!(app.rows[1].psnr_cache.stats.is_some());
+    assert!(app.queue.rows[0].psnr_cache.stats.is_some());
+    assert!(app.queue.rows[1].psnr_cache.stats.is_some());
     // Ranks resolved across the scored set: avg index 0 decides the cell.
-    assert_eq!(app.rows[0].psnr_cache.ranks[0], StatRank::Worst);
-    assert_eq!(app.rows[1].psnr_cache.ranks[0], StatRank::Best);
+    assert_eq!(app.queue.rows[0].psnr_cache.ranks[0], StatRank::Worst);
+    assert_eq!(app.queue.rows[1].psnr_cache.ranks[0], StatRank::Best);
     // Reset clears the cache back to Plain.
     app.reset_psnr();
-    assert!(app.rows[0].psnr_cache.stats.is_none());
-    assert_eq!(app.rows[0].psnr_cache.ranks, [StatRank::Plain; 10]);
+    assert!(app.queue.rows[0].psnr_cache.stats.is_none());
+    assert_eq!(app.queue.rows[0].psnr_cache.ranks, [StatRank::Plain; 10]);
 }
 
 #[test]
@@ -895,7 +924,7 @@ fn reset_metric_clears_only_that_column() {
     use crate::metrics::ffmpeg::MetricKind;
     use crate::metrics::{MetricCell, StatRank};
     let mut app = RFMetricsApp::default();
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
     let done = |avg: f64| MetricCell::Done {
         values: vec![avg - 1.0, avg, avg + 1.0],
         avg,
@@ -907,28 +936,28 @@ fn reset_metric_clears_only_that_column() {
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
-    app.rows[0].psnr = done(30.0);
-    app.rows[0].ssim = done(0.95);
-    app.rows[0].psnr_cache.stats = app.rows[0].psnr.done_stats();
-    app.rows[0].ssim_cache.stats = app.rows[0].ssim.done_stats();
-    app.rows[0].psnr_cache.text = app.rows[0]
+    app.queue.rows[0].psnr = done(30.0);
+    app.queue.rows[0].ssim = done(0.95);
+    app.queue.rows[0].psnr_cache.stats = app.queue.rows[0].psnr.done_stats();
+    app.queue.rows[0].ssim_cache.stats = app.queue.rows[0].ssim.done_stats();
+    app.queue.rows[0].psnr_cache.text = app.queue.rows[0]
         .psnr
         .cell_text_prec(crate::metrics::DEFAULT_PRECISION);
-    app.rows[0].ssim_cache.text = app.rows[0]
+    app.queue.rows[0].ssim_cache.text = app.queue.rows[0]
         .ssim
         .cell_text_prec(crate::metrics::DEFAULT_PRECISION);
-    app.live_kind = Some(MetricKind::Psnr);
-    app.live_key = Some(app.rows[0].key.clone());
+    app.run.live_kind = Some(MetricKind::Psnr);
+    app.run.live_key = Some(app.queue.rows[0].key.clone());
     app.reset_metric(MetricKind::Psnr);
-    assert!(matches!(app.rows[0].psnr, MetricCell::Idle));
-    assert!(app.rows[0].psnr_cache.stats.is_none());
-    assert_eq!(app.rows[0].psnr_cache.ranks, [StatRank::Plain; 10]);
+    assert!(matches!(app.queue.rows[0].psnr, MetricCell::Idle));
+    assert!(app.queue.rows[0].psnr_cache.stats.is_none());
+    assert_eq!(app.queue.rows[0].psnr_cache.ranks, [StatRank::Plain; 10]);
     // Other columns untouched.
-    assert!(matches!(app.rows[0].ssim, MetricCell::Done { .. }));
-    assert!(app.rows[0].ssim_cache.stats.is_some());
-    assert_eq!(app.rows[0].ssim_cache.text, "0.9500");
+    assert!(matches!(app.queue.rows[0].ssim, MetricCell::Done { .. }));
+    assert!(app.queue.rows[0].ssim_cache.stats.is_some());
+    assert_eq!(app.queue.rows[0].ssim_cache.text, "0.9500");
     // Live pointer cleared only because it pointed at the reset kind.
-    assert_eq!(app.live_kind, None);
+    assert_eq!(app.run.live_kind, None);
 }
 
 #[test]
@@ -939,7 +968,7 @@ fn done_stale_marking_matches_recompute_rules() {
     let app = RFMetricsApp::default();
     // Default trim boxes are empty (no trim); the fixture stamps match.
     let (skip, clip) = (None, None);
-    let cur_vmaf = app.current_vmaf_cfg();
+    let cur_vmaf = app.config.vmaf.current_vmaf_cfg();
     let done_psnr = MetricCell::Done {
         values: vec![30.0],
         avg: 30.0,
@@ -955,10 +984,10 @@ fn done_stale_marking_matches_recompute_rules() {
         (
             skip,
             clip,
-            app.current_vmaf_cfg(),
-            app.scale_method,
-            app.fps_mode,
-            app.ref_pixfmt,
+            app.config.vmaf.current_vmaf_cfg(),
+            app.config.view.scale_method,
+            app.config.view.fps_mode,
+            app.config.reference.pixfmt,
         )
     };
     let (s, c, v, sc, fm, pf) = cur();
@@ -1018,11 +1047,9 @@ fn done_stale_marking_matches_recompute_rules() {
         pf
     ));
     // VMAF options change stales VMAF alone.
-    let vmaf_app = RFMetricsApp {
-        vmaf_subsample: "5".to_owned(),
-        ..RFMetricsApp::default()
-    };
-    let new_vmaf = vmaf_app.current_vmaf_cfg();
+    let mut vmaf_app = RFMetricsApp::default();
+    vmaf_app.config.vmaf.subsample = "5".to_owned();
+    let new_vmaf = vmaf_app.config.vmaf.current_vmaf_cfg();
     assert_ne!(cur_vmaf, new_vmaf);
     assert!(done_is_stale(
         MetricKind::Vmaf,
@@ -1102,8 +1129,8 @@ fn refresh_ranks_single_row_stays_plain() {
     use crate::metrics::ffmpeg::MetricKind;
     use crate::metrics::{MetricCell, StatRank};
     let mut app = RFMetricsApp::default();
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].psnr = MetricCell::Done {
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].psnr = MetricCell::Done {
         values: vec![30.0, 31.0],
         avg: 30.5,
         exec_s: 1.0,
@@ -1114,22 +1141,22 @@ fn refresh_ranks_single_row_stays_plain() {
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
-    let stats = app.rows[0].psnr.done_stats();
-    app.rows[0].psnr_cache.stats = stats;
-    app.refresh_ranks(MetricKind::Psnr);
-    assert_eq!(app.rows[0].psnr_cache.ranks, [StatRank::Plain; 10]);
+    let stats = app.queue.rows[0].psnr.done_stats();
+    app.queue.rows[0].psnr_cache.stats = stats;
+    app.queue.refresh_ranks(MetricKind::Psnr);
+    assert_eq!(app.queue.rows[0].psnr_cache.ranks, [StatRank::Plain; 10]);
 }
 
 #[test]
 fn stop_keeps_done_and_settles_running_to_idle() {
-    use super::MetricMsg;
+    use super::run::MetricMsg;
     use crate::metrics::MetricCell;
     use std::sync::atomic::Ordering;
     let mut app = RFMetricsApp::default();
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows.push(psnr_test_row("C:/vids/b.mp4", true));
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows.push(psnr_test_row("C:/vids/b.mp4", true));
     // a finished before Stop, b was in flight.
-    app.rows[0].psnr = MetricCell::Done {
+    app.queue.rows[0].psnr = MetricCell::Done {
         values: vec![30.0],
         avg: 30.0,
         exec_s: 1.0,
@@ -1140,22 +1167,23 @@ fn stop_keeps_done_and_settles_running_to_idle() {
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
-    app.rows[1].psnr = MetricCell::Running {
+    app.queue.rows[1].psnr = MetricCell::Running {
         frame: 12,
         values: Vec::new(),
     };
-    app.rows[1].ssim = MetricCell::Running {
+    app.queue.rows[1].ssim = MetricCell::Running {
         frame: 3,
         values: Vec::new(),
     };
-    app.measuring = true;
-    app.pending = 1;
-    app.run_generation = 1;
+    app.run.measuring = true;
+    app.run.pending = 1;
+    app.run.generation = 1;
 
     app.stop_psnr();
-    assert!(app.abort.load(Ordering::SeqCst));
+    assert!(app.run.abort.load(Ordering::SeqCst));
 
-    app.metric_tx
+    app.run
+        .metric_tx
         .send(MetricMsg::Finished {
             generation: 1,
             aborted: true,
@@ -1164,38 +1192,39 @@ fn stop_keeps_done_and_settles_running_to_idle() {
     app.drain_metric_results();
     // Processed result kept; unprocessed settled; button flips back.
     assert!(matches!(
-        &app.rows[0].psnr,
+        &app.queue.rows[0].psnr,
         MetricCell::Done { avg, .. } if (*avg - 30.0).abs() < 1e-9
     ));
-    assert!(matches!(app.rows[1].psnr, MetricCell::Idle));
-    assert!(matches!(app.rows[1].ssim, MetricCell::Idle));
-    assert!(!app.measuring);
-    assert_eq!(app.pending, 0);
+    assert!(matches!(app.queue.rows[1].psnr, MetricCell::Idle));
+    assert!(matches!(app.queue.rows[1].ssim, MetricCell::Idle));
+    assert!(!app.run.measuring);
+    assert_eq!(app.run.pending, 0);
 }
 
 #[test]
 fn stop_settles_killed_cell_to_idle() {
-    use super::MetricMsg;
+    use super::run::MetricMsg;
     use crate::metrics::MetricCell;
     use crate::metrics::ffmpeg::MetricKind;
     let mut app = RFMetricsApp::default();
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows.push(psnr_test_row("C:/vids/b.mp4", true));
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows.push(psnr_test_row("C:/vids/b.mp4", true));
     // a is the killed in-flight job, b never started.
-    app.rows[0].psnr = MetricCell::Running {
+    app.queue.rows[0].psnr = MetricCell::Running {
         frame: 42,
         values: Vec::new(),
     };
-    app.rows[1].psnr = MetricCell::Running {
+    app.queue.rows[1].psnr = MetricCell::Running {
         frame: 0,
         values: Vec::new(),
     };
-    app.measuring = true;
-    app.pending = 2;
-    app.run_generation = 1;
+    app.run.measuring = true;
+    app.run.pending = 2;
+    app.run.generation = 1;
 
     // The killed job reports back first: quiet settle, not an error.
-    app.metric_tx
+    app.run
+        .metric_tx
         .send(MetricMsg::Done {
             generation: 1,
             kind: MetricKind::Psnr,
@@ -1213,36 +1242,38 @@ fn stop_settles_killed_cell_to_idle() {
         })
         .unwrap();
     app.drain_metric_results();
-    assert!(matches!(app.rows[0].psnr, MetricCell::Idle));
+    assert!(matches!(app.queue.rows[0].psnr, MetricCell::Idle));
 
     // `Finished` settles the unstarted row; the run ends.
-    app.metric_tx
+    app.run
+        .metric_tx
         .send(MetricMsg::Finished {
             generation: 1,
             aborted: true,
         })
         .unwrap();
     app.drain_metric_results();
-    assert!(matches!(app.rows[1].psnr, MetricCell::Idle));
-    assert!(!app.measuring);
-    assert_eq!(app.pending, 0);
+    assert!(matches!(app.queue.rows[1].psnr, MetricCell::Idle));
+    assert!(!app.run.measuring);
+    assert_eq!(app.run.pending, 0);
 }
 
 #[test]
 fn clean_finish_leaves_cells_and_clears_measuring() {
-    use super::MetricMsg;
+    use super::run::MetricMsg;
     let mut app = RFMetricsApp::default();
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.measuring = true;
-    app.run_generation = 1;
-    app.metric_tx
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.run.measuring = true;
+    app.run.generation = 1;
+    app.run
+        .metric_tx
         .send(MetricMsg::Finished {
             generation: 1,
             aborted: false,
         })
         .unwrap();
     app.drain_metric_results();
-    assert!(!app.measuring);
+    assert!(!app.run.measuring);
 }
 
 /// Last `Done` must not clear `measuring`: the worker sends `Finished`
@@ -1251,23 +1282,22 @@ fn clean_finish_leaves_cells_and_clears_measuring() {
 /// (losing the auto-save trigger and CSV summary).
 #[test]
 fn last_done_keeps_measuring_until_finished() {
-    use super::MetricMsg;
+    use super::run::MetricMsg;
     use crate::metrics::MetricCell;
     use crate::metrics::ffmpeg::MetricKind;
-    let mut app = RFMetricsApp {
-        results_autosave: true,
-        ..RFMetricsApp::default()
-    };
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].psnr = MetricCell::Running {
+    let mut app = RFMetricsApp::default();
+    app.config.export.results_autosave = true;
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].psnr = MetricCell::Running {
         frame: 42,
         values: Vec::new(),
     };
-    app.measuring = true;
-    app.pending = 1;
-    app.run_generation = 1;
+    app.run.measuring = true;
+    app.run.pending = 1;
+    app.run.generation = 1;
 
-    app.metric_tx
+    app.run
+        .metric_tx
         .send(MetricMsg::Done {
             generation: 1,
             kind: MetricKind::Psnr,
@@ -1286,26 +1316,28 @@ fn last_done_keeps_measuring_until_finished() {
         .unwrap();
     app.drain_metric_results();
     assert!(
-        matches!(&app.rows[0].psnr, MetricCell::Done { .. }),
+        matches!(&app.queue.rows[0].psnr, MetricCell::Done { .. }),
         "last Done must still apply its cell"
     );
-    assert_eq!(app.pending, 0);
+    assert_eq!(app.run.pending, 0);
     assert!(
-        app.measuring,
+        app.run.measuring,
         "last Done must not reopen Start before Finished lands"
     );
 
-    app.metric_tx
+    app.run
+        .metric_tx
         .send(MetricMsg::Finished {
             generation: 1,
             aborted: false,
         })
         .unwrap();
     app.drain_metric_results();
-    assert!(!app.measuring);
-    assert!(app.results_autosave_pending);
+    assert!(!app.run.measuring);
+    assert!(app.run.results_autosave_pending);
 
-    app.metric_tx
+    app.run
+        .metric_tx
         .send(MetricMsg::CsvReport {
             generation: 1,
             ok: 2,
@@ -1313,7 +1345,7 @@ fn last_done_keeps_measuring_until_finished() {
         })
         .unwrap();
     app.drain_metric_results();
-    assert_eq!(app.csv_report, Some((2, Vec::new())));
+    assert_eq!(app.run.csv_report, Some((2, Vec::new())));
 }
 
 /// Pre-flight errors must not leave stale result caches behind: rank,
@@ -1325,12 +1357,10 @@ fn preflight_error_clears_cached_stats_and_ranks() {
     use crate::metrics::{CellStat, MetricCell, StatRank};
     let p = std::env::temp_dir().join("rfmetrics-preflight-cache.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_psnr: true,
-        ref_path: p.to_string_lossy().into_owned(),
-        skip: "abc".to_owned(), // unparseable: hits the bad-time path
-        ..RFMetricsApp::default()
-    };
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = true;
+    app.config.reference.path = p.to_string_lossy().into_owned();
+    app.config.reference.skip = "abc".to_owned(); // unparseable: hits the bad-time path
     for (path, avg) in [("C:/vids/a.mp4", 30.0), ("C:/vids/b.mp4", 32.0)] {
         let mut row = psnr_test_row(path, true);
         row.psnr = MetricCell::Done {
@@ -1345,24 +1375,25 @@ fn preflight_error_clears_cached_stats_and_ranks() {
             ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
         };
         row.psnr_cache.stats = row.psnr.done_stats();
-        app.rows.push(row);
+        app.queue.rows.push(row);
     }
-    app.refresh_ranks(MetricKind::Psnr);
+    app.queue.refresh_ranks(MetricKind::Psnr);
     // Sanity: two scored rows rank against each other before the error.
     assert!(
-        app.rows
+        app.queue
+            .rows
             .iter()
             .any(|r| r.psnr_cache.ranks != [StatRank::Plain; 10])
     );
 
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
-    for row in &app.rows {
+    for row in &app.queue.rows {
         assert!(matches!(&row.psnr, MetricCell::Error { msg } if msg == "bad time"),);
         assert!(row.psnr_cache.stats.is_none(), "stale stats survived");
         assert_eq!(row.psnr_cache.ranks, [StatRank::Plain; 10]);
         assert_eq!(
-            crate::app_queue::sort_stat(row, MetricKind::Psnr, CellStat::Avg),
+            crate::app::queue::sort_stat(row, MetricKind::Psnr, CellStat::Avg),
             None
         );
     }
@@ -1373,48 +1404,45 @@ fn preflight_error_clears_cached_stats_and_ranks() {
 /// touches tmp afterwards). Idle close deletes immediately.
 #[test]
 fn badframe_close_defers_tmp_cleanup_while_busy() {
-    use super::BadframeMsg;
+    use super::badframes::BadframeMsg;
     let dir = std::env::temp_dir().join(format!("rfmetrics-bf-close-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("a.PSNR.bf000001.png"), b"x").unwrap();
 
     // Busy close: tmp survives, cleanup armed.
-    let mut app = RFMetricsApp {
-        badframe_tmp: dir.clone(),
-        show_badframes: true,
-        badframes_busy: true,
-        ..RFMetricsApp::default()
-    };
+    let mut app = RFMetricsApp::default();
+    app.badframes.tmp = dir.clone();
+    app.badframes.open = true;
+    app.badframes.busy = true;
     app.close_badframes();
-    assert!(!app.show_badframes);
-    assert!(app.badframe_tmp_cleanup_pending);
+    assert!(!app.badframes.open);
+    assert!(app.badframes.tmp_cleanup_pending);
     assert!(
         dir.join("a.PSNR.bf000001.png").is_file(),
         "tmp deleted under a live worker"
     );
 
     // The worker's last word clears busy and fires the deferred delete.
-    app.badframe_tx
+    app.badframes
+        .tx
         .send(BadframeMsg::Finished {
             ok: 1,
             errors: Vec::new(),
         })
         .unwrap();
     app.drain_badframe_results(0.0);
-    assert!(!app.badframes_busy);
-    assert!(!app.badframe_tmp_cleanup_pending);
+    assert!(!app.badframes.busy);
+    assert!(!app.badframes.tmp_cleanup_pending);
     assert!(!dir.exists(), "deferred tmp cleanup never fired");
 
     // Idle close: immediate delete, nothing armed.
     std::fs::create_dir_all(&dir).unwrap();
-    let mut app = RFMetricsApp {
-        badframe_tmp: dir.clone(),
-        show_badframes: true,
-        ..RFMetricsApp::default()
-    };
+    let mut app = RFMetricsApp::default();
+    app.badframes.tmp = dir.clone();
+    app.badframes.open = true;
     app.close_badframes();
-    assert!(!app.badframe_tmp_cleanup_pending);
+    assert!(!app.badframes.tmp_cleanup_pending);
     assert!(!dir.exists());
 }
 
@@ -1423,17 +1451,15 @@ fn start_psnr_bad_time_marks_all_included() {
     use crate::metrics::MetricCell;
     let p = std::env::temp_dir().join("rfmetrics-psnr-skip.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_psnr: true,
-        m_ssim: true,
-        m_vmaf: false,
-        ref_path: p.to_string_lossy().into_owned(),
-        skip: "abc".to_owned(), // unparseable: settings uncomparable
-        ..RFMetricsApp::default()
-    };
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows.push(psnr_test_row("C:/vids/b.mp4", true));
-    app.rows[0].psnr = MetricCell::Done {
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = true;
+    app.config.metrics.ssim = true;
+    app.config.metrics.vmaf = false;
+    app.config.reference.path = p.to_string_lossy().into_owned();
+    app.config.reference.skip = "abc".to_owned(); // unparseable: settings uncomparable
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows.push(psnr_test_row("C:/vids/b.mp4", true));
+    app.queue.rows[0].psnr = MetricCell::Done {
         values: vec![30.0],
         avg: 30.0,
         exec_s: 1.0,
@@ -1449,14 +1475,14 @@ fn start_psnr_bad_time_marks_all_included() {
     // Garbage settings can't be compared against the stored trim, so
     // even valid rows take the error (Python writes all targets too).
     for i in 0..2 {
-        for cell in [&app.rows[i].psnr, &app.rows[i].ssim] {
+        for cell in [&app.queue.rows[i].psnr, &app.queue.rows[i].ssim] {
             assert!(
                 matches!(cell, MetricCell::Error { msg } if msg == "bad time"),
                 "row {i} should be bad time, got {cell:?}",
             );
         }
     }
-    assert!(!app.measuring);
+    assert!(!app.run.measuring);
 }
 
 #[test]
@@ -1464,14 +1490,12 @@ fn start_psnr_all_done_toasts_without_running() {
     use crate::metrics::MetricCell;
     let p = std::env::temp_dir().join("rfmetrics-psnr-skipall.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_psnr: true,
-        m_vmaf: false,
-        ref_path: p.to_string_lossy().into_owned(),
-        ..RFMetricsApp::default()
-    };
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].psnr = MetricCell::Done {
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = true;
+    app.config.metrics.vmaf = false;
+    app.config.reference.path = p.to_string_lossy().into_owned();
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].psnr = MetricCell::Done {
         values: vec![30.0],
         avg: 30.0,
         exec_s: 1.0,
@@ -1484,9 +1508,9 @@ fn start_psnr_all_done_toasts_without_running() {
     };
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
-    assert!(!app.measuring);
-    assert!(app.pending == 0);
-    let toast = app.toast.as_ref().expect("skip toast shown");
+    assert!(!app.run.measuring);
+    assert!(app.run.pending == 0);
+    let toast = app.ui.toast.as_ref().expect("skip toast shown");
     assert!(toast.text.contains("Skipped 1 with existing PSNR"));
 }
 
@@ -1497,30 +1521,28 @@ fn start_run_plot_at_start_opens_plot() {
     use crate::probe::MediaInfo;
     let p = std::env::temp_dir().join("rfmetrics-plot-at-start.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_psnr: true,
-        m_vmaf: false,
-        ref_path: p.to_string_lossy().into_owned(),
-        plot_at_start: true,
-        ..RFMetricsApp::default()
-    };
-    app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
-    app.ref_info_data = Some(MediaInfo::default());
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].info = Some(MediaInfo::default());
-    assert!(!app.show_plot);
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = true;
+    app.config.metrics.vmaf = false;
+    app.config.reference.path = p.to_string_lossy().into_owned();
+    app.config.view.plot_at_start = true;
+    app.binaries.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+    app.ref_probe.info_data = Some(MediaInfo::default());
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].info = Some(MediaInfo::default());
+    assert!(!app.plots.open);
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
-    assert!(app.measuring);
-    assert!(app.show_plot);
+    assert!(app.run.measuring);
+    assert!(app.plots.open);
     for _ in 0..200 {
         app.drain_metric_results();
-        if !app.measuring {
+        if !app.run.measuring {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert!(!app.measuring);
+    assert!(!app.run.measuring);
 }
 
 #[test]
@@ -1528,29 +1550,27 @@ fn start_run_plot_stays_closed_by_default() {
     use crate::probe::MediaInfo;
     let p = std::env::temp_dir().join("rfmetrics-plot-default-closed.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_psnr: true,
-        m_vmaf: false,
-        ref_path: p.to_string_lossy().into_owned(),
-        ..RFMetricsApp::default()
-    };
-    assert!(!app.plot_at_start);
-    app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
-    app.ref_info_data = Some(MediaInfo::default());
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].info = Some(MediaInfo::default());
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = true;
+    app.config.metrics.vmaf = false;
+    app.config.reference.path = p.to_string_lossy().into_owned();
+    assert!(!app.config.view.plot_at_start);
+    app.binaries.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+    app.ref_probe.info_data = Some(MediaInfo::default());
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
-    assert!(app.measuring);
-    assert!(!app.show_plot);
+    assert!(app.run.measuring);
+    assert!(!app.plots.open);
     for _ in 0..200 {
         app.drain_metric_results();
-        if !app.measuring {
+        if !app.run.measuring {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert!(!app.measuring);
+    assert!(!app.run.measuring);
 }
 
 /// Regression: the jobs loop must iterate `fresh`, never `targets`.
@@ -1561,20 +1581,18 @@ fn start_psnr_rerun_leaves_done_row_untouched() {
     use crate::probe::MediaInfo;
     let p = std::env::temp_dir().join("rfmetrics-psnr-rerun.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_psnr: true,
-        m_vmaf: false,
-        ref_path: p.to_string_lossy().into_owned(),
-        ..RFMetricsApp::default()
-    };
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = true;
+    app.config.metrics.vmaf = false;
+    app.config.reference.path = p.to_string_lossy().into_owned();
     // Fabricate everything past the pre-flights so the run reaches the
     // jobs loop; the ffmpeg binary doesn't exist, so the worker fails
     // the spawn asynchronously and the test stays headless-safe.
-    app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
-    app.ref_info_data = Some(MediaInfo::default());
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows.push(psnr_test_row("C:/vids/b.mp4", true));
-    app.rows[0].psnr = MetricCell::Done {
+    app.binaries.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+    app.ref_probe.info_data = Some(MediaInfo::default());
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows.push(psnr_test_row("C:/vids/b.mp4", true));
+    app.queue.rows[0].psnr = MetricCell::Done {
         values: vec![30.0],
         avg: 30.0,
         exec_s: 1.0,
@@ -1585,36 +1603,36 @@ fn start_psnr_rerun_leaves_done_row_untouched() {
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
-    app.rows[0].info = Some(MediaInfo::default());
-    app.rows[1].info = Some(MediaInfo::default());
+    app.queue.rows[0].info = Some(MediaInfo::default());
+    app.queue.rows[1].info = Some(MediaInfo::default());
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
     // Sync state right after Start: Done row untouched, fresh Running.
     assert!(
-        matches!(&app.rows[0].psnr, MetricCell::Done { avg, .. } if (*avg - 30.0).abs() < 1e-9),
+        matches!(&app.queue.rows[0].psnr, MetricCell::Done { avg, .. } if (*avg - 30.0).abs() < 1e-9),
         "Done row must never re-enter Running, got {:?}",
-        app.rows[0].psnr,
+        app.queue.rows[0].psnr,
     );
     assert!(matches!(
-        app.rows[1].psnr,
+        app.queue.rows[1].psnr,
         MetricCell::Running { frame: 0, .. }
     ));
-    assert!(app.measuring);
+    assert!(app.run.measuring);
     // Let the doomed worker land, then settle.
     for _ in 0..200 {
         app.drain_metric_results();
-        if !app.measuring {
+        if !app.run.measuring {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert!(!app.measuring);
+    assert!(!app.run.measuring);
     assert!(
-        matches!(&app.rows[0].psnr, MetricCell::Done { .. }),
+        matches!(&app.queue.rows[0].psnr, MetricCell::Done { .. }),
         "Done row must survive the whole rerun, got {:?}",
-        app.rows[0].psnr,
+        app.queue.rows[0].psnr,
     );
-    assert!(matches!(&app.rows[1].psnr, MetricCell::Error { .. }));
+    assert!(matches!(&app.queue.rows[1].psnr, MetricCell::Error { .. }));
 }
 
 /// Guard rail: a Done value stamped with different trim settings is
@@ -1625,17 +1643,15 @@ fn start_psnr_changed_trim_recomputes_done_row() {
     use crate::probe::MediaInfo;
     let p = std::env::temp_dir().join("rfmetrics-psnr-staletrim.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_psnr: true,
-        m_vmaf: false,
-        ref_path: p.to_string_lossy().into_owned(),
-        duration: "10".to_owned(), // value was computed with clip 5
-        ..RFMetricsApp::default()
-    };
-    app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
-    app.ref_info_data = Some(MediaInfo::default());
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].psnr = MetricCell::Done {
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = true;
+    app.config.metrics.vmaf = false;
+    app.config.reference.path = p.to_string_lossy().into_owned();
+    app.config.reference.duration = "10".to_owned(); // value was computed with clip 5
+    app.binaries.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+    app.ref_probe.info_data = Some(MediaInfo::default());
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].psnr = MetricCell::Done {
         values: vec![30.0],
         avg: 30.0,
         exec_s: 1.0,
@@ -1646,24 +1662,24 @@ fn start_psnr_changed_trim_recomputes_done_row() {
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
-    app.rows[0].info = Some(MediaInfo::default());
+    app.queue.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
     // Stale trim: the row re-enters the run instead of skipping.
     assert!(
-        matches!(app.rows[0].psnr, MetricCell::Running { .. }),
+        matches!(app.queue.rows[0].psnr, MetricCell::Running { .. }),
         "stale-trim Done must recompute, got {:?}",
-        app.rows[0].psnr,
+        app.queue.rows[0].psnr,
     );
-    assert!(app.measuring);
+    assert!(app.run.measuring);
     for _ in 0..200 {
         app.drain_metric_results();
-        if !app.measuring {
+        if !app.run.measuring {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert!(!app.measuring);
+    assert!(!app.run.measuring);
 }
 
 /// Same trim stamp still skips, even with nonzero settings.
@@ -1673,17 +1689,15 @@ fn start_psnr_matching_trim_still_skips() {
     use crate::probe::MediaInfo;
     let p = std::env::temp_dir().join("rfmetrics-psnr-sametrim.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_psnr: true,
-        m_vmaf: false,
-        ref_path: p.to_string_lossy().into_owned(),
-        duration: "10".to_owned(),
-        ..RFMetricsApp::default()
-    };
-    app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
-    app.ref_info_data = Some(MediaInfo::default());
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].psnr = MetricCell::Done {
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = true;
+    app.config.metrics.vmaf = false;
+    app.config.reference.path = p.to_string_lossy().into_owned();
+    app.config.reference.duration = "10".to_owned();
+    app.binaries.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+    app.ref_probe.info_data = Some(MediaInfo::default());
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].psnr = MetricCell::Done {
         values: vec![30.0],
         avg: 30.0,
         exec_s: 1.0,
@@ -1694,16 +1708,16 @@ fn start_psnr_matching_trim_still_skips() {
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
-    app.rows[0].info = Some(MediaInfo::default());
+    app.queue.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
-    assert!(!app.measuring);
+    assert!(!app.run.measuring);
     assert!(
-        matches!(&app.rows[0].psnr, MetricCell::Done { .. }),
+        matches!(&app.queue.rows[0].psnr, MetricCell::Done { .. }),
         "matching-trim Done must skip, got {:?}",
-        app.rows[0].psnr,
+        app.queue.rows[0].psnr,
     );
-    let toast = app.toast.as_ref().expect("skip toast shown");
+    let toast = app.ui.toast.as_ref().expect("skip toast shown");
     assert!(toast.text.contains("Skipped 1 with existing PSNR"));
 }
 
@@ -1717,20 +1731,18 @@ fn start_run_vmaf_settings_change_recomputes_vmaf_only() {
     use crate::probe::MediaInfo;
     let p = std::env::temp_dir().join("rfmetrics-vmaf-restamp.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_psnr: true,
-        m_vmaf: true,
-        ref_path: p.to_string_lossy().into_owned(),
-        ..RFMetricsApp::default()
-    };
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = true;
+    app.config.metrics.vmaf = true;
+    app.config.reference.path = p.to_string_lossy().into_owned();
     // Current UI settings snapshot to subsample 1; the stored VMAF
     // value was computed under subsample 5.
-    app.vmaf_subsample = "1".to_owned();
-    app.vmaf_threads = "4".to_owned();
-    app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
-    app.ref_info_data = Some(MediaInfo::default());
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].psnr = MetricCell::Done {
+    app.config.vmaf.subsample = "1".to_owned();
+    app.config.vmaf.threads = "4".to_owned();
+    app.binaries.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+    app.ref_probe.info_data = Some(MediaInfo::default());
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].psnr = MetricCell::Done {
         values: vec![30.0],
         avg: 30.0,
         exec_s: 1.0,
@@ -1741,7 +1753,7 @@ fn start_run_vmaf_settings_change_recomputes_vmaf_only() {
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
-    app.rows[0].vmaf = MetricCell::Done {
+    app.queue.rows[0].vmaf = MetricCell::Done {
         values: vec![90.0],
         avg: 90.0,
         exec_s: 1.0,
@@ -1759,32 +1771,32 @@ fn start_run_vmaf_settings_change_recomputes_vmaf_only() {
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
-    app.rows[0].info = Some(MediaInfo::default());
+    app.queue.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
-    assert!(app.measuring);
+    assert!(app.run.measuring);
     assert!(
-        matches!(&app.rows[0].psnr, MetricCell::Done { .. }),
+        matches!(&app.queue.rows[0].psnr, MetricCell::Done { .. }),
         "valid PSNR must keep skipping, got {:?}",
-        app.rows[0].psnr,
+        app.queue.rows[0].psnr,
     );
     assert!(
-        matches!(&app.rows[0].vmaf, MetricCell::Running { .. }),
+        matches!(&app.queue.rows[0].vmaf, MetricCell::Running { .. }),
         "stale-stamped VMAF must recompute, got {:?}",
-        app.rows[0].vmaf,
+        app.queue.rows[0].vmaf,
     );
     for _ in 0..200 {
         app.drain_metric_results();
-        if !app.measuring {
+        if !app.run.measuring {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert!(!app.measuring);
+    assert!(!app.run.measuring);
     // Spawn fails headless (bogus binary): the cell records the error
     // while PSNR still holds its skipped value.
-    assert!(matches!(&app.rows[0].vmaf, MetricCell::Error { .. }));
-    assert!(matches!(&app.rows[0].psnr, MetricCell::Done { .. }));
+    assert!(matches!(&app.queue.rows[0].vmaf, MetricCell::Error { .. }));
+    assert!(matches!(&app.queue.rows[0].psnr, MetricCell::Done { .. }));
 }
 
 /// Matching VMAF stamp still skips: unchanged options recompute nothing.
@@ -1795,18 +1807,16 @@ fn start_run_vmaf_matching_settings_still_skips() {
     use crate::probe::MediaInfo;
     let p = std::env::temp_dir().join("rfmetrics-vmaf-samestamp.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_psnr: true,
-        m_vmaf: true,
-        ref_path: p.to_string_lossy().into_owned(),
-        ..RFMetricsApp::default()
-    };
-    app.vmaf_subsample = "1".to_owned();
-    app.vmaf_threads = "4".to_owned();
-    app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
-    app.ref_info_data = Some(MediaInfo::default());
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].psnr = MetricCell::Done {
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = true;
+    app.config.metrics.vmaf = true;
+    app.config.reference.path = p.to_string_lossy().into_owned();
+    app.config.vmaf.subsample = "1".to_owned();
+    app.config.vmaf.threads = "4".to_owned();
+    app.binaries.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+    app.ref_probe.info_data = Some(MediaInfo::default());
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].psnr = MetricCell::Done {
         values: vec![30.0],
         avg: 30.0,
         exec_s: 1.0,
@@ -1817,7 +1827,7 @@ fn start_run_vmaf_matching_settings_still_skips() {
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
-    app.rows[0].vmaf = MetricCell::Done {
+    app.queue.rows[0].vmaf = MetricCell::Done {
         values: vec![90.0],
         avg: 90.0,
         exec_s: 1.0,
@@ -1835,13 +1845,13 @@ fn start_run_vmaf_matching_settings_still_skips() {
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
-    app.rows[0].info = Some(MediaInfo::default());
+    app.queue.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
-    assert!(!app.measuring);
-    assert!(matches!(&app.rows[0].psnr, MetricCell::Done { .. }));
-    assert!(matches!(&app.rows[0].vmaf, MetricCell::Done { .. }));
-    let toast = app.toast.as_ref().expect("skip toast shown");
+    assert!(!app.run.measuring);
+    assert!(matches!(&app.queue.rows[0].psnr, MetricCell::Done { .. }));
+    assert!(matches!(&app.queue.rows[0].vmaf, MetricCell::Done { .. }));
+    let toast = app.ui.toast.as_ref().expect("skip toast shown");
     assert_eq!(
         toast.text,
         "Skipped 1 with existing PSNR, VMAF (Reset to recompute)"
@@ -1858,17 +1868,15 @@ fn start_run_scaler_change_recomputes_ffmpeg_only() {
     use crate::probe::MediaInfo;
     let p = std::env::temp_dir().join("rfmetrics-scaler-restamp.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_psnr: true,
-        m_vmaf: false,
-        m_ssim2: true,
-        ref_path: p.to_string_lossy().into_owned(),
-        ..RFMetricsApp::default()
-    };
-    app.scale_method = ScaleMethod::Lanczos;
-    app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
-    app.ref_info_data = Some(MediaInfo::default());
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = true;
+    app.config.metrics.vmaf = false;
+    app.config.metrics.ssim2 = true;
+    app.config.reference.path = p.to_string_lossy().into_owned();
+    app.config.view.scale_method = ScaleMethod::Lanczos;
+    app.binaries.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+    app.ref_probe.info_data = Some(MediaInfo::default());
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
     let done = |avg: f64| MetricCell::Done {
         values: vec![avg],
         avg,
@@ -1880,34 +1888,34 @@ fn start_run_scaler_change_recomputes_ffmpeg_only() {
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
-    app.rows[0].psnr = done(30.0);
-    app.rows[0].ssim2 = done(80.0);
-    app.rows[0].info = Some(MediaInfo::default());
+    app.queue.rows[0].psnr = done(30.0);
+    app.queue.rows[0].ssim2 = done(80.0);
+    app.queue.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
-    assert!(app.measuring);
+    assert!(app.run.measuring);
     assert!(
-        matches!(&app.rows[0].psnr, MetricCell::Running { .. }),
+        matches!(&app.queue.rows[0].psnr, MetricCell::Running { .. }),
         "stale-stamped PSNR must recompute, got {:?}",
-        app.rows[0].psnr,
+        app.queue.rows[0].psnr,
     );
     assert!(
-        matches!(&app.rows[0].ssim2, MetricCell::Done { .. }),
+        matches!(&app.queue.rows[0].ssim2, MetricCell::Done { .. }),
         "FFVship SSIM2 ignores the scaler, got {:?}",
-        app.rows[0].ssim2,
+        app.queue.rows[0].ssim2,
     );
     for _ in 0..200 {
         app.drain_metric_results();
-        if !app.measuring {
+        if !app.run.measuring {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert!(!app.measuring);
+    assert!(!app.run.measuring);
     // Spawn fails headless (bogus binary): the cell records the error
     // while SSIM2 still holds its skipped value.
-    assert!(matches!(&app.rows[0].psnr, MetricCell::Error { .. }));
-    assert!(matches!(&app.rows[0].ssim2, MetricCell::Done { .. }));
+    assert!(matches!(&app.queue.rows[0].psnr, MetricCell::Error { .. }));
+    assert!(matches!(&app.queue.rows[0].ssim2, MetricCell::Done { .. }));
 }
 
 /// Fps-mode change recomputes ffmpeg-backed columns but leaves FFVship
@@ -1920,17 +1928,15 @@ fn start_run_fps_mode_change_recomputes_ffmpeg_only() {
     use crate::probe::MediaInfo;
     let p = std::env::temp_dir().join("rfmetrics-fpsmode-restamp.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_psnr: true,
-        m_vmaf: false,
-        m_ssim2: true,
-        ref_path: p.to_string_lossy().into_owned(),
-        ..RFMetricsApp::default()
-    };
-    app.fps_mode = InputFpsMode::Off;
-    app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
-    app.ref_info_data = Some(MediaInfo::default());
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = true;
+    app.config.metrics.vmaf = false;
+    app.config.metrics.ssim2 = true;
+    app.config.reference.path = p.to_string_lossy().into_owned();
+    app.config.view.fps_mode = InputFpsMode::Off;
+    app.binaries.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+    app.ref_probe.info_data = Some(MediaInfo::default());
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
     let done = |avg: f64| MetricCell::Done {
         values: vec![avg],
         avg,
@@ -1942,34 +1948,34 @@ fn start_run_fps_mode_change_recomputes_ffmpeg_only() {
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
-    app.rows[0].psnr = done(30.0);
-    app.rows[0].ssim2 = done(80.0);
-    app.rows[0].info = Some(MediaInfo::default());
+    app.queue.rows[0].psnr = done(30.0);
+    app.queue.rows[0].ssim2 = done(80.0);
+    app.queue.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
-    assert!(app.measuring);
+    assert!(app.run.measuring);
     assert!(
-        matches!(&app.rows[0].psnr, MetricCell::Running { .. }),
+        matches!(&app.queue.rows[0].psnr, MetricCell::Running { .. }),
         "stale-stamped PSNR must recompute, got {:?}",
-        app.rows[0].psnr,
+        app.queue.rows[0].psnr,
     );
     assert!(
-        matches!(&app.rows[0].ssim2, MetricCell::Done { .. }),
+        matches!(&app.queue.rows[0].ssim2, MetricCell::Done { .. }),
         "FFVship SSIM2 ignores the fps mode, got {:?}",
-        app.rows[0].ssim2,
+        app.queue.rows[0].ssim2,
     );
     for _ in 0..200 {
         app.drain_metric_results();
-        if !app.measuring {
+        if !app.run.measuring {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert!(!app.measuring);
+    assert!(!app.run.measuring);
     // Spawn fails headless (bogus binary): the cell records the error
     // while SSIM2 still holds its skipped value.
-    assert!(matches!(&app.rows[0].psnr, MetricCell::Error { .. }));
-    assert!(matches!(&app.rows[0].ssim2, MetricCell::Done { .. }));
+    assert!(matches!(&app.queue.rows[0].psnr, MetricCell::Error { .. }));
+    assert!(matches!(&app.queue.rows[0].ssim2, MetricCell::Done { .. }));
 }
 
 /// Pixel-format target change recomputes ffmpeg-backed columns but leaves
@@ -1983,17 +1989,15 @@ fn start_run_pixfmt_change_recomputes_ffmpeg_only() {
     use crate::probe::MediaInfo;
     let p = std::env::temp_dir().join("rfmetrics-pixfmt-restamp.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_psnr: true,
-        m_vmaf: false,
-        m_ssim2: true,
-        ref_path: p.to_string_lossy().into_owned(),
-        ..RFMetricsApp::default()
-    };
-    app.ref_pixfmt = RefPixFmt::Yuv444p;
-    app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
-    app.ref_info_data = Some(MediaInfo::default());
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = true;
+    app.config.metrics.vmaf = false;
+    app.config.metrics.ssim2 = true;
+    app.config.reference.path = p.to_string_lossy().into_owned();
+    app.config.reference.pixfmt = RefPixFmt::Yuv444p;
+    app.binaries.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+    app.ref_probe.info_data = Some(MediaInfo::default());
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
     let done = |avg: f64| MetricCell::Done {
         values: vec![avg],
         avg,
@@ -2005,34 +2009,34 @@ fn start_run_pixfmt_change_recomputes_ffmpeg_only() {
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: RefPixFmt::NoConversion,
     };
-    app.rows[0].psnr = done(30.0);
-    app.rows[0].ssim2 = done(80.0);
-    app.rows[0].info = Some(MediaInfo::default());
+    app.queue.rows[0].psnr = done(30.0);
+    app.queue.rows[0].ssim2 = done(80.0);
+    app.queue.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
-    assert!(app.measuring);
+    assert!(app.run.measuring);
     assert!(
-        matches!(&app.rows[0].psnr, MetricCell::Running { .. }),
+        matches!(&app.queue.rows[0].psnr, MetricCell::Running { .. }),
         "stale-stamped PSNR must recompute, got {:?}",
-        app.rows[0].psnr,
+        app.queue.rows[0].psnr,
     );
     assert!(
-        matches!(&app.rows[0].ssim2, MetricCell::Done { .. }),
+        matches!(&app.queue.rows[0].ssim2, MetricCell::Done { .. }),
         "FFVship SSIM2 ignores the pixel-format target, got {:?}",
-        app.rows[0].ssim2,
+        app.queue.rows[0].ssim2,
     );
     for _ in 0..200 {
         app.drain_metric_results();
-        if !app.measuring {
+        if !app.run.measuring {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert!(!app.measuring);
+    assert!(!app.run.measuring);
     // Spawn fails headless (bogus binary): the cell records the error
     // while SSIM2 still holds its skipped value.
-    assert!(matches!(&app.rows[0].psnr, MetricCell::Error { .. }));
-    assert!(matches!(&app.rows[0].ssim2, MetricCell::Done { .. }));
+    assert!(matches!(&app.queue.rows[0].psnr, MetricCell::Error { .. }));
+    assert!(matches!(&app.queue.rows[0].ssim2, MetricCell::Done { .. }));
 }
 
 /// RGB targets are ignored for VMAF (requires YUV): an RGB-stamped VMAF
@@ -2046,18 +2050,16 @@ fn start_run_rgb_target_ignored_for_vmaf_only() {
     use crate::probe::MediaInfo;
     let p = std::env::temp_dir().join("rfmetrics-pixfmt-vmafignore.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_psnr: true,
-        m_vmaf: true,
-        ref_path: p.to_string_lossy().into_owned(),
-        ..RFMetricsApp::default()
-    };
-    app.ref_pixfmt = RefPixFmt::Rgb24;
-    app.vmaf_subsample = "1".to_owned();
-    app.vmaf_threads = "4".to_owned();
-    app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
-    app.ref_info_data = Some(MediaInfo::default());
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = true;
+    app.config.metrics.vmaf = true;
+    app.config.reference.path = p.to_string_lossy().into_owned();
+    app.config.reference.pixfmt = RefPixFmt::Rgb24;
+    app.config.vmaf.subsample = "1".to_owned();
+    app.config.vmaf.threads = "4".to_owned();
+    app.binaries.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+    app.ref_probe.info_data = Some(MediaInfo::default());
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
     let vmaf_cfg = VmafCfg {
         model: "vmaf_v0.6.1.json".to_owned(),
         phone: false,
@@ -2066,7 +2068,7 @@ fn start_run_rgb_target_ignored_for_vmaf_only() {
         subsample: 1,
         n_threads: 4,
     };
-    app.rows[0].psnr = MetricCell::Done {
+    app.queue.rows[0].psnr = MetricCell::Done {
         values: vec![30.0],
         avg: 30.0,
         exec_s: 1.0,
@@ -2077,7 +2079,7 @@ fn start_run_rgb_target_ignored_for_vmaf_only() {
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: RefPixFmt::Rgb24,
     };
-    app.rows[0].vmaf = MetricCell::Done {
+    app.queue.rows[0].vmaf = MetricCell::Done {
         values: vec![90.0],
         avg: 90.0,
         exec_s: 1.0,
@@ -2088,14 +2090,14 @@ fn start_run_rgb_target_ignored_for_vmaf_only() {
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: RefPixFmt::Rgb24,
     };
-    app.rows[0].info = Some(MediaInfo::default());
+    app.queue.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
     // Matching RGB stamps: both skip (VMAF ignores the target, so its
     // legs match; PSNR's stamped target matches the selection too).
-    assert!(!app.measuring);
-    assert!(matches!(&app.rows[0].psnr, MetricCell::Done { .. }));
-    assert!(matches!(&app.rows[0].vmaf, MetricCell::Done { .. }));
+    assert!(!app.run.measuring);
+    assert!(matches!(&app.queue.rows[0].psnr, MetricCell::Done { .. }));
+    assert!(matches!(&app.queue.rows[0].vmaf, MetricCell::Done { .. }));
 }
 
 /// Pixel-format target persists and restores; unknown labels keep live.
@@ -2103,7 +2105,7 @@ fn start_run_rgb_target_ignored_for_vmaf_only() {
 fn state_apply_restores_ref_pixfmt() {
     use crate::metrics::ffmpeg::RefPixFmt;
     let mut app = RFMetricsApp::default();
-    assert_eq!(app.ref_pixfmt, RefPixFmt::NoConversion);
+    assert_eq!(app.config.reference.pixfmt, RefPixFmt::NoConversion);
     let state = crate::state::AppState {
         options: crate::state::OptionsState {
             ref_pixfmt: Some("YUV 444p".to_owned()),
@@ -2112,7 +2114,7 @@ fn state_apply_restores_ref_pixfmt() {
         ..Default::default()
     };
     app.apply_state(Some(state));
-    assert_eq!(app.ref_pixfmt, RefPixFmt::Yuv444p);
+    assert_eq!(app.config.reference.pixfmt, RefPixFmt::Yuv444p);
     assert!(app.snapshot().options.ref_pixfmt == Some("YUV 444p".to_owned()));
     let state = crate::state::AppState {
         options: crate::state::OptionsState {
@@ -2122,7 +2124,7 @@ fn state_apply_restores_ref_pixfmt() {
         ..Default::default()
     };
     app.apply_state(Some(state));
-    assert_eq!(app.ref_pixfmt, RefPixFmt::Yuv444p);
+    assert_eq!(app.config.reference.pixfmt, RefPixFmt::Yuv444p);
 }
 
 /// Matching scaler stamp still skips: unchanged method recomputes nothing.
@@ -2132,14 +2134,12 @@ fn start_run_matching_scaler_still_skips() {
     use crate::probe::MediaInfo;
     let p = std::env::temp_dir().join("rfmetrics-scaler-samestamp.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_psnr: true,
-        m_vmaf: false,
-        ref_path: p.to_string_lossy().into_owned(),
-        ..RFMetricsApp::default()
-    };
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].psnr = MetricCell::Done {
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = true;
+    app.config.metrics.vmaf = false;
+    app.config.reference.path = p.to_string_lossy().into_owned();
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].psnr = MetricCell::Done {
         values: vec![30.0],
         avg: 30.0,
         exec_s: 1.0,
@@ -2150,13 +2150,13 @@ fn start_run_matching_scaler_still_skips() {
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
-    app.rows[0].info = Some(MediaInfo::default());
-    app.ref_info_data = Some(MediaInfo::default());
+    app.queue.rows[0].info = Some(MediaInfo::default());
+    app.ref_probe.info_data = Some(MediaInfo::default());
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
-    assert!(!app.measuring);
-    assert!(matches!(&app.rows[0].psnr, MetricCell::Done { .. }));
-    let toast = app.toast.as_ref().expect("skip toast shown");
+    assert!(!app.run.measuring);
+    assert!(matches!(&app.queue.rows[0].psnr, MetricCell::Done { .. }));
+    let toast = app.ui.toast.as_ref().expect("skip toast shown");
     assert!(toast.text.contains("Skipped 1 with existing PSNR"));
 }
 
@@ -2168,16 +2168,14 @@ fn start_run_skip_toast_lists_all_metrics() {
     use crate::metrics::vmaf::{Pooling, VmafCfg};
     let p = std::env::temp_dir().join("rfmetrics-skipall-metrics.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_psnr: true,
-        m_ssim: true,
-        m_vmaf: true,
-        ref_path: p.to_string_lossy().into_owned(),
-        ..RFMetricsApp::default()
-    };
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = true;
+    app.config.metrics.ssim = true;
+    app.config.metrics.vmaf = true;
+    app.config.reference.path = p.to_string_lossy().into_owned();
     // Pin threads: the "auto" default resolves machine-dependently.
-    app.vmaf_threads = "4".to_owned();
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.config.vmaf.threads = "4".to_owned();
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
     let done = |avg: f64| MetricCell::Done {
         values: vec![avg],
         avg,
@@ -2189,9 +2187,9 @@ fn start_run_skip_toast_lists_all_metrics() {
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
-    app.rows[0].psnr = done(30.0);
-    app.rows[0].ssim = done(0.9);
-    app.rows[0].vmaf = MetricCell::Done {
+    app.queue.rows[0].psnr = done(30.0);
+    app.queue.rows[0].ssim = done(0.9);
+    app.queue.rows[0].vmaf = MetricCell::Done {
         values: vec![90.0],
         avg: 90.0,
         exec_s: 1.0,
@@ -2211,10 +2209,10 @@ fn start_run_skip_toast_lists_all_metrics() {
     };
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
-    assert!(!app.measuring);
+    assert!(!app.run.measuring);
     // Shared skip set merges into one line instead of repeating it
     // per metric (previously only the VMAF line survived).
-    let toast = app.toast.as_ref().expect("skip toast shown");
+    let toast = app.ui.toast.as_ref().expect("skip toast shown");
     assert_eq!(
         toast.text,
         "Skipped 1 with existing PSNR, SSIM, VMAF (Reset to recompute)"
@@ -2230,20 +2228,18 @@ fn start_run_skip_toast_merges_shared_rows() {
     use crate::probe::MediaInfo;
     let p = std::env::temp_dir().join("rfmetrics-skip-merge.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_psnr: true,
-        m_ssim: true,
-        m_vmaf: true,
-        ref_path: p.to_string_lossy().into_owned(),
-        ..RFMetricsApp::default()
-    };
-    app.vmaf_subsample = "1".to_owned();
-    app.vmaf_threads = "4".to_owned();
-    app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
-    app.ref_info_data = Some(MediaInfo::default());
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows.push(psnr_test_row("C:/vids/b.mp4", true));
-    app.rows[1].display = "b.mp4".to_owned();
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = true;
+    app.config.metrics.ssim = true;
+    app.config.metrics.vmaf = true;
+    app.config.reference.path = p.to_string_lossy().into_owned();
+    app.config.vmaf.subsample = "1".to_owned();
+    app.config.vmaf.threads = "4".to_owned();
+    app.binaries.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+    app.ref_probe.info_data = Some(MediaInfo::default());
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows.push(psnr_test_row("C:/vids/b.mp4", true));
+    app.queue.rows[1].display = "b.mp4".to_owned();
     let stale_vmaf = || MetricCell::Done {
         values: vec![90.0],
         avg: 90.0,
@@ -2263,7 +2259,7 @@ fn start_run_skip_toast_merges_shared_rows() {
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     for i in 0..2 {
-        app.rows[i].psnr = MetricCell::Done {
+        app.queue.rows[i].psnr = MetricCell::Done {
             values: vec![30.0],
             avg: 30.0,
             exec_s: 1.0,
@@ -2274,7 +2270,7 @@ fn start_run_skip_toast_merges_shared_rows() {
             fps_mode: InputFpsMode::Reference,
             ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
         };
-        app.rows[i].ssim = MetricCell::Done {
+        app.queue.rows[i].ssim = MetricCell::Done {
             values: vec![0.9],
             avg: 0.9,
             exec_s: 1.0,
@@ -2285,30 +2281,36 @@ fn start_run_skip_toast_merges_shared_rows() {
             fps_mode: InputFpsMode::Reference,
             ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
         };
-        app.rows[i].vmaf = stale_vmaf();
-        app.rows[i].info = Some(MediaInfo::default());
+        app.queue.rows[i].vmaf = stale_vmaf();
+        app.queue.rows[i].info = Some(MediaInfo::default());
     }
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
-    assert!(app.measuring);
+    assert!(app.run.measuring);
     // One line, filenames once — not repeated per metric.
-    let toast = app.toast.as_ref().expect("skip toast shown");
+    let toast = app.ui.toast.as_ref().expect("skip toast shown");
     assert_eq!(
         toast.text,
         "Skipped 2 with existing PSNR, SSIM: a.mp4, b.mp4"
     );
-    assert!(matches!(&app.rows[0].vmaf, MetricCell::Running { .. }));
-    assert!(matches!(&app.rows[1].vmaf, MetricCell::Running { .. }));
+    assert!(matches!(
+        &app.queue.rows[0].vmaf,
+        MetricCell::Running { .. }
+    ));
+    assert!(matches!(
+        &app.queue.rows[1].vmaf,
+        MetricCell::Running { .. }
+    ));
     for _ in 0..200 {
         app.drain_metric_results();
-        if !app.measuring {
+        if !app.run.measuring {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert!(!app.measuring);
-    assert!(matches!(&app.rows[0].psnr, MetricCell::Done { .. }));
-    assert!(matches!(&app.rows[1].ssim, MetricCell::Done { .. }));
+    assert!(!app.run.measuring);
+    assert!(matches!(&app.queue.rows[0].psnr, MetricCell::Done { .. }));
+    assert!(matches!(&app.queue.rows[1].ssim, MetricCell::Done { .. }));
 }
 
 /// SSIM-only run: only the SSIM cell enters the run, PSNR stays Idle.
@@ -2318,36 +2320,34 @@ fn start_run_ssim_only_runs_ssim_cell() {
     use crate::probe::MediaInfo;
     let p = std::env::temp_dir().join("rfmetrics-ssim-only.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_ssim: true,
-        m_vmaf: false,
-        ref_path: p.to_string_lossy().into_owned(),
-        ..RFMetricsApp::default()
-    };
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.ssim = true;
+    app.config.metrics.vmaf = false;
+    app.config.reference.path = p.to_string_lossy().into_owned();
     // Fabricate past the pre-flights; the binary doesn't exist so the
     // worker fails the spawn asynchronously (headless-safe).
-    app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
-    app.ref_info_data = Some(MediaInfo::default());
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].info = Some(MediaInfo::default());
+    app.binaries.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+    app.ref_probe.info_data = Some(MediaInfo::default());
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
-    assert!(app.measuring);
-    assert!(matches!(app.rows[0].psnr, MetricCell::Idle));
+    assert!(app.run.measuring);
+    assert!(matches!(app.queue.rows[0].psnr, MetricCell::Idle));
     assert!(matches!(
-        app.rows[0].ssim,
+        app.queue.rows[0].ssim,
         MetricCell::Running { frame: 0, .. }
     ));
     for _ in 0..200 {
         app.drain_metric_results();
-        if !app.measuring {
+        if !app.run.measuring {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert!(!app.measuring);
-    assert!(matches!(app.rows[0].psnr, MetricCell::Idle));
-    assert!(matches!(&app.rows[0].ssim, MetricCell::Error { .. }));
+    assert!(!app.run.measuring);
+    assert!(matches!(app.queue.rows[0].psnr, MetricCell::Idle));
+    assert!(matches!(&app.queue.rows[0].ssim, MetricCell::Error { .. }));
 }
 
 /// Mixed run: valid PSNR skips while fresh SSIM on the same row runs.
@@ -2357,17 +2357,15 @@ fn start_run_skips_done_psnr_but_runs_fresh_ssim() {
     use crate::probe::MediaInfo;
     let p = std::env::temp_dir().join("rfmetrics-ssim-mixed.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_psnr: true,
-        m_ssim: true,
-        m_vmaf: false,
-        ref_path: p.to_string_lossy().into_owned(),
-        ..RFMetricsApp::default()
-    };
-    app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
-    app.ref_info_data = Some(MediaInfo::default());
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].psnr = MetricCell::Done {
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = true;
+    app.config.metrics.ssim = true;
+    app.config.metrics.vmaf = false;
+    app.config.reference.path = p.to_string_lossy().into_owned();
+    app.binaries.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+    app.ref_probe.info_data = Some(MediaInfo::default());
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].psnr = MetricCell::Done {
         values: vec![30.0],
         avg: 30.0,
         exec_s: 1.0,
@@ -2378,28 +2376,28 @@ fn start_run_skips_done_psnr_but_runs_fresh_ssim() {
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
-    app.rows[0].info = Some(MediaInfo::default());
+    app.queue.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
-    assert!(app.measuring);
+    assert!(app.run.measuring);
     assert!(
-        matches!(&app.rows[0].psnr, MetricCell::Done { .. }),
+        matches!(&app.queue.rows[0].psnr, MetricCell::Done { .. }),
         "valid PSNR must skip, got {:?}",
-        app.rows[0].psnr,
+        app.queue.rows[0].psnr,
     );
     assert!(matches!(
-        app.rows[0].ssim,
+        app.queue.rows[0].ssim,
         MetricCell::Running { frame: 0, .. }
     ));
     for _ in 0..200 {
         app.drain_metric_results();
-        if !app.measuring {
+        if !app.run.measuring {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert!(!app.measuring);
-    assert!(matches!(&app.rows[0].psnr, MetricCell::Done { .. }));
+    assert!(!app.run.measuring);
+    assert!(matches!(&app.queue.rows[0].psnr, MetricCell::Done { .. }));
 }
 
 /// XPSNR-only run: only the XPSNR cell enters the run, the rest stay Idle.
@@ -2409,37 +2407,35 @@ fn start_run_xpsnr_only_runs_xpsnr_cell() {
     use crate::probe::MediaInfo;
     let p = std::env::temp_dir().join("rfmetrics-xpsnr-only.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_xpsnr: true,
-        m_vmaf: false,
-        ref_path: p.to_string_lossy().into_owned(),
-        ..RFMetricsApp::default()
-    };
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.xpsnr = true;
+    app.config.metrics.vmaf = false;
+    app.config.reference.path = p.to_string_lossy().into_owned();
     // Fabricate past the pre-flights; the binary doesn't exist so the
     // worker fails the spawn asynchronously (headless-safe).
-    app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
-    app.ref_info_data = Some(MediaInfo::default());
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].info = Some(MediaInfo::default());
+    app.binaries.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+    app.ref_probe.info_data = Some(MediaInfo::default());
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
-    assert!(app.measuring);
-    assert!(matches!(app.rows[0].psnr, MetricCell::Idle));
-    assert!(matches!(app.rows[0].ssim, MetricCell::Idle));
+    assert!(app.run.measuring);
+    assert!(matches!(app.queue.rows[0].psnr, MetricCell::Idle));
+    assert!(matches!(app.queue.rows[0].ssim, MetricCell::Idle));
     assert!(matches!(
-        app.rows[0].xpsnr,
+        app.queue.rows[0].xpsnr,
         MetricCell::Running { frame: 0, .. }
     ));
     for _ in 0..200 {
         app.drain_metric_results();
-        if !app.measuring {
+        if !app.run.measuring {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert!(!app.measuring);
-    assert!(matches!(app.rows[0].psnr, MetricCell::Idle));
-    assert!(matches!(&app.rows[0].xpsnr, MetricCell::Error { .. }));
+    assert!(!app.run.measuring);
+    assert!(matches!(app.queue.rows[0].psnr, MetricCell::Idle));
+    assert!(matches!(&app.queue.rows[0].xpsnr, MetricCell::Error { .. }));
 }
 
 /// Mixed run: valid XPSNR skips while fresh PSNR on the same row runs.
@@ -2449,17 +2445,15 @@ fn start_run_skips_done_xpsnr_but_runs_fresh_psnr() {
     use crate::probe::MediaInfo;
     let p = std::env::temp_dir().join("rfmetrics-xpsnr-mixed.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_psnr: true,
-        m_xpsnr: true,
-        m_vmaf: false,
-        ref_path: p.to_string_lossy().into_owned(),
-        ..RFMetricsApp::default()
-    };
-    app.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
-    app.ref_info_data = Some(MediaInfo::default());
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].xpsnr = MetricCell::Done {
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = true;
+    app.config.metrics.xpsnr = true;
+    app.config.metrics.vmaf = false;
+    app.config.reference.path = p.to_string_lossy().into_owned();
+    app.binaries.ffmpeg.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+    app.ref_probe.info_data = Some(MediaInfo::default());
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].xpsnr = MetricCell::Done {
         values: vec![40.0],
         avg: 40.0,
         exec_s: 1.0,
@@ -2470,28 +2464,28 @@ fn start_run_skips_done_xpsnr_but_runs_fresh_psnr() {
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
-    app.rows[0].info = Some(MediaInfo::default());
+    app.queue.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
-    assert!(app.measuring);
+    assert!(app.run.measuring);
     assert!(matches!(
-        app.rows[0].psnr,
+        app.queue.rows[0].psnr,
         MetricCell::Running { frame: 0, .. }
     ));
     assert!(
-        matches!(&app.rows[0].xpsnr, MetricCell::Done { .. }),
+        matches!(&app.queue.rows[0].xpsnr, MetricCell::Done { .. }),
         "valid XPSNR must skip, got {:?}",
-        app.rows[0].xpsnr,
+        app.queue.rows[0].xpsnr,
     );
     for _ in 0..200 {
         app.drain_metric_results();
-        if !app.measuring {
+        if !app.run.measuring {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert!(!app.measuring);
-    assert!(matches!(&app.rows[0].xpsnr, MetricCell::Done { .. }));
+    assert!(!app.run.measuring);
+    assert!(matches!(&app.queue.rows[0].xpsnr, MetricCell::Done { .. }));
 }
 
 /// SSIM2-only run: only the SSIM2 cell enters the run, the rest stay
@@ -2503,34 +2497,32 @@ fn start_run_ssim2_only_runs_ssim2_cell() {
     use crate::probe::MediaInfo;
     let p = std::env::temp_dir().join("rfmetrics-ssim2-only.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_ssim2: true,
-        m_vmaf: false,
-        ref_path: p.to_string_lossy().into_owned(),
-        ..RFMetricsApp::default()
-    };
-    app.ffvship.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
-    app.ffvship.usable = true;
-    app.ref_info_data = Some(MediaInfo::default());
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].info = Some(MediaInfo::default());
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.ssim2 = true;
+    app.config.metrics.vmaf = false;
+    app.config.reference.path = p.to_string_lossy().into_owned();
+    app.binaries.ffvship.path = Some(std::path::PathBuf::from("rfmetrics-no-such-binary"));
+    app.binaries.ffvship.usable = true;
+    app.ref_probe.info_data = Some(MediaInfo::default());
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
-    assert!(app.measuring);
-    assert!(matches!(app.rows[0].psnr, MetricCell::Idle));
+    assert!(app.run.measuring);
+    assert!(matches!(app.queue.rows[0].psnr, MetricCell::Idle));
     assert!(matches!(
-        app.rows[0].ssim2,
+        app.queue.rows[0].ssim2,
         MetricCell::Running { frame: 0, .. }
     ));
     for _ in 0..200 {
         app.drain_metric_results();
-        if !app.measuring {
+        if !app.run.measuring {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert!(!app.measuring);
-    assert!(matches!(&app.rows[0].ssim2, MetricCell::Error { .. }));
+    assert!(!app.run.measuring);
+    assert!(matches!(&app.queue.rows[0].ssim2, MetricCell::Error { .. }));
 }
 
 /// Missing FFVship binary: FFVship cells error out without running,
@@ -2541,29 +2533,31 @@ fn start_run_ffvship_missing_binary_errors_cells() {
     use crate::probe::MediaInfo;
     let p = std::env::temp_dir().join("rfmetrics-ffvship-missing.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_ssim2: true,
-        m_but: true,
-        m_cvvdp: true,
-        m_vmaf: false,
-        ref_path: p.to_string_lossy().into_owned(),
-        ..RFMetricsApp::default()
-    };
-    app.ffvship.path = None;
-    app.ffvship.usable = false;
-    app.ref_info_data = Some(MediaInfo::default());
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].info = Some(MediaInfo::default());
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.ssim2 = true;
+    app.config.metrics.butteraugli = true;
+    app.config.metrics.cvvdp = true;
+    app.config.metrics.vmaf = false;
+    app.config.reference.path = p.to_string_lossy().into_owned();
+    app.binaries.ffvship.path = None;
+    app.binaries.ffvship.usable = false;
+    app.ref_probe.info_data = Some(MediaInfo::default());
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].info = Some(MediaInfo::default());
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
-    assert!(!app.measuring);
-    for cell in [&app.rows[0].ssim2, &app.rows[0].butter, &app.rows[0].cvvdp] {
+    assert!(!app.run.measuring);
+    for cell in [
+        &app.queue.rows[0].ssim2,
+        &app.queue.rows[0].butter,
+        &app.queue.rows[0].cvvdp,
+    ] {
         assert!(
             matches!(cell, MetricCell::Error { msg } if msg == "FFVship not found"),
             "expected FFVship gate, got {cell:?}"
         );
     }
-    assert!(app.toast.is_some());
+    assert!(app.ui.toast.is_some());
 }
 
 /// BUTTER ranks min-wins on every stat (lower is better); other
@@ -2572,10 +2566,10 @@ fn start_run_ffvship_missing_binary_errors_cells() {
 fn butter_rank_is_min_wins() {
     use crate::metrics::{MetricCell, StatRank};
     let mut app = RFMetricsApp::default();
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows.push(psnr_test_row("C:/vids/b.mp4", true));
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows.push(psnr_test_row("C:/vids/b.mp4", true));
     for (i, avg) in [3.0, 5.0].into_iter().enumerate() {
-        app.rows[i].butter = MetricCell::Done {
+        app.queue.rows[i].butter = MetricCell::Done {
             values: vec![avg, avg],
             avg,
             exec_s: 1.0,
@@ -2586,12 +2580,13 @@ fn butter_rank_is_min_wins() {
             fps_mode: InputFpsMode::Reference,
             ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
         };
-        let stats = app.rows[i].butter.done_stats();
-        app.rows[i].butter_cache.stats = stats;
+        let stats = app.queue.rows[i].butter.done_stats();
+        app.queue.rows[i].butter_cache.stats = stats;
     }
-    app.refresh_ranks(crate::metrics::ffmpeg::MetricKind::But);
-    assert_eq!(app.rows[0].butter_cache.ranks[0], StatRank::Best);
-    assert_eq!(app.rows[1].butter_cache.ranks[0], StatRank::Worst);
+    app.queue
+        .refresh_ranks(crate::metrics::ffmpeg::MetricKind::But);
+    assert_eq!(app.queue.rows[0].butter_cache.ranks[0], StatRank::Best);
+    assert_eq!(app.queue.rows[1].butter_cache.ranks[0], StatRank::Worst);
 }
 
 /// State round-trip: snapshot captures boxes, toggles, options, and
@@ -2601,44 +2596,42 @@ fn state_snapshot_apply_round_trip() {
     use crate::probe::MediaInfo;
     let p = std::env::temp_dir().join("rfmetrics-state-rt.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        ref_path: "C:/vids/ref.mp4".to_owned(),
-        skip: "5".to_owned(),
-        duration: "00:10".to_owned(),
-        m_psnr: true,
-        m_vmaf: false,
-        m_ssim2: true,
-        vmaf_phone: true,
-        vmaf_pooling: "Harmonic Mean".to_owned(),
-        vmaf_threads: "4".to_owned(),
-        scale_method: ScaleMethod::Lanczos,
-        fps_mode: InputFpsMode::Off,
-        plot_at_start: true,
-        plot_size: crate::plot::PlotSize::S1600,
-        ..RFMetricsApp::default()
-    };
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows.push(psnr_test_row("C:/vids/b.mp4", false));
-    app.rows[0].info = Some(MediaInfo::default());
+    let mut app = RFMetricsApp::default();
+    app.config.reference.path = "C:/vids/ref.mp4".to_owned();
+    app.config.reference.skip = "5".to_owned();
+    app.config.reference.duration = "00:10".to_owned();
+    app.config.metrics.psnr = true;
+    app.config.metrics.vmaf = false;
+    app.config.metrics.ssim2 = true;
+    app.config.vmaf.phone = true;
+    app.config.vmaf.pooling = "Harmonic Mean".to_owned();
+    app.config.vmaf.threads = "4".to_owned();
+    app.config.view.scale_method = ScaleMethod::Lanczos;
+    app.config.view.fps_mode = InputFpsMode::Off;
+    app.config.view.plot_at_start = true;
+    app.config.view.plot_size = crate::plot::PlotSize::S1600;
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows.push(psnr_test_row("C:/vids/b.mp4", false));
+    app.queue.rows[0].info = Some(MediaInfo::default());
     let snap = app.snapshot();
     std::fs::remove_file(&p).ok();
 
     let mut fresh = RFMetricsApp::default();
     fresh.apply_state(Some(snap));
-    assert_eq!(fresh.ref_path, "C:/vids/ref.mp4");
-    assert_eq!(fresh.skip, "5");
-    assert_eq!(fresh.duration, "00:10");
-    assert!(fresh.m_psnr && !fresh.m_vmaf && fresh.m_ssim2);
-    assert!(fresh.vmaf_phone);
-    assert_eq!(fresh.vmaf_pooling, "Harmonic Mean");
-    assert_eq!(fresh.vmaf_threads, "4");
-    assert_eq!(fresh.scale_method, ScaleMethod::Lanczos);
-    assert_eq!(fresh.fps_mode, InputFpsMode::Off);
-    assert!(fresh.plot_at_start);
-    assert_eq!(fresh.plot_size, crate::plot::PlotSize::S1600);
+    assert_eq!(fresh.config.reference.path, "C:/vids/ref.mp4");
+    assert_eq!(fresh.config.reference.skip, "5");
+    assert_eq!(fresh.config.reference.duration, "00:10");
+    assert!(fresh.config.metrics.psnr && !fresh.config.metrics.vmaf && fresh.config.metrics.ssim2);
+    assert!(fresh.config.vmaf.phone);
+    assert_eq!(fresh.config.vmaf.pooling, "Harmonic Mean");
+    assert_eq!(fresh.config.vmaf.threads, "4");
+    assert_eq!(fresh.config.view.scale_method, ScaleMethod::Lanczos);
+    assert_eq!(fresh.config.view.fps_mode, InputFpsMode::Off);
+    assert!(fresh.config.view.plot_at_start);
+    assert_eq!(fresh.config.view.plot_size, crate::plot::PlotSize::S1600);
     // psnr_test_row paths don't exist on disk: only pre-existing rows
     // could restore, so the queue stays empty here.
-    assert!(fresh.rows.is_empty());
+    assert!(fresh.queue.rows.is_empty());
 }
 
 /// State apply restores live queue files with their include flags and
@@ -2670,11 +2663,11 @@ fn state_apply_restores_files_with_include() {
     app.apply_state(Some(state));
     std::fs::remove_file(&a).ok();
     std::fs::remove_file(&b).ok();
-    assert_eq!(app.rows.len(), 2);
-    assert!(app.rows[0].include);
-    assert!(!app.rows[1].include);
+    assert_eq!(app.queue.rows.len(), 2);
+    assert!(app.queue.rows[0].include);
+    assert!(!app.queue.rows[1].include);
     // Absent keys keep live defaults (VMAF-only).
-    assert!(!app.m_psnr && app.m_vmaf);
+    assert!(!app.config.metrics.psnr && app.config.metrics.vmaf);
 }
 
 /// State apply validates options: unknown models/pooling/subsamples
@@ -2693,10 +2686,10 @@ fn state_apply_validates_vmaf_options() {
         ..Default::default()
     };
     app.apply_state(Some(state));
-    assert_eq!(app.vmaf_model, "vmaf_v0.6.1.json");
-    assert_eq!(app.vmaf_pooling, "Mean");
-    assert_eq!(app.vmaf_subsample, "1");
-    assert!(app.vmaf_phone);
+    assert_eq!(app.config.vmaf.model, "vmaf_v0.6.1.json");
+    assert_eq!(app.config.vmaf.pooling, "Mean");
+    assert_eq!(app.config.vmaf.subsample, "1");
+    assert!(app.config.vmaf.phone);
 }
 
 /// Issue #7: restored ticks for filters this ffmpeg build lacks are
@@ -2706,7 +2699,8 @@ fn state_apply_unticks_unsupported_filters() {
     use crate::metrics::ffmpeg::MetricKind;
     let mut app = RFMetricsApp::default();
     // Simulate a w32threads-style build: everything but libvmaf.
-    app.ffmpeg.supported_metrics = vec![MetricKind::Psnr, MetricKind::Ssim, MetricKind::Xpsnr];
+    app.binaries.ffmpeg.supported_metrics =
+        vec![MetricKind::Psnr, MetricKind::Ssim, MetricKind::Xpsnr];
     let state = crate::state::AppState {
         metrics: crate::state::MetricsState {
             psnr: Some(true),
@@ -2718,8 +2712,8 @@ fn state_apply_unticks_unsupported_filters() {
         ..Default::default()
     };
     app.apply_state(Some(state));
-    assert!(app.m_psnr && app.m_ssim && app.m_xpsnr);
-    assert!(!app.m_vmaf);
+    assert!(app.config.metrics.psnr && app.config.metrics.ssim && app.config.metrics.xpsnr);
+    assert!(!app.config.metrics.vmaf);
 }
 
 /// FFVship parity with Issue #7: restored ticks for the FFVship family are
@@ -2740,28 +2734,79 @@ fn state_apply_unticks_ffvship_when_unusable() {
     };
     // Unusable binary: family ticks cleared, ffmpeg ticks kept.
     let mut app = RFMetricsApp::default();
-    app.ffmpeg.supported_metrics = vec![
+    app.binaries.ffmpeg.supported_metrics = vec![
         MetricKind::Psnr,
         MetricKind::Ssim,
         MetricKind::Vmaf,
         MetricKind::Xpsnr,
     ];
-    app.ffvship.usable = false;
+    app.binaries.ffvship.usable = false;
     app.apply_state(Some(state()));
-    assert!(app.m_psnr);
-    assert!(!app.m_ssim2 && !app.m_but && !app.m_cvvdp);
+    assert!(app.config.metrics.psnr);
+    assert!(
+        !app.config.metrics.ssim2 && !app.config.metrics.butteraugli && !app.config.metrics.cvvdp
+    );
     // Usable binary: restored family ticks survive.
     let mut app = RFMetricsApp::default();
-    app.ffmpeg.supported_metrics = vec![
+    app.binaries.ffmpeg.supported_metrics = vec![
         MetricKind::Psnr,
         MetricKind::Ssim,
         MetricKind::Vmaf,
         MetricKind::Xpsnr,
     ];
-    app.ffvship.usable = true;
+    app.binaries.ffvship.usable = true;
     app.apply_state(Some(state()));
-    assert!(app.m_psnr);
-    assert!(app.m_ssim2 && app.m_but && app.m_cvvdp);
+    assert!(app.config.metrics.psnr);
+    assert!(app.config.metrics.ssim2 && app.config.metrics.butteraugli && app.config.metrics.cvvdp);
+}
+
+/// Startup ordering: while the version probes are in flight the
+/// capability set is an empty placeholder — `apply_state` must not let
+/// the capability guard wipe restored ticks (or the VMAF-on default).
+/// Enforcement waits for `drain_bin_results`, which unticks against the
+/// real results once they land.
+#[test]
+fn state_apply_keeps_ticks_while_binaries_probing() {
+    let state = || crate::state::AppState {
+        metrics: crate::state::MetricsState {
+            psnr: Some(true),
+            ssim: Some(true),
+            vmaf: Some(true),
+            xpsnr: Some(true),
+            ssim2: Some(true),
+            butteraugli: Some(true),
+            cvvdp: Some(true),
+        },
+        ..Default::default()
+    };
+    // Probing placeholders (empty set, unusable FFVship): everything
+    // restored survives.
+    let mut app = RFMetricsApp::default();
+    app.binaries.probing = true;
+    app.binaries.ffmpeg.supported_metrics = Vec::new();
+    app.binaries.ffvship.usable = false;
+    app.apply_state(Some(state()));
+    assert!(
+        app.config.metrics.psnr
+            && app.config.metrics.ssim
+            && app.config.metrics.vmaf
+            && app.config.metrics.xpsnr
+            && app.config.metrics.ssim2
+            && app.config.metrics.butteraugli
+            && app.config.metrics.cvvdp
+    );
+    // Probes landed without ffmpeg/FFVship: the same guard now clears.
+    app.binaries.probing = false;
+    app.untick_unsupported_metrics();
+    assert!(
+        !app.config.metrics.psnr
+            && !app.config.metrics.ssim
+            && !app.config.metrics.vmaf
+            && !app.config.metrics.xpsnr
+            && !app.config.metrics.ssim2
+            && !app.config.metrics.butteraugli
+            && !app.config.metrics.cvvdp
+    );
 }
 
 /// Issue #7 backstop: a ticked-but-unsupported metric never reaches
@@ -2772,52 +2817,56 @@ fn start_run_unsupported_vmaf_is_noop() {
     use crate::probe::MediaInfo;
     let p = std::env::temp_dir().join("rfmetrics-unsupported-vmaf.tmp");
     std::fs::write(&p, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_psnr: false,
-        m_ssim: false,
-        m_vmaf: true,
-        ref_path: p.to_string_lossy().into_owned(),
-        ..RFMetricsApp::default()
-    };
-    app.ffmpeg.supported_metrics = vec![MetricKind::Psnr, MetricKind::Ssim, MetricKind::Xpsnr];
-    app.ref_info_data = Some(MediaInfo::default());
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = false;
+    app.config.metrics.ssim = false;
+    app.config.metrics.vmaf = true;
+    app.config.reference.path = p.to_string_lossy().into_owned();
+    app.binaries.ffmpeg.supported_metrics =
+        vec![MetricKind::Psnr, MetricKind::Ssim, MetricKind::Xpsnr];
+    app.ref_probe.info_data = Some(MediaInfo::default());
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
     app.start_run(0.0);
     std::fs::remove_file(&p).ok();
-    assert!(!app.measuring);
-    assert!(matches!(app.rows[0].vmaf, crate::metrics::MetricCell::Idle));
+    assert!(!app.run.measuring);
+    assert!(matches!(
+        app.queue.rows[0].vmaf,
+        crate::metrics::MetricCell::Idle
+    ));
 }
 
 /// CsvReport stashes the summary; the UI frame toasts it (drain has
 /// no timestamp). Stale generations stay silent.
 #[test]
 fn csv_report_stash_and_generation() {
-    use super::MetricMsg;
+    use super::run::MetricMsg;
     let mut app = RFMetricsApp::default();
-    app.metric_tx
+    app.run
+        .metric_tx
         .send(MetricMsg::CsvReport {
-            generation: app.run_generation,
+            generation: app.run.generation,
             ok: 3,
             errors: Vec::new(),
         })
         .unwrap();
     assert!(app.drain_metric_results());
     assert_eq!(
-        app.csv_report,
+        app.run.csv_report,
         Some((3, Vec::new())),
         "fresh report must stash"
     );
     // Stale report: dropped without touching the stash.
-    app.run_generation = app.run_generation.wrapping_add(1);
-    app.metric_tx
+    app.run.generation = app.run.generation.wrapping_add(1);
+    app.run
+        .metric_tx
         .send(MetricMsg::CsvReport {
-            generation: app.run_generation.wrapping_sub(1),
+            generation: app.run.generation.wrapping_sub(1),
             ok: 9,
             errors: vec!["x".to_owned()],
         })
         .unwrap();
     assert!(app.drain_metric_results());
-    assert_eq!(app.csv_report, Some((3, Vec::new())));
+    assert_eq!(app.run.csv_report, Some((3, Vec::new())));
 }
 
 /// CSV options persist and restore like the other Options keys.
@@ -2833,8 +2882,8 @@ fn state_apply_restores_csv_options() {
         ..Default::default()
     };
     app.apply_state(Some(state));
-    assert!(app.csv_export);
-    assert_eq!(app.csv_dir, "D:/csv");
+    assert!(app.config.export.csv_export);
+    assert_eq!(app.config.export.csv_dir, "D:/csv");
     assert!(app.snapshot().options.csv_export == Some(true));
 }
 
@@ -2850,7 +2899,7 @@ fn state_apply_restores_badframes_export_dir() {
         ..Default::default()
     };
     app.apply_state(Some(state));
-    assert_eq!(app.badframes_export_dir, "D:/bf");
+    assert_eq!(app.config.export.badframes_export_dir, "D:/bf");
     assert!(app.snapshot().options.badframes_export_dir == Some("D:/bf".to_owned()));
 }
 
@@ -2859,21 +2908,19 @@ fn state_apply_restores_badframes_export_dir() {
 /// stay silent.
 #[test]
 fn results_autosave_end_to_end() {
-    use super::MetricMsg;
+    use super::run::MetricMsg;
     use crate::metrics::MetricCell;
     let dir = std::env::temp_dir().join(format!("rfmetrics-autosave-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let mut app = RFMetricsApp {
-        results_autosave: true,
-        results_path: dir
-            .join("RFMetrics.Results.csv")
-            .to_string_lossy()
-            .into_owned(),
-        ..RFMetricsApp::default()
-    };
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].psnr = MetricCell::Done {
+    let mut app = RFMetricsApp::default();
+    app.config.export.results_autosave = true;
+    app.config.export.results_path = dir
+        .join("RFMetrics.Results.csv")
+        .to_string_lossy()
+        .into_owned();
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].psnr = MetricCell::Done {
         values: vec![30.0, 31.0],
         avg: 30.5,
         exec_s: 1.0,
@@ -2885,19 +2932,20 @@ fn results_autosave_end_to_end() {
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     for aborted in [false, true] {
-        app.metric_tx
+        app.run
+            .metric_tx
             .send(MetricMsg::Finished {
-                generation: app.run_generation,
+                generation: app.run.generation,
                 aborted,
             })
             .unwrap();
         app.drain_metric_results();
         assert!(
-            app.results_autosave_pending,
+            app.run.results_autosave_pending,
             "Finished (aborted={aborted}) must arm with the option on"
         );
         app.consume_autosave(0.0);
-        assert!(!app.results_autosave_pending);
+        assert!(!app.run.results_autosave_pending);
     }
     let text = std::fs::read_to_string(dir.join("RFMetrics.Results.csv")).unwrap();
     let lines: Vec<&str> = text.split("\r\n").collect();
@@ -2910,15 +2958,16 @@ fn results_autosave_end_to_end() {
     assert!(lines[1].contains("\t30.5\t"));
     assert_eq!(lines[3], "");
     // Opted out: Finished arms nothing.
-    app.results_autosave = false;
-    app.metric_tx
+    app.config.export.results_autosave = false;
+    app.run
+        .metric_tx
         .send(MetricMsg::Finished {
-            generation: app.run_generation,
+            generation: app.run.generation,
             aborted: false,
         })
         .unwrap();
     app.drain_metric_results();
-    assert!(!app.results_autosave_pending);
+    assert!(!app.run.results_autosave_pending);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2935,8 +2984,8 @@ fn state_apply_restores_results_options() {
         ..Default::default()
     };
     app.apply_state(Some(state));
-    assert!(app.results_autosave);
-    assert_eq!(app.results_path, "D:/r.csv");
+    assert!(app.config.export.results_autosave);
+    assert_eq!(app.config.export.results_path, "D:/r.csv");
     assert!(app.snapshot().options.results_autosave == Some(true));
 }
 
@@ -2958,86 +3007,84 @@ fn wall_stamp_shape() {
 #[test]
 fn dirty_check_matches_snapshot_compare() {
     let mut app = RFMetricsApp::default();
-    app.saved_snapshot = app.snapshot();
+    app.ui.saved_snapshot = app.snapshot();
     assert!(!app.is_state_dirty());
 
     // One mutation at a time: each must read dirty under both paths,
     // and re-saving must read clean.
     let check = |app: &mut RFMetricsApp| {
         assert!(app.is_state_dirty());
-        assert_ne!(app.snapshot(), app.saved_snapshot);
-        app.saved_snapshot = app.snapshot();
+        assert_ne!(app.snapshot(), app.ui.saved_snapshot);
+        app.ui.saved_snapshot = app.snapshot();
         assert!(!app.is_state_dirty());
     };
-    app.ref_path = "C:/vids/ref.mp4".to_owned();
+    app.config.reference.path = "C:/vids/ref.mp4".to_owned();
     check(&mut app);
-    app.skip = "5".to_owned();
+    app.config.reference.skip = "5".to_owned();
     check(&mut app);
-    app.duration = "00:10".to_owned();
+    app.config.reference.duration = "00:10".to_owned();
     check(&mut app);
-    app.m_psnr = !app.m_psnr;
+    app.config.metrics.psnr = !app.config.metrics.psnr;
     check(&mut app);
-    app.m_ssim = !app.m_ssim;
+    app.config.metrics.ssim = !app.config.metrics.ssim;
     check(&mut app);
-    app.m_vmaf = !app.m_vmaf;
+    app.config.metrics.vmaf = !app.config.metrics.vmaf;
     check(&mut app);
-    app.m_xpsnr = !app.m_xpsnr;
+    app.config.metrics.xpsnr = !app.config.metrics.xpsnr;
     check(&mut app);
-    app.m_ssim2 = !app.m_ssim2;
+    app.config.metrics.ssim2 = !app.config.metrics.ssim2;
     check(&mut app);
-    app.m_but = !app.m_but;
+    app.config.metrics.butteraugli = !app.config.metrics.butteraugli;
     check(&mut app);
-    app.m_cvvdp = !app.m_cvvdp;
+    app.config.metrics.cvvdp = !app.config.metrics.cvvdp;
     check(&mut app);
-    app.vmaf_model = "other.json".to_owned();
+    app.config.vmaf.model = "other.json".to_owned();
     check(&mut app);
-    app.vmaf_phone = !app.vmaf_phone;
+    app.config.vmaf.phone = !app.config.vmaf.phone;
     check(&mut app);
-    app.vmaf_scale = !app.vmaf_scale;
+    app.config.vmaf.scale = !app.config.vmaf.scale;
     check(&mut app);
-    app.vmaf_pooling = "Harmonic Mean".to_owned();
+    app.config.vmaf.pooling = "Harmonic Mean".to_owned();
     check(&mut app);
-    app.vmaf_subsample = "2".to_owned();
+    app.config.vmaf.subsample = "2".to_owned();
     check(&mut app);
-    app.vmaf_threads = "4".to_owned();
+    app.config.vmaf.threads = "4".to_owned();
     check(&mut app);
-    app.scale_method = ScaleMethod::Lanczos;
+    app.config.view.scale_method = ScaleMethod::Lanczos;
     check(&mut app);
-    app.plot_at_start = !app.plot_at_start;
+    app.config.view.plot_at_start = !app.config.view.plot_at_start;
     check(&mut app);
-    app.plot_size = crate::plot::PlotSize::S1600;
+    app.config.view.plot_size = crate::plot::PlotSize::S1600;
     check(&mut app);
-    app.csv_export = !app.csv_export;
+    app.config.export.csv_export = !app.config.export.csv_export;
     check(&mut app);
-    app.csv_dir = "D:/csv".to_owned();
+    app.config.export.csv_dir = "D:/csv".to_owned();
     check(&mut app);
-    app.results_autosave = !app.results_autosave;
+    app.config.export.results_autosave = !app.config.export.results_autosave;
     check(&mut app);
-    app.results_path = "D:/r.csv".to_owned();
+    app.config.export.results_path = "D:/r.csv".to_owned();
     check(&mut app);
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
     check(&mut app);
-    app.rows[0].include = false;
+    app.queue.rows[0].include = false;
     check(&mut app);
-    app.rows[0].path = "C:/vids/b.mp4".to_owned();
-    app.rows[0].key = norm_key("C:/vids/b.mp4");
+    app.queue.rows[0].path = "C:/vids/b.mp4".to_owned();
+    app.queue.rows[0].key = norm_key("C:/vids/b.mp4");
     check(&mut app);
     // Order-sensitive like the snapshot vec.
-    app.rows.push(psnr_test_row("C:/vids/c.mp4", true));
+    app.queue.rows.push(psnr_test_row("C:/vids/c.mp4", true));
     check(&mut app);
-    app.rows.swap(0, 1);
+    app.queue.rows.swap(0, 1);
     assert!(app.is_state_dirty());
-    assert_ne!(app.snapshot(), app.saved_snapshot);
+    assert_ne!(app.snapshot(), app.ui.saved_snapshot);
 }
 
 /// Exit flush: a change inside the debounce window still reaches disk —
 /// `on_exit` saves whenever dirty, so the final second is never lost.
 #[test]
 fn on_exit_flushes_dirty_state() {
-    let mut app = RFMetricsApp {
-        ref_path: "C:/vids/ref.mp4".to_owned(),
-        ..RFMetricsApp::default()
-    };
+    let mut app = RFMetricsApp::default();
+    app.config.reference.path = "C:/vids/ref.mp4".to_owned();
     assert!(app.is_state_dirty());
     eframe::App::on_exit(&mut app);
     assert!(!app.is_state_dirty(), "exit must leave nothing unsaved");
@@ -3055,19 +3102,19 @@ fn on_exit_flushes_dirty_state() {
 fn dirty_check_perf() {
     let mut app = RFMetricsApp::default();
     for i in 0..200 {
-        app.rows.push(psnr_test_row(
+        app.queue.rows.push(psnr_test_row(
             &format!("C:/vids/clip_{i:04}.mp4"),
             i % 2 == 0,
         ));
     }
-    app.saved_snapshot = app.snapshot();
+    app.ui.saved_snapshot = app.snapshot();
     assert!(!app.is_state_dirty());
 
     let n = 2000;
     let t0 = std::time::Instant::now();
     let mut dirty_old = false;
     for _ in 0..n {
-        dirty_old |= app.snapshot() != app.saved_snapshot;
+        dirty_old |= app.snapshot() != app.ui.saved_snapshot;
     }
     let old_ms = t0.elapsed();
     let t1 = std::time::Instant::now();
@@ -3088,17 +3135,17 @@ fn dirty_check_perf() {
 fn row_routing_perf() {
     let mut app = RFMetricsApp::default();
     for i in 0..200 {
-        app.rows.push(psnr_test_row(
+        app.queue.rows.push(psnr_test_row(
             &format!("C:/vids/clip_{i:04}.mp4"),
             i % 2 == 0,
         ));
     }
-    let key = app.rows[100].key.clone();
+    let key = app.queue.rows[100].key.clone();
     let n = 5000;
     let t0 = std::time::Instant::now();
     let mut found_old = 0;
     for _ in 0..n {
-        if let Some(r) = app.rows.iter().find(|r| norm_key(&r.path) == key) {
+        if let Some(r) = app.queue.rows.iter().find(|r| norm_key(&r.path) == key) {
             found_old += r.path.len();
         }
     }
@@ -3106,7 +3153,7 @@ fn row_routing_perf() {
     let t1 = std::time::Instant::now();
     let mut found_new = 0;
     for _ in 0..n {
-        if let Some(r) = app.rows.iter().find(|r| r.key == key) {
+        if let Some(r) = app.queue.rows.iter().find(|r| r.key == key) {
             found_new += r.path.len();
         }
     }
@@ -3119,12 +3166,12 @@ fn row_routing_perf() {
 /// `cell_text_prec()` by construction); Reset clears it.
 #[test]
 fn cell_text_cache_set_and_cleared() {
-    use super::MetricMsg;
+    use super::run::MetricMsg;
     use crate::metrics::MetricCell;
     use crate::metrics::ffmpeg::MetricKind;
     let mut app = RFMetricsApp::default();
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.run_generation = 1;
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.run.generation = 1;
     let done = |error: Option<String>| MetricMsg::Done {
         generation: 1,
         kind: MetricKind::Psnr,
@@ -3140,28 +3187,31 @@ fn cell_text_cache_set_and_cleared() {
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
-    app.metric_tx.send(done(None)).unwrap();
+    app.run.metric_tx.send(done(None)).unwrap();
     app.drain_metric_results();
-    assert_eq!(app.rows[0].psnr_cache.text, "30.1235");
+    assert_eq!(app.queue.rows[0].psnr_cache.text, "30.1235");
     assert_eq!(
-        app.rows[0].psnr_cache.text,
-        app.rows[0]
+        app.queue.rows[0].psnr_cache.text,
+        app.queue.rows[0]
             .psnr
             .cell_text_prec(crate::metrics::DEFAULT_PRECISION)
     );
-    app.metric_tx.send(done(Some("boom".to_owned()))).unwrap();
+    app.run
+        .metric_tx
+        .send(done(Some("boom".to_owned())))
+        .unwrap();
     app.drain_metric_results();
-    assert!(matches!(app.rows[0].psnr, MetricCell::Error { .. }));
-    assert_eq!(app.rows[0].psnr_cache.text, "boom");
+    assert!(matches!(app.queue.rows[0].psnr, MetricCell::Error { .. }));
+    assert_eq!(app.queue.rows[0].psnr_cache.text, "boom");
     app.reset_psnr();
-    assert!(app.rows[0].psnr_cache.text.is_empty());
+    assert!(app.queue.rows[0].psnr_cache.text.is_empty());
 }
 
 /// No-live-feed first Done (VMAF) on the shown tab owes one auto-fit
 /// poke; a later sibling row must not disturb the first fit.
 #[test]
 fn vmaf_first_done_arms_follow() {
-    use super::MetricMsg;
+    use super::run::MetricMsg;
     use crate::metrics::MetricCell;
     use crate::metrics::ffmpeg::MetricKind;
     let done = |key: &str| MetricMsg::Done {
@@ -3179,28 +3229,26 @@ fn vmaf_first_done_arms_follow() {
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
-    let mut app = RFMetricsApp {
-        show_plot: true,
-        plot_tab: MetricKind::Vmaf,
-        ..RFMetricsApp::default()
-    };
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].vmaf = MetricCell::Running {
+    let mut app = RFMetricsApp::default();
+    app.plots.open = true;
+    app.plots.tab = MetricKind::Vmaf;
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].vmaf = MetricCell::Running {
         frame: 0,
         values: Vec::new(),
     };
-    app.metric_tx.send(done("C:/vids/a.mp4")).unwrap();
+    app.run.metric_tx.send(done("C:/vids/a.mp4")).unwrap();
     app.drain_metric_results();
     assert!(
-        app.plot_follow_pending,
+        app.plots.follow_pending,
         "first VMAF Done on the shown tab must arm a refit"
     );
-    app.plot_follow_pending = false;
-    app.rows.push(psnr_test_row("C:/vids/b.mp4", true));
-    app.metric_tx.send(done("C:/vids/b.mp4")).unwrap();
+    app.plots.follow_pending = false;
+    app.queue.rows.push(psnr_test_row("C:/vids/b.mp4", true));
+    app.run.metric_tx.send(done("C:/vids/b.mp4")).unwrap();
     app.drain_metric_results();
     assert!(
-        !app.plot_follow_pending,
+        !app.plots.follow_pending,
         "later rows must not disturb the first fit"
     );
 }
@@ -3209,7 +3257,7 @@ fn vmaf_first_done_arms_follow() {
 /// errored runs never arm the poke.
 #[test]
 fn follow_arm_rules() {
-    use super::MetricMsg;
+    use super::run::MetricMsg;
     use crate::metrics::ffmpeg::MetricKind;
     let done = |kind, key: &str, error: Option<String>| MetricMsg::Done {
         generation: 0,
@@ -3227,34 +3275,36 @@ fn follow_arm_rules() {
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
     // Live-feed metric never arms, even first on the shown tab.
-    let mut app = RFMetricsApp {
-        show_plot: true,
-        plot_tab: MetricKind::Psnr,
-        ..RFMetricsApp::default()
-    };
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.metric_tx
+    let mut app = RFMetricsApp::default();
+    app.plots.open = true;
+    app.plots.tab = MetricKind::Psnr;
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.run
+        .metric_tx
         .send(done(MetricKind::Psnr, "C:/vids/a.mp4", None))
         .unwrap();
     app.drain_metric_results();
-    assert!(!app.plot_follow_pending);
+    assert!(!app.plots.follow_pending);
     // First VMAF data on a hidden tab never arms.
-    app.metric_tx
+    app.run
+        .metric_tx
         .send(done(MetricKind::Vmaf, "C:/vids/a.mp4", None))
         .unwrap();
     app.drain_metric_results();
-    assert!(!app.plot_follow_pending);
+    assert!(!app.plots.follow_pending);
     // Closed window never arms.
-    app.show_plot = false;
-    app.plot_tab = MetricKind::Vmaf;
-    app.metric_tx
+    app.plots.open = false;
+    app.plots.tab = MetricKind::Vmaf;
+    app.run
+        .metric_tx
         .send(done(MetricKind::Vmaf, "C:/vids/a.mp4", None))
         .unwrap();
     app.drain_metric_results();
-    assert!(!app.plot_follow_pending);
+    assert!(!app.plots.follow_pending);
     // Errored VMAF never arms.
-    app.show_plot = true;
-    app.metric_tx
+    app.plots.open = true;
+    app.run
+        .metric_tx
         .send(done(
             MetricKind::Vmaf,
             "C:/vids/a.mp4",
@@ -3262,7 +3312,7 @@ fn follow_arm_rules() {
         ))
         .unwrap();
     app.drain_metric_results();
-    assert!(!app.plot_follow_pending);
+    assert!(!app.plots.follow_pending);
 }
 
 /// Rerun start clears the frozen text synchronously (asserted before the
@@ -3276,21 +3326,19 @@ fn cell_text_cache_cleared_on_rerun() {
     let fake_exe = dir.join("rfmetrics-rerun-exe.tmp");
     std::fs::write(&ref_file, b"x").unwrap();
     std::fs::write(&fake_exe, b"x").unwrap();
-    let mut app = RFMetricsApp {
-        m_psnr: true,
-        m_vmaf: false,
-        ref_path: ref_file.to_string_lossy().into_owned(),
-        ref_info_data: Some(MediaInfo::default()),
-        ..RFMetricsApp::default()
-    };
-    app.ffmpeg.path = Some(fake_exe.clone());
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.rows[0].info = Some(MediaInfo::default());
-    app.rows[0].psnr_cache.text = "30.1235".to_owned();
+    let mut app = RFMetricsApp::default();
+    app.config.metrics.psnr = true;
+    app.config.metrics.vmaf = false;
+    app.config.reference.path = ref_file.to_string_lossy().into_owned();
+    app.ref_probe.info_data = Some(MediaInfo::default());
+    app.binaries.ffmpeg.path = Some(fake_exe.clone());
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows[0].info = Some(MediaInfo::default());
+    app.queue.rows[0].psnr_cache.text = "30.1235".to_owned();
     app.start_run(0.0);
-    assert!(matches!(app.rows[0].psnr, MetricCell::Running { .. }));
-    assert!(app.rows[0].psnr_cache.text.is_empty());
-    assert!(app.rows[0].psnr_cache.stats.is_none());
+    assert!(matches!(app.queue.rows[0].psnr, MetricCell::Running { .. }));
+    assert!(app.queue.rows[0].psnr_cache.text.is_empty());
+    assert!(app.queue.rows[0].psnr_cache.stats.is_none());
     app.reset_psnr();
     std::fs::remove_file(&ref_file).ok();
     std::fs::remove_file(&fake_exe).ok();
@@ -3350,12 +3398,12 @@ fn idle_heartbeat_budget() {
     use std::hint::black_box;
     let mut app = RFMetricsApp::default();
     for i in 0..200 {
-        app.rows.push(psnr_test_row(
+        app.queue.rows.push(psnr_test_row(
             &format!("C:/vids/clip_{i:04}.mp4"),
             i % 2 == 0,
         ));
     }
-    app.saved_snapshot = app.snapshot();
+    app.ui.saved_snapshot = app.snapshot();
     let raw: Vec<Vec<f64>> = (0..5)
         .map(|s| {
             (0..5000)
@@ -3369,7 +3417,7 @@ fn idle_heartbeat_budget() {
     let mut acc = 0usize;
     for _ in 0..n {
         acc += app.is_state_dirty() as usize;
-        for row in &app.rows {
+        for row in &app.queue.rows {
             for kind in MetricKind::ALL {
                 let text: &str = match row.cell(kind) {
                     MetricCell::Idle => "N/A",
@@ -3402,16 +3450,18 @@ fn idle_heartbeat_budget() {
 /// Stale messages count as traffic (one harmless extra frame).
 #[test]
 fn drains_report_activity() {
-    use super::{MetricMsg, PngSaveMsg, ThumbMsg};
+    use super::plots::PngSaveMsg;
+    use super::run::{MetricMsg, ThumbMsg};
     use crate::metrics::ffmpeg::MetricKind;
     let ctx = egui::Context::default();
     let mut app = RFMetricsApp::default();
     assert!(!app.drain_probe_results());
     assert!(!app.drain_metric_results());
-    assert!(!app.drain_png_results(&ctx, 0.0));
+    assert!(!app.plots.drain_png_results(&ctx, 0.0, &mut app.ui));
     assert!(!app.drain_thumbs(&ctx));
     // Stale metric message (wrong generation) is still traffic.
-    app.metric_tx
+    app.run
+        .metric_tx
         .send(MetricMsg::Progress {
             generation: 999,
             kind: MetricKind::Psnr,
@@ -3422,7 +3472,8 @@ fn drains_report_activity() {
     assert!(app.drain_metric_results());
     assert!(!app.drain_metric_results());
     // Stale probe message likewise.
-    app.probe_tx
+    app.ref_probe
+        .probe_tx
         .send(ProbeMsg::Reference {
             generation: 999,
             text: "stale".to_owned(),
@@ -3433,18 +3484,20 @@ fn drains_report_activity() {
     assert!(app.drain_probe_results());
     assert!(!app.drain_probe_results());
     // PNG worker reply lands a toast.
-    app.png_tx
+    app.plots
+        .png_tx
         .send(PngSaveMsg::Saved {
             path: std::path::PathBuf::from("C:/vids/plot.png"),
         })
         .unwrap();
-    assert!(app.drain_png_results(&ctx, 0.0));
-    assert!(app.toast.is_some());
-    assert!(!app.drain_png_results(&ctx, 0.0));
+    assert!(app.plots.drain_png_results(&ctx, 0.0, &mut app.ui));
+    assert!(app.ui.toast.is_some());
+    assert!(!app.plots.drain_png_results(&ctx, 0.0, &mut app.ui));
     // Empty-image thumbnail clears without touching the GPU path.
-    app.thumb_tx
+    app.ref_probe
+        .thumb_tx
         .send(ThumbMsg {
-            generation: app.thumb_generation,
+            generation: app.ref_probe.thumb_generation,
             image: None,
         })
         .unwrap();
@@ -3452,7 +3505,8 @@ fn drains_report_activity() {
     assert!(!app.drain_thumbs(&ctx));
     // Refresh helpers propagate their drain flags (paths unchanged, so
     // no worker spawns — pure drain reporting).
-    app.probe_tx
+    app.ref_probe
+        .probe_tx
         .send(ProbeMsg::Reference {
             generation: 999,
             text: "stale".to_owned(),
@@ -3462,9 +3516,10 @@ fn drains_report_activity() {
         .unwrap();
     assert!(app.refresh_ref_info());
     assert!(!app.refresh_ref_info());
-    app.thumb_tx
+    app.ref_probe
+        .thumb_tx
         .send(ThumbMsg {
-            generation: app.thumb_generation,
+            generation: app.ref_probe.thumb_generation,
             image: None,
         })
         .unwrap();
@@ -3484,12 +3539,12 @@ fn fps_counter_budget() {
     use std::hint::black_box;
     let mut app = RFMetricsApp::default();
     for i in 0..200 {
-        app.rows.push(psnr_test_row(
+        app.queue.rows.push(psnr_test_row(
             &format!("C:/vids/clip_{i:04}.mp4"),
             i % 2 == 0,
         ));
     }
-    app.saved_snapshot = app.snapshot();
+    app.ui.saved_snapshot = app.snapshot();
     let kinds = MetricKind::ALL;
     let cells: Vec<MetricCell> = (0..200 * kinds.len()).map(|_| MetricCell::Idle).collect();
     let raw: Vec<Vec<f64>> = (0..5)
@@ -3505,7 +3560,7 @@ fn fps_counter_budget() {
     let t0 = std::time::Instant::now();
     let mut acc = 0usize;
     for _ in 0..n {
-        acc += (app.snapshot() != app.saved_snapshot) as usize;
+        acc += (app.snapshot() != app.ui.saved_snapshot) as usize;
         for (cell, kind) in cells.iter().zip(kinds.iter().cycle()) {
             let text = cell.cell_text_prec(crate::metrics::DEFAULT_PRECISION);
             let tip = cell.tooltip(kind.name());
@@ -3585,7 +3640,7 @@ fn fps_counter_budget() {
 /// qualifies; anything else (or no/zero duration) falls back.
 #[test]
 fn thumb_duration_reuse_rules() {
-    use crate::app_queue::thumb_duration;
+    use crate::app::queue::thumb_duration;
     assert_eq!(
         thumb_duration("C:/r.mp4", "C:/r.mp4", Some(63.0)),
         Some(63.0)
@@ -3602,24 +3657,24 @@ fn thumb_duration_reuse_rules() {
 /// The reference drain records which path its info was probed from.
 #[test]
 fn ref_drain_tracks_info_path() {
-    let mut app = RFMetricsApp {
-        last_spawned_ref: "C:/vids/r.mp4".to_owned(),
-        ..RFMetricsApp::default()
-    };
-    app.probe_tx
+    let mut app = RFMetricsApp::default();
+    app.ref_probe.last_spawned = "C:/vids/r.mp4".to_owned();
+    app.ref_probe
+        .probe_tx
         .send(ProbeMsg::Reference {
-            generation: app.ref_generation,
+            generation: app.ref_probe.generation,
             text: "info".to_owned(),
             info: None,
             timed_out: false,
         })
         .unwrap();
     app.drain_probe_results();
-    assert_eq!(app.ref_info_path, "C:/vids/r.mp4");
+    assert_eq!(app.ref_probe.info_path, "C:/vids/r.mp4");
     // Stale generation leaves the tracked path alone.
-    app.last_spawned_ref = "C:/vids/new.mp4".to_owned();
-    app.ref_generation = app.ref_generation.wrapping_add(1);
-    app.probe_tx
+    app.ref_probe.last_spawned = "C:/vids/new.mp4".to_owned();
+    app.ref_probe.generation = app.ref_probe.generation.wrapping_add(1);
+    app.ref_probe
+        .probe_tx
         .send(ProbeMsg::Reference {
             generation: 0,
             text: "stale".to_owned(),
@@ -3628,7 +3683,7 @@ fn ref_drain_tracks_info_path() {
         })
         .unwrap();
     app.drain_probe_results();
-    assert_eq!(app.ref_info_path, "C:/vids/r.mp4");
+    assert_eq!(app.ref_probe.info_path, "C:/vids/r.mp4");
 }
 
 /// Alt+click on a checked include box isolates it; on a solo/all-off
@@ -3735,11 +3790,12 @@ fn selection_alt_solo_and_shift_clicked_wins() {
 #[test]
 fn probe_timeout_note_recorded_once() {
     let mut app = RFMetricsApp::default();
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
-    app.probe_tx
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.ref_probe
+        .probe_tx
         .send(ProbeMsg::RowMedia {
             key: norm_key("C:/vids/a.mp4"),
-            probe_gen: app.rows[0].probe_gen,
+            probe_gen: app.queue.rows[0].probe_gen,
             media: "x".to_owned(),
             tip: "y".to_owned(),
             info: None,
@@ -3747,9 +3803,10 @@ fn probe_timeout_note_recorded_once() {
         })
         .unwrap();
     app.drain_probe_results();
-    assert_eq!(app.probe_timeout_note.as_deref(), Some("a.mp4"));
+    assert_eq!(app.ref_probe.timeout_note.as_deref(), Some("a.mp4"));
     // Stale ref timeout: generation mismatch drops it, note untouched.
-    app.probe_tx
+    app.ref_probe
+        .probe_tx
         .send(ProbeMsg::Reference {
             generation: 999,
             text: "Probe timed out".to_owned(),
@@ -3758,9 +3815,10 @@ fn probe_timeout_note_recorded_once() {
         })
         .unwrap();
     app.drain_probe_results();
-    assert_eq!(app.probe_timeout_note.as_deref(), Some("a.mp4"));
+    assert_eq!(app.ref_probe.timeout_note.as_deref(), Some("a.mp4"));
     // Timeout for a removed row stays silent.
-    app.probe_tx
+    app.ref_probe
+        .probe_tx
         .send(ProbeMsg::RowMedia {
             key: "gone".to_owned(),
             probe_gen: 0,
@@ -3771,7 +3829,7 @@ fn probe_timeout_note_recorded_once() {
         })
         .unwrap();
     app.drain_probe_results();
-    assert_eq!(app.probe_timeout_note.as_deref(), Some("a.mp4"));
+    assert_eq!(app.ref_probe.timeout_note.as_deref(), Some("a.mp4"));
 }
 
 /// Minimal queue row for sort tests: distinct display name plus an
@@ -3806,7 +3864,7 @@ fn sort_test_row(
 /// third clears to insertion; switching columns restarts.
 #[test]
 fn sort_cycle_path_and_metrics() {
-    use crate::app_queue::{SortColumn, SortDir, cycle_sort, initial_dir};
+    use crate::app::queue::{SortColumn, SortDir, cycle_sort, initial_dir};
     use crate::metrics::CellStat;
     use crate::metrics::ffmpeg::MetricKind;
     assert_eq!(
@@ -3857,7 +3915,7 @@ fn sort_cycle_path_and_metrics() {
 /// unscored rows always last in both directions, stable ties.
 #[test]
 fn sort_view_orders_and_restores() {
-    use crate::app_queue::{SortColumn, SortDir, sort_view};
+    use crate::app::queue::{SortColumn, SortDir, sort_view};
     use crate::metrics::CellStat;
     use crate::metrics::ffmpeg::MetricKind;
     let rows = vec![
@@ -3911,7 +3969,7 @@ fn sort_view_orders_and_restores() {
 /// path (populated) and the uncached fallback (cleared).
 #[test]
 fn sort_view_follows_cell_stat_selector() {
-    use crate::app_queue::{SortColumn, SortDir, sort_view};
+    use crate::app::queue::{SortColumn, SortDir, sort_view};
     use crate::metrics::CellStat;
     use crate::metrics::ffmpeg::MetricKind;
     fn scored(display: &str, values: Vec<f64>, avg: f64, cache: bool) -> QueueRow {
@@ -3957,7 +4015,7 @@ fn sort_view_follows_cell_stat_selector() {
 fn state_apply_restores_cell_stat() {
     use crate::metrics::CellStat;
     let mut app = RFMetricsApp::default();
-    assert_eq!(app.cell_stat, CellStat::Avg);
+    assert_eq!(app.config.view.cell_stat, CellStat::Avg);
     let state = crate::state::AppState {
         options: crate::state::OptionsState {
             cell_stat: Some("Max".to_owned()),
@@ -3966,7 +4024,7 @@ fn state_apply_restores_cell_stat() {
         ..Default::default()
     };
     app.apply_state(Some(state));
-    assert_eq!(app.cell_stat, CellStat::Max);
+    assert_eq!(app.config.view.cell_stat, CellStat::Max);
     assert!(app.snapshot().options.cell_stat == Some("Max".to_owned()));
     let state = crate::state::AppState {
         options: crate::state::OptionsState {
@@ -3976,14 +4034,14 @@ fn state_apply_restores_cell_stat() {
         ..Default::default()
     };
     app.apply_state(Some(state));
-    assert_eq!(app.cell_stat, CellStat::Max);
+    assert_eq!(app.config.view.cell_stat, CellStat::Max);
 }
 
 /// Precision persists and restores; out-of-range labels keep the live value.
 #[test]
 fn state_apply_restores_cell_precision() {
     let mut app = RFMetricsApp::default();
-    assert_eq!(app.cell_precision, 4);
+    assert_eq!(app.config.view.cell_precision, 4);
     let state = crate::state::AppState {
         options: crate::state::OptionsState {
             cell_precision: Some("2".to_owned()),
@@ -3992,7 +4050,7 @@ fn state_apply_restores_cell_precision() {
         ..Default::default()
     };
     app.apply_state(Some(state));
-    assert_eq!(app.cell_precision, 2);
+    assert_eq!(app.config.view.cell_precision, 2);
     assert!(app.snapshot().options.cell_precision == Some("2".to_owned()));
     for bad in ["abc", "7", ""] {
         let state = crate::state::AppState {
@@ -4003,7 +4061,10 @@ fn state_apply_restores_cell_precision() {
             ..Default::default()
         };
         app.apply_state(Some(state));
-        assert_eq!(app.cell_precision, 2, "label {bad:?} must be rejected");
+        assert_eq!(
+            app.config.view.cell_precision, 2,
+            "label {bad:?} must be rejected"
+        );
     }
 }
 
@@ -4013,7 +4074,7 @@ fn state_apply_restores_cell_precision() {
 fn refreeze_cell_texts_updates_all_done_cells() {
     use crate::metrics::MetricCell;
     let mut app = RFMetricsApp::default();
-    app.rows.push(psnr_test_row("C:/vids/a.mp4", true));
+    app.queue.rows.push(psnr_test_row("C:/vids/a.mp4", true));
     let done = |avg: f64| MetricCell::Done {
         values: vec![avg],
         avg,
@@ -4025,22 +4086,22 @@ fn refreeze_cell_texts_updates_all_done_cells() {
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt::NoConversion,
     };
-    app.rows[0].psnr = done(30.123_456);
-    app.rows[0].ssim = done(0.987_654);
-    app.rows[0].psnr_cache.text = app.rows[0].psnr.cell_text_prec(4);
-    app.rows[0].ssim_cache.text = app.rows[0].ssim.cell_text_prec(4);
-    assert_eq!(app.rows[0].psnr_cache.text, "30.1235");
-    app.cell_precision = 2;
+    app.queue.rows[0].psnr = done(30.123_456);
+    app.queue.rows[0].ssim = done(0.987_654);
+    app.queue.rows[0].psnr_cache.text = app.queue.rows[0].psnr.cell_text_prec(4);
+    app.queue.rows[0].ssim_cache.text = app.queue.rows[0].ssim.cell_text_prec(4);
+    assert_eq!(app.queue.rows[0].psnr_cache.text, "30.1235");
+    app.config.view.cell_precision = 2;
     app.refreeze_cell_texts();
-    assert_eq!(app.rows[0].psnr_cache.text, "30.12");
-    assert_eq!(app.rows[0].ssim_cache.text, "0.99");
+    assert_eq!(app.queue.rows[0].psnr_cache.text, "30.12");
+    assert_eq!(app.queue.rows[0].ssim_cache.text, "0.99");
     // Idle cells have no text to re-freeze.
-    assert!(app.rows[0].vmaf_cache.text.is_empty());
+    assert!(app.queue.rows[0].vmaf_cache.text.is_empty());
 }
 
 #[test]
 fn running_sweep_ping_pongs() {
-    use crate::app_widgets::running_sweep_pos;
+    use crate::app::widgets::running_sweep_pos;
     // 0.7s per leg: 0 → 1 → 0 → 1 …
     assert!((running_sweep_pos(0.0) - 0.0).abs() < 1e-6);
     assert!((running_sweep_pos(0.35) - 0.5).abs() < 1e-6);

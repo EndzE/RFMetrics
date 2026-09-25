@@ -36,6 +36,17 @@ fn stderr_tail_keeps_last_non_empty_lines() {
 }
 
 #[test]
+fn no_data_outcome_picks_tail_or_fallback() {
+    assert_eq!(last_err_line(""), None);
+    assert_eq!(last_err_line("a\n\n  b \n"), Some("b"));
+    let out = no_data_outcome("PSNR", "d.mp4", Some(1), 0.5, "x\nboom\n", "no PSNR data");
+    assert_eq!(out.error.as_deref(), Some("boom"));
+    assert!(out.values.is_empty());
+    let out = no_data_outcome("PSNR", "d.mp4", Some(1), 0.5, "  \n", "no PSNR data");
+    assert_eq!(out.error.as_deref(), Some("no PSNR data"));
+}
+
+#[test]
 fn frame_lines() {
     use super::MetricKind::Psnr;
     assert_eq!(

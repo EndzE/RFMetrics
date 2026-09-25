@@ -5,9 +5,7 @@
 //! FFVship-specific. Scores are never clamped (Python parity: finite-check
 //! only) — unlike the PSNR/SSIM frame clamps.
 
-use crate::metrics::ffmpeg::{
-    FrameDetail, RunInputs, RunOutcome, STDERR_TAIL_LINES, pump_process, stderr_tail,
-};
+use crate::metrics::ffmpeg::{FrameDetail, RunInputs, RunOutcome, no_data_outcome, pump_process};
 use crate::probe::MediaInfo;
 
 /// Which FFVship metric a run computes: CLI name, per-line score count,
@@ -217,13 +215,7 @@ pub fn run_ffvship(
     } = *job;
     let name = kind.metric_arg();
     // FFVship kinds are out of CSV scope: no frame detail is retained.
-    let fail = |msg: String| RunOutcome {
-        values: Vec::new(),
-        avg: None,
-        exec_s: 0.0,
-        error: Some(msg),
-        detail: crate::metrics::ffmpeg::FrameDetail::None,
-    };
+    let fail = |msg: String| RunOutcome::error(msg, 0.0);
     let (window, expected_n) = match trim_window_frames(ref_info, dist_info, skip, clip_dur) {
         Ok(w) => w,
         Err(e) => {
@@ -242,18 +234,7 @@ pub fn run_ffvship(
     // Malformed lines are skipped live; `Done` replaces the buffer with
     // the strict result either way. Same throttle as `run_metric`.
     let n_scores = kind.n_scores();
-    let mut pending: Vec<f64> = Vec::new();
-    let mut last_emit = std::time::Instant::now();
-    let emit = |pending: &mut Vec<f64>, last_emit: &mut std::time::Instant| {
-        if !pending.is_empty()
-            && (pending.len() >= crate::metrics::ffmpeg::SERIES_BATCH
-                || last_emit.elapsed() >= crate::metrics::ffmpeg::SERIES_THROTTLE)
-        {
-            on_series(pending);
-            pending.clear();
-            *last_emit = std::time::Instant::now();
-        }
-    };
+    let mut series = crate::metrics::ffmpeg::SeriesEmitter::new(on_series);
     let pumped = match pump_process(
         exe,
         &args,
@@ -269,8 +250,7 @@ pub fn run_ffvship(
                 on_progress(frames);
             }
             if let Some(v) = live_value(line, n_scores) {
-                pending.push(v);
-                emit(&mut pending, &mut last_emit);
+                series.push(v);
             }
         },
         on_progress,
@@ -283,13 +263,7 @@ pub fn run_ffvship(
     };
     if pumped.aborted {
         log::info!(target: "rfmetrics::metric", "{name} \"{dist_path}\" aborted after {:.1}s", pumped.exec_s);
-        return RunOutcome {
-            values: Vec::new(),
-            avg: None,
-            exec_s: pumped.exec_s,
-            error: Some("aborted".to_owned()),
-            detail: crate::metrics::ffmpeg::FrameDetail::None,
-        };
+        return RunOutcome::error("aborted".to_owned(), pumped.exec_s);
     }
     // Python ignores the exit code and trusts the strict parse instead.
     // Full ordered rows feed both the pooled series (first score, the
@@ -318,24 +292,14 @@ pub fn run_ffvship(
                 },
             }
         }
-        None => {
-            let msg = pumped
-                .stderr
-                .lines()
-                .map(str::trim)
-                .rfind(|l| !l.is_empty())
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("no {name} data"));
-            let dump = stderr_tail(&pumped.stderr, STDERR_TAIL_LINES);
-            log::warn!(target: "rfmetrics::metric", "{name} no data for \"{dist_path}\" (exit {:?}, {:.1}s): {msg}\n{dump}", pumped.code, pumped.exec_s);
-            RunOutcome {
-                values: Vec::new(),
-                avg: None,
-                exec_s: pumped.exec_s,
-                error: Some(msg),
-                detail: crate::metrics::ffmpeg::FrameDetail::None,
-            }
-        }
+        None => no_data_outcome(
+            name,
+            dist_path,
+            pumped.code,
+            pumped.exec_s,
+            &pumped.stderr,
+            &format!("no {name} data"),
+        ),
     }
 }
 #[cfg(test)]

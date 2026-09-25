@@ -59,7 +59,7 @@ pub fn extract_thumbnail(
     path: &str,
     duration: Option<f64>,
 ) -> Option<egui::ColorImage> {
-    if path.trim().is_empty() || !Path::new(path).is_file() {
+    if !crate::probe::path_usable(path) {
         return None;
     }
     let vf = format!(

@@ -1,10 +1,7 @@
-//! Main-window panels for `RFMetricsApp`.
-//!
-//! Extracted from `app.rs` (`eframe::App::ui`): reference panel, bottom
-//! action bar, VMAF/options panels, the file-queue center table, and the
-//! drop-hint/toast overlays. Pure `impl RFMetricsApp` moves — the thin
-//! `ui` orchestrator in `app.rs` (drop routing + worker drains + repaint)
-//! calls these; no behavior change.
+//! Main-window views for `RFMetricsApp`: reference panel, bottom action
+//! bar, VMAF/options panels, the file-queue center table, and the
+//! drop-hint/toast overlays. Called by the thin `ui` orchestrator in
+//! `app/mod.rs`.
 
 use crate::app::{
     METRIC_COLUMNS, ROW_HOVER_DELAY, SortColumn, TOAST_SECS, Toast, ToastKind, VIDEO_EXTS,
@@ -43,23 +40,23 @@ impl crate::app::RFMetricsApp {
                                             .add_filter("Video files", VIDEO_EXTS)
                                             .pick_file()
                                     {
-                                        self.ref_path = path.to_string_lossy().into_owned();
+                                        self.config.reference.path = path.to_string_lossy().into_owned();
                                     }
                                     let _ = ui.add_enabled(
                                         !run_locked,
-                                        egui::TextEdit::singleline(&mut self.ref_path)
+                                        egui::TextEdit::singleline(&mut self.config.reference.path)
                                             .desired_width(f32::INFINITY),
                                     );
                                 },
                             );
                         });
-                        ui.label(&self.ref_info);
+                        ui.label(&self.ref_probe.info);
                         ui.horizontal(|ui| {
                             ui.add(egui::Label::new("Duration:").selectable(false));
                             let _ = ui
                                 .add_enabled(
                                     !run_locked,
-                                    egui::TextEdit::singleline(&mut self.duration)
+                                    egui::TextEdit::singleline(&mut self.config.reference.duration)
                                         .hint_text("00:00.000")
                                         .desired_width(110.0),
                                 )
@@ -70,7 +67,7 @@ impl crate::app::RFMetricsApp {
                             let _ = ui
                                 .add_enabled(
                                     !run_locked,
-                                    egui::TextEdit::singleline(&mut self.skip)
+                                    egui::TextEdit::singleline(&mut self.config.reference.skip)
                                         .hint_text("00:00.000")
                                         .desired_width(110.0),
                                 )
@@ -79,11 +76,11 @@ impl crate::app::RFMetricsApp {
                             ui.add_enabled_ui(!run_locked, |ui| {
                                 let _ = egui::ComboBox::from_id_salt("ref_pixfmt")
                                     .width(150.0)
-                                    .selected_text(self.ref_pixfmt.label())
+                                    .selected_text(self.config.reference.pixfmt.label())
                                     .show_ui(ui, |ui| {
                                         for m in crate::metrics::ffmpeg::RefPixFmt::ALL {
                                             let _ = ui.selectable_value(
-                                                &mut self.ref_pixfmt,
+                                                &mut self.config.reference.pixfmt,
                                                 m,
                                                 m.label(),
                                             );
@@ -105,12 +102,12 @@ impl crate::app::RFMetricsApp {
                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(60)))
                         .show(ui, |ui| {
                             ui.set_min_size(egui::vec2(preview_w, 76.0));
-                            if let Some(tex) = &self.thumb_tex {
+                            if let Some(tex) = &self.ref_probe.thumb_tex {
                                 let size = tex.size_vec2();
                                 ui.centered_and_justified(|ui| {
                                     ui.image((tex.id(), size));
                                 });
-                            } else if self.thumb_loading {
+                            } else if self.ref_probe.thumb_loading {
                                 ui.centered_and_justified(|ui| {
                                     ui.add(
                                         egui::Label::new(
@@ -137,7 +134,7 @@ impl crate::app::RFMetricsApp {
                 });
             });
         });
-        self.ref_rect = Some(ref_resp.response.rect);
+        self.queue.ref_rect = Some(ref_resp.response.rect);
     }
 
     /// Bottom action bar (bottommost): Start/Stop, Reset, Plot,
@@ -146,12 +143,12 @@ impl crate::app::RFMetricsApp {
         // ---- Bottom action bar (bottommost) ----
         egui::Panel::bottom("actions").show(ui, |ui| {
             ui.horizontal(|ui| {
-                let run_label = if self.measuring { "Stop" } else { "Start" };
+                let run_label = if self.run.measuring { "Stop" } else { "Start" };
                 if ui
                     .add_sized([90.0, 24.0], egui::Button::new(run_label))
                     .clicked()
                 {
-                    if self.measuring {
+                    if self.run.measuring {
                         self.stop_psnr();
                     } else {
                         self.start_run(now);
@@ -170,10 +167,10 @@ impl crate::app::RFMetricsApp {
                     .add_sized([90.0, 24.0], egui::Button::new("Plot"))
                     .clicked()
                 {
-                    self.show_plot = true;
+                    self.plots.open = true;
                 }
                 // Bad-frames viewer window (tmp-backed, tabs per metric).
-                let bf_enabled = !self.measuring && self.ffmpeg.path.is_some();
+                let bf_enabled = !self.run.measuring && self.binaries.ffmpeg.path.is_some();
                 if ui
                     .add_enabled_ui(bf_enabled, |ui| {
                         ui.add_sized([130.0, 24.0], egui::Button::new("Bad frames"))
@@ -182,7 +179,7 @@ impl crate::app::RFMetricsApp {
                     .on_hover_text("Open the worst-frame viewer (dist/ref side by side)")
                     .clicked()
                 {
-                    self.show_badframes = true;
+                    self.badframes.open = true;
                 }
                 if ui
                     .add_enabled_ui(!run_locked, |ui| {
@@ -200,11 +197,11 @@ impl crate::app::RFMetricsApp {
                     path.set_extension("csv");
                     self.save_results(now, path);
                 }
-                ui.label(&self.ffmpeg.short)
-                    .on_hover_text(&self.ffmpeg.detail);
+                ui.label(&self.binaries.ffmpeg.short)
+                    .on_hover_text(&self.binaries.ffmpeg.detail);
                 ui.add(egui::Label::new("|").selectable(false));
-                ui.label(&self.ffvship.short)
-                    .on_hover_text(&self.ffvship.detail);
+                ui.label(&self.binaries.ffvship.short)
+                    .on_hover_text(&self.binaries.ffvship.detail);
             });
         });
     }
@@ -218,12 +215,12 @@ impl crate::app::RFMetricsApp {
                     ui.add(egui::Label::new("VMAF options").selectable(false));
             // Dim when running or when the VMAF header checkbox is off
             // (todo.txt:1 parity with the run_locked inputs above).
-            let vmaf_enabled = !run_locked && self.m_vmaf;
+            let vmaf_enabled = !run_locked && self.config.metrics.vmaf;
             ui.add_enabled_ui(vmaf_enabled, |ui| {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
                     ui.add_sized([70.0, 18.0], egui::Label::new("Model").selectable(false));
-                    let models = self.vmaf_models.clone();
+                    let models = self.config.vmaf.models.clone();
                     // Tall enough for every model: the default max menu
                     // height scrolls past ~10 entries. This is a ceiling —
                     // the popup still shrinks to its content.
@@ -231,11 +228,11 @@ impl crate::app::RFMetricsApp {
                     let _ = egui::ComboBox::from_id_salt("vmaf_model")
                         .width(220.0)
                         .height(menu_h)
-                        .selected_text(&self.vmaf_model)
+                        .selected_text(&self.config.vmaf.model)
                             .show_ui(ui, |ui| {
                                 for m in &models {
                                     let _ = ui.selectable_value(
-                                        &mut self.vmaf_model,
+                                        &mut self.config.vmaf.model,
                                         m.clone(),
                                         m.as_str(),
                                     );
@@ -245,14 +242,14 @@ impl crate::app::RFMetricsApp {
                         // block the box for v1 models (run-time guard is the
                         // backstop). Unchecking here is visible and keeps the
                         // Start snapshot truthful — no silent coercion.
-                        let v1 = crate::metrics::vmaf::is_v1_model(&self.vmaf_model);
+                        let v1 = crate::metrics::vmaf::is_v1_model(&self.config.vmaf.model);
                         if v1 {
-                            self.vmaf_phone = false;
+                            self.config.vmaf.phone = false;
                         }
                         let _ = ui
                             .add_enabled(
                                 !v1,
-                                egui::Checkbox::new(&mut self.vmaf_phone, "Phone"),
+                                egui::Checkbox::new(&mut self.config.vmaf.phone, "Phone"),
                             )
                             .on_hover_text(if v1 {
                                 "v1 phone is the separate 5d0h model file — pick it with Phone unticked"
@@ -263,7 +260,7 @@ impl crate::app::RFMetricsApp {
                     ui.horizontal(|ui| {
                         ui.add_sized([70.0, 18.0], egui::Label::new(""));
                         let _ = ui.add(egui::Checkbox::new(
-                            &mut self.vmaf_scale,
+                            &mut self.config.vmaf.scale,
                             "Scale to model's resolution",
                         ));
                     });
@@ -271,15 +268,15 @@ impl crate::app::RFMetricsApp {
                         ui.add_sized([70.0, 18.0], egui::Label::new("Pooling").selectable(false));
                         let _ = egui::ComboBox::from_id_salt("vmaf_pooling")
                             .width(220.0)
-                            .selected_text(&self.vmaf_pooling)
+                            .selected_text(&self.config.vmaf.pooling)
                             .show_ui(ui, |ui| {
                                 let _ = ui.selectable_value(
-                                    &mut self.vmaf_pooling,
+                                    &mut self.config.vmaf.pooling,
                                     "Mean".to_owned(),
                                     "Mean",
                                 );
                                 let _ = ui.selectable_value(
-                                    &mut self.vmaf_pooling,
+                                    &mut self.config.vmaf.pooling,
                                     "Harmonic Mean".to_owned(),
                                     "Harmonic Mean",
                                 );
@@ -292,11 +289,11 @@ impl crate::app::RFMetricsApp {
                         );
                         let _ = egui::ComboBox::from_id_salt("vmaf_subsample")
                             .width(220.0)
-                            .selected_text(&self.vmaf_subsample)
+                            .selected_text(&self.config.vmaf.subsample)
                             .show_ui(ui, |ui| {
                                 for v in ["1", "2", "3", "5", "10", "15"] {
                                     let _ = ui.selectable_value(
-                                        &mut self.vmaf_subsample,
+                                        &mut self.config.vmaf.subsample,
                                         v.to_owned(),
                                         v,
                                     );
@@ -307,11 +304,11 @@ impl crate::app::RFMetricsApp {
                         ui.add_sized([70.0, 18.0], egui::Label::new("Threads").selectable(false));
                         let _ = egui::ComboBox::from_id_salt("vmaf_threads")
                             .width(220.0)
-                            .selected_text(&self.vmaf_threads)
+                            .selected_text(&self.config.vmaf.threads)
                             .show_ui(ui, |ui| {
                                 for v in ["auto", "1", "2", "4", "8", "16", "32"] {
                                     let _ = ui.selectable_value(
-                                        &mut self.vmaf_threads,
+                                        &mut self.config.vmaf.threads,
                                         v.to_owned(),
                                         v,
                                     );
@@ -339,11 +336,11 @@ impl crate::app::RFMetricsApp {
                                 );
                                 let _ = egui::ComboBox::from_id_salt("scale_method")
                                     .width(220.0)
-                                    .selected_text(self.scale_method.label())
+                                    .selected_text(self.config.view.scale_method.label())
                                     .show_ui(ui, |ui| {
                                         for m in ScaleMethod::ALL {
                                             let _ = ui.selectable_value(
-                                                &mut self.scale_method,
+                                                &mut self.config.view.scale_method,
                                                 m,
                                                 m.label(),
                                             );
@@ -362,12 +359,12 @@ impl crate::app::RFMetricsApp {
                                 );
                                 let _ = egui::ComboBox::from_id_salt("fps_mode")
                                     .width(220.0)
-                                    .selected_text(self.fps_mode.label())
+                                    .selected_text(self.config.view.fps_mode.label())
                                     .show_ui(ui, |ui| {
                                         use crate::metrics::ffmpeg::InputFpsMode;
                                         for m in InputFpsMode::ALL {
                                             let _ = ui.selectable_value(
-                                                &mut self.fps_mode,
+                                                &mut self.config.view.fps_mode,
                                                 m,
                                                 m.label(),
                                             );
@@ -390,11 +387,11 @@ impl crate::app::RFMetricsApp {
                                 );
                                 let _ = egui::ComboBox::from_id_salt("plot_size")
                                     .width(220.0)
-                                    .selected_text(self.plot_size.label())
+                                    .selected_text(self.config.view.plot_size.label())
                                     .show_ui(ui, |ui| {
                                         for m in crate::plot::PlotSize::ALL {
                                             let _ = ui.selectable_value(
-                                                &mut self.plot_size,
+                                                &mut self.config.view.plot_size,
                                                 m,
                                                 m.label(),
                                             );
@@ -412,11 +409,11 @@ impl crate::app::RFMetricsApp {
                                 );
                                 let _ = egui::ComboBox::from_id_salt("cell_stat")
                                     .width(220.0)
-                                    .selected_text(self.cell_stat.label())
+                                    .selected_text(self.config.view.cell_stat.label())
                                     .show_ui(ui, |ui| {
                                         for m in crate::metrics::CellStat::ALL {
                                             let _ = ui.selectable_value(
-                                                &mut self.cell_stat,
+                                                &mut self.config.view.cell_stat,
                                                 m,
                                                 m.label(),
                                             );
@@ -432,14 +429,14 @@ impl crate::app::RFMetricsApp {
                                     [70.0, 18.0],
                                     egui::Label::new("Precision").selectable(false),
                                 );
-                                let prev_precision = self.cell_precision;
+                                let prev_precision = self.config.view.cell_precision;
                                 let _ = egui::ComboBox::from_id_salt("cell_precision")
                                     .width(220.0)
-                                    .selected_text(self.cell_precision.to_string())
+                                    .selected_text(self.config.view.cell_precision.to_string())
                                     .show_ui(ui, |ui| {
                                         for p in 0..=crate::metrics::MAX_PRECISION as u8 {
                                             let _ = ui.selectable_value(
-                                                &mut self.cell_precision,
+                                                &mut self.config.view.cell_precision,
                                                 p,
                                                 p.to_string(),
                                             );
@@ -452,13 +449,13 @@ impl crate::app::RFMetricsApp {
                                 // Frozen Avg texts embed the old precision —
                                 // re-freeze them once on change (non-Avg
                                 // selectors format live and follow for free).
-                                if self.cell_precision != prev_precision {
+                                if self.config.view.cell_precision != prev_precision {
                                     self.refreeze_cell_texts();
                                 }
                             });
                             let _ = ui
                                 .add(egui::Checkbox::new(
-                                    &mut self.plot_at_start,
+                                    &mut self.config.view.plot_at_start,
                                     "Plot window at start",
                                 ))
                                 .on_hover_text(
@@ -477,7 +474,7 @@ impl crate::app::RFMetricsApp {
                                 ui.vertical(|ui| {
                             let _ = ui
                                 .add(egui::Checkbox::new(
-                                    &mut self.csv_export,
+                                    &mut self.config.export.csv_export,
                                     "Save frames metrics to CSV files",
                                 ))
                                 .on_hover_text(
@@ -492,7 +489,7 @@ impl crate::app::RFMetricsApp {
                                 );
                                 // Bounded display (full path stays in the hover);
                                 // the worker snapshots the real string at Start.
-                                let full = self.csv_dir.clone();
+                                let full = self.config.export.csv_dir.clone();
                                 let shown = if full.trim().is_empty() {
                                     "Beside distorted files".to_owned()
                                 } else if full.chars().count() > 40 {
@@ -513,19 +510,19 @@ impl crate::app::RFMetricsApp {
                                         .set_title("CSV output folder")
                                         .pick_folder()
                                 {
-                                    self.csv_dir = dir.to_string_lossy().into_owned();
+                                    self.config.export.csv_dir = dir.to_string_lossy().into_owned();
                                 }
                                 if ui
                                     .button("Clear")
                                     .on_hover_text("Back to beside-the-distorted-file")
                                     .clicked()
                                 {
-                                    self.csv_dir.clear();
+                                    self.config.export.csv_dir.clear();
                                 }
                             });
                             let _ = ui
                                 .add(egui::Checkbox::new(
-                                    &mut self.results_autosave,
+                                    &mut self.config.export.results_autosave,
                                     "Auto-save results",
                                 ))
                                 .on_hover_text(
@@ -539,7 +536,7 @@ impl crate::app::RFMetricsApp {
                                 );
                                 // Bounded display (full path stays in the hover);
                                 // resolved (custom or exe-dir default) at save time.
-                                let full = self.results_path.clone();
+                                let full = self.config.export.results_path.clone();
                                 let empty = full.trim().is_empty();
                                 let shown = if empty {
                                     "RFMetrics.Results.csv next to exe".to_owned()
@@ -571,7 +568,7 @@ impl crate::app::RFMetricsApp {
                                     }
                                     if let Some(mut path) = dialog.save_file() {
                                         path.set_extension("csv");
-                                        self.results_path =
+                                        self.config.export.results_path =
                                             path.to_string_lossy().into_owned();
                                     }
                                 }
@@ -580,7 +577,7 @@ impl crate::app::RFMetricsApp {
                                     .on_hover_text("Back to next-to-the-exe default")
                                     .clicked()
                                 {
-                                    self.results_path.clear();
+                                    self.config.export.results_path.clear();
                                 }
                             });
                                 });
@@ -625,21 +622,21 @@ impl crate::app::RFMetricsApp {
                     .inner
                     .clicked()
                 {
-                    self.rows.retain(|r| !r.selected);
-                    self.refresh_queue_names();
+                    self.queue.rows.retain(|r| !r.selected);
+                    self.queue.refresh_queue_names();
                     // The scored set may have shrunk: re-rank all columns.
                     for kind in MetricKind::ALL {
-                        self.refresh_ranks(kind);
+                        self.queue.refresh_ranks(kind);
                     }
                 }
             });
             ui.add_space(4.0);
-            self.hovered_now = None;
+            self.queue.hovered_now = None;
             let table_resp = panel_frame(ui, table_hover).show(ui, |ui| {
                 // Keep the drop box a stable size: at least full width × 160
                 // even when the table content is smaller (e.g. one row).
                 ui.set_min_size(egui::vec2(ui.available_width(), 160.0));
-                if self.rows.is_empty() {
+                if self.queue.rows.is_empty() {
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new("No files yet — drag & drop video files here")
@@ -687,13 +684,13 @@ impl crate::app::RFMetricsApp {
                     // Range anchor snapshot (stale = dangling past the
                     // queue → plain toggle); copied before the `&mut`
                     // flag borrows below so no shared borrow lives on.
-                    let anchor = self.include_anchor.filter(|&a| a < self.rows.len());
-                    let sel_anchor = self.selected_anchor.filter(|&a| a < self.rows.len());
+                    let anchor = self.queue.include_anchor.filter(|&a| a < self.queue.rows.len());
+                    let sel_anchor = self.queue.selected_anchor.filter(|&a| a < self.queue.rows.len());
                     // Sorted display order as underlying indices (identity
                     // when unsorted); anchors/toggles below stay underlying
                     // so they survive re-sorts without invalidation.
-                    let view: Vec<usize> = sort_view(&self.rows, self.sort_spec, self.cell_stat);
-                    let sort_spec = self.sort_spec;
+                    let view: Vec<usize> = sort_view(&self.queue.rows, self.queue.sort_spec, self.config.view.cell_stat);
+                    let sort_spec = self.queue.sort_spec;
                     // Header sort click, applied once below the loop.
                     let mut sort_click: Option<SortColumn> = None;
                     // Header per-metric Reset, applied once below the loop
@@ -705,16 +702,16 @@ impl crate::app::RFMetricsApp {
                     // Invalid boxes ("bad time") disable the badge —
                     // `start_run` reports those as errors instead.
                     let stale_cur = match (
-                        Self::trim_opt(&self.skip),
-                        Self::trim_opt(&self.duration),
+                        crate::app::config::trim_opt(&self.config.reference.skip),
+                        crate::app::config::trim_opt(&self.config.reference.duration),
                     ) {
                         (Some(s), Some(c)) => Some((
                             s,
                             c,
-                            self.current_vmaf_cfg(),
-                            self.scale_method,
-                            self.fps_mode,
-                            self.ref_pixfmt,
+                            self.config.vmaf.current_vmaf_cfg(),
+                            self.config.view.scale_method,
+                            self.config.view.fps_mode,
+                            self.config.reference.pixfmt,
                         )),
                         _ => None,
                     };
@@ -761,7 +758,7 @@ impl crate::app::RFMetricsApp {
                             // detail (path / GPU-mismatch hint) instead of
                             // the ffmpeg filter text below.
                             let (psnr_ok, ssim_ok, vmaf_ok, xpsnr_ok) = {
-                                let sup = &self.ffmpeg.supported_metrics;
+                                let sup = &self.binaries.ffmpeg.supported_metrics;
                                 (
                                     sup.contains(&MetricKind::Psnr),
                                     sup.contains(&MetricKind::Ssim),
@@ -769,16 +766,16 @@ impl crate::app::RFMetricsApp {
                                     sup.contains(&MetricKind::Xpsnr),
                                 )
                             };
-                            let ffvship_ok = self.ffvship.usable;
-                            let ffvship_detail = self.ffvship.detail.clone();
+                            let ffvship_ok = self.binaries.ffvship.usable;
+                            let ffvship_detail = self.binaries.ffvship.detail.clone();
                             for (flag, name, ok, kind) in [
-                                (&mut self.m_psnr, "PSNR", psnr_ok, MetricKind::Psnr),
-                                (&mut self.m_ssim, "SSIM", ssim_ok, MetricKind::Ssim),
-                                (&mut self.m_vmaf, "VMAF", vmaf_ok, MetricKind::Vmaf),
-                                (&mut self.m_xpsnr, "XPSNR", xpsnr_ok, MetricKind::Xpsnr),
-                                (&mut self.m_ssim2, "SSIM2", ffvship_ok, MetricKind::Ssim2),
-                                (&mut self.m_but, "BUTTER", ffvship_ok, MetricKind::But),
-                                (&mut self.m_cvvdp, "CVVDP", ffvship_ok, MetricKind::Cvvdp),
+                                (&mut self.config.metrics.psnr, "PSNR", psnr_ok, MetricKind::Psnr),
+                                (&mut self.config.metrics.ssim, "SSIM", ssim_ok, MetricKind::Ssim),
+                                (&mut self.config.metrics.vmaf, "VMAF", vmaf_ok, MetricKind::Vmaf),
+                                (&mut self.config.metrics.xpsnr, "XPSNR", xpsnr_ok, MetricKind::Xpsnr),
+                                (&mut self.config.metrics.ssim2, "SSIM2", ffvship_ok, MetricKind::Ssim2),
+                                (&mut self.config.metrics.butteraugli, "BUTTER", ffvship_ok, MetricKind::But),
+                                (&mut self.config.metrics.cvvdp, "CVVDP", ffvship_ok, MetricKind::Cvvdp),
                             ] {
                                 header.col(|ui| vline(ui, egui::Color32::from_gray(0x8A)));
                                 header.col(|ui| {
@@ -829,18 +826,18 @@ impl crate::app::RFMetricsApp {
                             }
                         })
                         .body(|body| {
-                            body.rows(20.0, self.rows.len(), |mut row| {
+                            body.rows(20.0, self.queue.rows.len(), |mut row| {
                                 let i = row.index();
                                 // Display position → underlying row: every
                                 // `vi` use below addresses the real row, so
                                 // selection/anchors survive re-sorts.
                                 let vi = view[i];
-                                row.set_selected(self.rows[vi].selected);
+                                row.set_selected(self.queue.rows[vi].selected);
                                 // Delayed hover: only outline after the pointer
                                 // rests on the row, so passing over rows while
                                 // aiming at text doesn't flash each one.
-                                let hover_delayed = self.hover_row == Some(vi)
-                                    && self.hover_since.is_some_and(|t| now - t >= ROW_HOVER_DELAY);
+                                let hover_delayed = self.queue.hover_row == Some(vi)
+                                    && self.queue.hover_since.is_some_and(|t| now - t >= ROW_HOVER_DELAY);
                                 row.set_hovered(hover_delayed);
                                 // Free-space click toggles selection; widget clicks
                                 // (checkbox, play, text drag-select) must not.
@@ -849,7 +846,7 @@ impl crate::app::RFMetricsApp {
                                     let alt = ui.input(|i| i.modifiers.alt);
                                     let shift = ui.input(|i| i.modifiers.shift);
                                     let resp = ui
-                                        .checkbox(&mut self.rows[vi].include, "")
+                                        .checkbox(&mut self.queue.rows[vi].include, "")
                                         .on_hover_text("Include in run and plot");
                                     if resp.changed() {
                                         if alt {
@@ -871,7 +868,7 @@ impl crate::app::RFMetricsApp {
                                                     shift_include_range(view.len(), ap, i)
                                                 })
                                             {
-                                                shift_range = Some((lo, hi, self.rows[vi].include));
+                                                shift_range = Some((lo, hi, self.queue.rows[vi].include));
                                             }
                                         }
                                         // Every click moves the anchor, so
@@ -887,7 +884,7 @@ impl crate::app::RFMetricsApp {
                                 }
                                 row.col(|ui| {
                                     if ui.button("▶").clicked() {
-                                        open_path = Some(self.rows[vi].path.clone());
+                                        open_path = Some(self.queue.rows[vi].path.clone());
                                     }
                                 });
                                 let (_, r) =
@@ -897,7 +894,7 @@ impl crate::app::RFMetricsApp {
                                 }
                                 let (_, r) = row.col(|ui| {
                                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-                                    let row_data = &self.rows[vi];
+                                    let row_data = &self.queue.rows[vi];
                                     // Plain non-selectable text: no button hover
                                     // outline; copy lives in the right-click menu
                                     // and the full path shows as tooltip (Python parity).
@@ -906,18 +903,18 @@ impl crate::app::RFMetricsApp {
                                 });
                                 r.context_menu(|ui| {
                                     if ui.button("Show in explorer").clicked() {
-                                        reveal_path = Some(self.rows[vi].path.clone());
+                                        reveal_path = Some(self.queue.rows[vi].path.clone());
                                         ui.close();
                                     }
                                     if ui.button("Copy path").clicked() {
-                                        ui.ctx().copy_text(self.rows[vi].path.clone());
+                                        ui.ctx().copy_text(self.queue.rows[vi].path.clone());
                                         ui.close();
                                     }
                                     if ui.button("Copy filename").clicked() {
-                                        let name = Path::new(&self.rows[vi].path)
+                                        let name = Path::new(&self.queue.rows[vi].path)
                                             .file_name()
                                             .map(|s| s.to_string_lossy().into_owned())
-                                            .unwrap_or_else(|| self.rows[vi].display.clone());
+                                            .unwrap_or_else(|| self.queue.rows[vi].display.clone());
                                         ui.ctx().copy_text(name);
                                         ui.close();
                                     }
@@ -931,7 +928,7 @@ impl crate::app::RFMetricsApp {
                                     toggle_row = Some(vi);
                                 }
                                 let (_, r) = row.col(|ui| {
-                                    let row_data = &self.rows[vi];
+                                    let row_data = &self.queue.rows[vi];
                                     // Cross-format warning (upstream #47):
                                     // the runners silently scale/convert a
                                     // distorted leg to the reference (FFVship
@@ -944,11 +941,11 @@ impl crate::app::RFMetricsApp {
                                     // Comparisons only when matched; strings
                                     // alloc on mismatch.
                                     let warns = match (
-                                        self.ref_info_data.as_ref(),
+                                        self.ref_probe.info_data.as_ref(),
                                         row_data.info.as_ref(),
                                     ) {
                                         (Some(r), Some(d))
-                                            if self.ref_pixfmt
+                                            if self.config.reference.pixfmt
                                                 == crate::metrics::ffmpeg::RefPixFmt::NoConversion =>
                                         {
                                             crate::metrics::ffmpeg::conversion_warnings(r, d)
@@ -984,12 +981,12 @@ impl crate::app::RFMetricsApp {
                                 r.context_menu(|ui| {
                                     if ui.button("Copy summary").clicked() {
                                         ui.ctx().copy_text(crate::probe::table_media_text(
-                                            self.rows[vi].info.as_ref(),
+                                            self.queue.rows[vi].info.as_ref(),
                                         ));
                                         ui.close();
                                     }
                                     if ui.button("Copy details").clicked() {
-                                        ui.ctx().copy_text(self.rows[vi].media_tip.clone());
+                                        ui.ctx().copy_text(self.queue.rows[vi].media_tip.clone());
                                         ui.close();
                                     }
                                 });
@@ -1010,7 +1007,7 @@ impl crate::app::RFMetricsApp {
                                         toggle_row = Some(vi);
                                     }
                                     let (_, r) = row.col(|ui| {
-                                        let row_data = &self.rows[vi];
+                                        let row_data = &self.queue.rows[vi];
                                         let cell = row_data.cell(kind);
                                         let cached = row_data.cached(kind);
                                         // Stale `Done` values (stamped options
@@ -1031,8 +1028,8 @@ impl crate::app::RFMetricsApp {
                                         // Error borrows its message; only live
                                         // Running frames format per frame
                                         // (they change anyway).
-                                        let sel = self.cell_stat;
-                                        let prec = self.cell_precision as usize;
+                                        let sel = self.config.view.cell_stat;
+                                        let prec = self.config.view.cell_precision as usize;
                                         let running;
                                         let selected;
                                         let text: &str = match cell {
@@ -1078,8 +1075,8 @@ impl crate::app::RFMetricsApp {
                                         let is_live = matches!(
                                             cell,
                                             crate::metrics::MetricCell::Running { .. }
-                                        ) && self.live_kind == Some(kind)
-                                            && self.live_key.as_deref()
+                                        ) && self.run.live_kind == Some(kind)
+                                            && self.run.live_key.as_deref()
                                                 == Some(row_data.key.as_str());
                                         cell_frame.show(ui, |ui| {
                                             ui.set_width(ui.available_width());
@@ -1124,16 +1121,16 @@ impl crate::app::RFMetricsApp {
                                     r.context_menu(|ui| {
                                         if ui.button("Copy value").clicked() {
                                             ui.ctx().copy_text(
-                                                self.rows[vi].cell(kind).cell_stat_text_prec(
-                                                    self.cell_stat,
-                                                    self.cell_precision as usize,
+                                                self.queue.rows[vi].cell(kind).cell_stat_text_prec(
+                                                    self.config.view.cell_stat,
+                                                    self.config.view.cell_precision as usize,
                                                 ),
                                             );
                                             ui.close();
                                         }
                                         if ui.button("Copy summary").clicked() {
                                             ui.ctx()
-                                                .copy_text(self.rows[vi].cell(kind).tooltip(title));
+                                                .copy_text(self.queue.rows[vi].cell(kind).tooltip(title));
                                             ui.close();
                                         }
                                     });
@@ -1154,7 +1151,7 @@ impl crate::app::RFMetricsApp {
                     // state without threading through every cell.
                     let (sel_alt, sel_shift) = ui.input(|i| (i.modifiers.alt, i.modifiers.shift));
                     if let Some(i) = toggle_row
-                        && i < self.rows.len()
+                        && i < self.queue.rows.len()
                     {
                         if sel_alt {
                             // Alt-solo/select-all, mirroring the include
@@ -1163,9 +1160,9 @@ impl crate::app::RFMetricsApp {
                             // unflipped column (rare action: one small
                             // alloc is fine — never per frame).
                             let mut flags: Vec<bool> =
-                                self.rows.iter().map(|r| r.selected).collect();
+                                self.queue.rows.iter().map(|r| r.selected).collect();
                             apply_alt_include(&mut flags, i);
-                            for (r, v) in self.rows.iter_mut().zip(flags) {
+                            for (r, v) in self.queue.rows.iter_mut().zip(flags) {
                                 r.selected = v;
                             }
                         } else if sel_shift {
@@ -1182,32 +1179,32 @@ impl crate::app::RFMetricsApp {
                             match (anchor_pos, click_pos) {
                                 (Some(ap), Some(cp)) => {
                                     let (lo, hi) = (ap.min(cp), ap.max(cp));
-                                    let v = !self.rows[i].selected;
+                                    let v = !self.queue.rows[i].selected;
                                     for &u in &view[lo..=hi] {
-                                        self.rows[u].selected = v;
+                                        self.queue.rows[u].selected = v;
                                     }
                                 }
                                 _ => {
-                                    self.rows[i].selected = !self.rows[i].selected;
+                                    self.queue.rows[i].selected = !self.queue.rows[i].selected;
                                 }
                             }
                         } else {
-                            self.rows[i].selected = !self.rows[i].selected;
+                            self.queue.rows[i].selected = !self.queue.rows[i].selected;
                         }
                         // Every selection click moves the anchor, so chained
                         // Shift+clicks extend from the last clicked row.
-                        self.selected_anchor = Some(i);
+                        self.queue.selected_anchor = Some(i);
                     }
                     // Alt+click solo/select-all: the clicked box already
                     // flipped above; the helper overwrites the whole column
                     // from that post-toggle state (rare action: one small
                     // alloc is fine — never on the per-frame hot path).
                     if let Some(i) = alt_solo
-                        && i < self.rows.len()
+                        && i < self.queue.rows.len()
                     {
-                        let mut flags: Vec<bool> = self.rows.iter().map(|r| r.include).collect();
+                        let mut flags: Vec<bool> = self.queue.rows.iter().map(|r| r.include).collect();
                         apply_alt_include(&mut flags, i);
-                        for (r, v) in self.rows.iter_mut().zip(flags) {
+                        for (r, v) in self.queue.rows.iter_mut().zip(flags) {
                             r.include = v;
                         }
                     }
@@ -1218,17 +1215,17 @@ impl crate::app::RFMetricsApp {
                         && hi < view.len()
                     {
                         for &u in &view[lo..=hi] {
-                            self.rows[u].include = v;
+                            self.queue.rows[u].include = v;
                         }
                     }
                     if let Some(a) = anchor_next {
-                        self.include_anchor = Some(a);
+                        self.queue.include_anchor = Some(a);
                     }
                     // Header sort click: cycle best-first → reversed →
                     // insertion order (session-only; run/state order stays
                     // insertion).
                     if let Some(col) = sort_click {
-                        self.sort_spec = cycle_sort(self.sort_spec, col, self.cell_stat);
+                        self.queue.sort_spec = cycle_sort(self.queue.sort_spec, col, self.config.view.cell_stat);
                     }
                     // Header per-metric Reset: one column back to Idle.
                     if let Some(kind) = reset_click {
@@ -1238,7 +1235,7 @@ impl crate::app::RFMetricsApp {
                         && let Err(e) = open::that(&path)
                     {
                         log::error!(target: "rfmetrics::app", "open \"{path}\" failed: {e}");
-                        self.toast = Some(Toast {
+                        self.ui.toast = Some(Toast {
                             text: format!("Could not open file: {e}"),
                             until: now + TOAST_SECS,
                             kind: ToastKind::Error,
@@ -1248,47 +1245,47 @@ impl crate::app::RFMetricsApp {
                         && let Err(e) = reveal_in_explorer(&path)
                     {
                         log::error!(target: "rfmetrics::app", "reveal \"{path}\" failed: {e}");
-                        self.toast = Some(Toast {
+                        self.ui.toast = Some(Toast {
                             text: format!("Could not show in explorer: {e}"),
                             until: now + TOAST_SECS,
                             kind: ToastKind::Error,
                         });
                     }
-                    self.hovered_now = hovered_next;
+                    self.queue.hovered_now = hovered_next;
                 });
             });
-            self.table_rect = Some(table_resp.response.rect);
+            self.queue.table_rect = Some(table_resp.response.rect);
             // Ctrl/Cmd+A select-all for the removal set, scoped to
             // pointer-over-table (the "focused" proxy — egui tables take no
             // keyboard focus). Runs after the table so a focused TextEdit
             // (ref path/trim boxes, built above) consumes the key first and
             // keeps its select-all-text behavior.
-            if !self.rows.is_empty()
-                && self.table_rect.is_some_and(|r| ui.rect_contains_pointer(r))
+            if !self.queue.rows.is_empty()
+                && self.queue.table_rect.is_some_and(|r| ui.rect_contains_pointer(r))
                 && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A))
             {
-                for r in &mut self.rows {
+                for r in &mut self.queue.rows {
                     r.selected = true;
                 }
                 // Anchor at the end: a follow-up Shift+click on a selected
                 // row unselects the trailing range (checkbox-style).
-                self.selected_anchor = Some(self.rows.len() - 1);
+                self.queue.selected_anchor = Some(self.queue.rows.len() - 1);
             }
             // Roll the delayed-hover timer forward; schedule one wake-up
             // for when the delay elapses so the outline appears without
             // moving (no every-frame spin while pending).
-            if self.hovered_now != self.hover_row {
-                self.hover_row = self.hovered_now;
-                self.hover_since = self.hover_row.map(|_| now);
+            if self.queue.hovered_now != self.queue.hover_row {
+                self.queue.hover_row = self.queue.hovered_now;
+                self.queue.hover_since = self.queue.hover_row.map(|_| now);
             }
             let hover_pending = matches!(
-                (self.hover_row, self.hovered_now, self.hover_since),
+                (self.queue.hover_row, self.queue.hovered_now, self.queue.hover_since),
                 (Some(a), Some(b), Some(t)) if a == b && now - t < ROW_HOVER_DELAY
             );
             if hover_pending {
                 // `hover_pending` implies `hover_since` is `Some`.
                 let remaining = self
-                    .hover_since
+                    .queue.hover_since
                     .map(|t| (ROW_HOVER_DELAY - (now - t)).max(0.0))
                     .unwrap_or(ROW_HOVER_DELAY);
                 ui.ctx()
@@ -1309,10 +1306,12 @@ impl crate::app::RFMetricsApp {
         // Drop hint overlay pinned over the active drop target
         if hovering {
             let active_hint = if ref_hover {
-                self.ref_rect
+                self.queue
+                    .ref_rect
                     .map(|r| ("drop_hint_ref", r, "Drop video to set as reference"))
             } else if table_hover {
-                self.table_rect
+                self.queue
+                    .table_rect
                     .map(|r| ("drop_hint_table", r, "Drop files to queue"))
             } else {
                 None
@@ -1333,7 +1332,7 @@ impl crate::app::RFMetricsApp {
         // Transient toast (e.g. extra files dropped on the reference box).
         // Static text needs exactly two frames (show + hide): schedule one
         // wake-up at expiry instead of full-rate repaints for 3 s.
-        if let Some(toast) = self.toast.clone() {
+        if let Some(toast) = self.ui.toast.clone() {
             if now < toast.until {
                 let remaining = (toast.until - now).max(0.0);
                 ui.ctx()
@@ -1353,7 +1352,7 @@ impl crate::app::RFMetricsApp {
                         });
                     });
             } else {
-                self.toast = None;
+                self.ui.toast = None;
             }
         }
     }

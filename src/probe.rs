@@ -311,9 +311,15 @@ fn probe_once(path: &str, exe: &Path) -> Result<MediaInfo, ProbeFail> {
     Ok(info)
 }
 
+/// Empty/missing guard shared by probe, thumbnail, run, and badframes
+/// call sites: non-blank path to an existing file.
+pub(crate) fn path_usable(path: &str) -> bool {
+    !path.trim().is_empty() && Path::new(path).is_file()
+}
+
 /// Shared ffprobe spawn + parse; `None` = no usable video stream.
 pub(crate) fn probe_media(path: &str, ffprobe: Option<&Path>) -> Option<MediaInfo> {
-    if path.trim().is_empty() || !Path::new(path).is_file() {
+    if !path_usable(path) {
         return None;
     }
     let exe = ffprobe?;
@@ -512,10 +518,7 @@ pub fn probe_table_text(
 ) -> (String, String, Option<MediaInfo>, bool) {
     // Same guards as `probe_media`; the flag reports an ffprobe timeout
     // (the queue worker surfaces it as a toast).
-    let (info, timed_out) = match (
-        path.trim().is_empty() || !Path::new(path).is_file(),
-        ffprobe,
-    ) {
+    let (info, timed_out) = match (!path_usable(path), ffprobe) {
         (true, _) | (_, None) => (None, false),
         (false, Some(exe)) => probe_media_fail(path, exe),
     };

@@ -50,8 +50,8 @@ fn viewer_fit_centers_union() {
 #[test]
 fn wipe_split_clamps() {
     assert_eq!(clamp_split(0.5), 0.5);
-    assert_eq!(clamp_split(-1.0), 0.02);
-    assert_eq!(clamp_split(2.0), 0.98);
+    assert_eq!(clamp_split(-1.0), 0.0);
+    assert_eq!(clamp_split(2.0), 1.0);
 }
 
 #[test]
@@ -72,7 +72,7 @@ fn export_dest_set_dir_joins_stem() {
 
 #[test]
 fn wipe_layout_tiles_without_gap() {
-    for f in [0.02, 0.25, 0.5, 0.9, 0.98] {
+    for f in [0.0, 0.25, 0.5, 0.9, 1.0] {
         let l = wipe_layout(200.0, f);
         assert!((l.left_cx + l.left_w / 2.0 - l.div_x).abs() < 1e-9);
         assert!((l.right_cx - l.right_w / 2.0 - l.div_x).abs() < 1e-9);
@@ -83,9 +83,9 @@ fn wipe_layout_tiles_without_gap() {
     assert!((l.left_cx + 50.0).abs() < 1e-9);
     assert!((l.right_cx - 50.0).abs() < 1e-9);
     assert_eq!(l.u, 0.5);
-    // Out-of-range splits clamp to the draggable band.
-    assert_eq!(wipe_layout(200.0, -5.0).u, 0.02);
-    assert_eq!(wipe_layout(200.0, 5.0).u, 0.98);
+    // Out-of-range splits pin to the nearest edge.
+    assert_eq!(wipe_layout(200.0, -5.0).u, 0.0);
+    assert_eq!(wipe_layout(200.0, 5.0).u, 1.0);
 }
 
 #[test]

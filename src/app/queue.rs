@@ -1,13 +1,35 @@
-//! Queue table domain: rows, cached stats, sorting, drop routing.
-//!
-//! Extracted from `app.rs` (High 1 split, step 1). Channel-free and
-//! UI-free except for tiny `egui` sort-mark helpers that stay in `app.rs`;
-//! everything here is pure over `QueueRow`/slices so unit tests cover it
-//! without a GUI harness.
+//! Queue table domain: `QueueModel` (rows + session-only table chrome),
+//! cached stats, sorting, and drop routing. Channel-free; pure over
+//! `QueueRow`/slices so unit tests cover it without a GUI harness.
 
 use crate::metrics::ffmpeg::MetricKind;
 use crate::metrics::ffmpeg::ScaleMethod;
 use std::path::Path;
+
+/// Queue table model: rows plus the session-only table chrome (sort,
+/// anchors, hover, measured rects). Only `path` + `include` per row
+/// persist (via `persist.rs`); everything else is rebuilt per session.
+pub(crate) struct QueueModel {
+    pub(crate) rows: Vec<QueueRow>,
+    /// Next plot-color slot; bumped per queued file, never reused.
+    pub(crate) next_color_idx: usize,
+    /// Next row-probe token; bumped per queued file, never reused.
+    pub(crate) next_probe_seq: u64,
+    /// Active table sort, if any (session-only, never persisted — the
+    /// state file and run order always keep insertion order).
+    pub(crate) sort_spec: Option<(SortColumn, SortDir)>,
+    /// Shift+click range anchor: last clicked include-checkbox row
+    /// (session-only, like hover/selection — never persisted).
+    pub(crate) include_anchor: Option<usize>,
+    /// Shift+click range anchor: last free-space-clicked row for the
+    /// `selected` removal set (session-only, never persisted).
+    pub(crate) selected_anchor: Option<usize>,
+    pub(crate) hover_row: Option<usize>,
+    pub(crate) hover_since: Option<f64>,
+    pub(crate) hovered_now: Option<usize>,
+    pub(crate) ref_rect: Option<egui::Rect>,
+    pub(crate) table_rect: Option<egui::Rect>,
+}
 
 #[derive(Debug)]
 pub(crate) struct QueueRow {
@@ -515,7 +537,7 @@ pub(crate) fn route_drop(
     }
 }
 
-impl crate::app::RFMetricsApp {
+impl QueueModel {
     pub(crate) fn refresh_ranks(&mut self, kind: MetricKind) {
         let mut stat_lo = [f64::INFINITY; 10];
         let mut stat_hi = [f64::NEG_INFINITY; 10];
@@ -549,5 +571,18 @@ impl crate::app::RFMetricsApp {
             }
             cached.ranks = ranks;
         }
+    }
+
+    /// Update every row's disambiguated display name after queue edits.
+    pub(crate) fn refresh_queue_names(&mut self) {
+        let paths: Vec<String> = self.rows.iter().map(|r| r.path.clone()).collect();
+        for (row, name) in self.rows.iter_mut().zip(display_names(&paths)) {
+            row.display = name;
+        }
+        // Row indices may have shifted; drop stale hover state.
+        self.hover_row = None;
+        self.hover_since = None;
+        self.include_anchor = None;
+        self.selected_anchor = None;
     }
 }

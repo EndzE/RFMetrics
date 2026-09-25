@@ -166,15 +166,40 @@ fn max_frame_in(text: &str) -> Option<u64> {
 /// `ERROR:` + stderr parity without progress-meter flooding).
 pub(crate) const STDERR_TAIL_LINES: usize = 30;
 
-/// Live-curve throttle: a Series batch ships when it holds this many
-/// values or this much time passed since the last batch — whichever
-/// first. Plot repaints ride the existing measuring-repaint driver.
 /// Live-curve throttle (shared with `run_ffvship`): a Series batch ships
 /// when it holds this many values or this much time passed since the last
 /// batch — whichever first. Plot repaints ride the existing
 /// measuring-repaint driver.
 pub(crate) const SERIES_BATCH: usize = 64;
 pub(crate) const SERIES_THROTTLE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Throttled live-curve batch sender (shared `run_metric`/`run_ffvship`):
+/// pushes accumulate and ship to the plot when the batch holds
+/// `SERIES_BATCH` values or `SERIES_THROTTLE` has elapsed.
+pub(crate) struct SeriesEmitter<'a> {
+    on_series: &'a (dyn Fn(&[f64]) + Sync),
+    pending: Vec<f64>,
+    last_emit: std::time::Instant,
+}
+
+impl<'a> SeriesEmitter<'a> {
+    pub(crate) fn new(on_series: &'a (dyn Fn(&[f64]) + Sync)) -> Self {
+        Self {
+            on_series,
+            pending: Vec::new(),
+            last_emit: std::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn push(&mut self, v: f64) {
+        self.pending.push(v);
+        if self.pending.len() >= SERIES_BATCH || self.last_emit.elapsed() >= SERIES_THROTTLE {
+            (self.on_series)(&self.pending);
+            self.pending.clear();
+            self.last_emit = std::time::Instant::now();
+        }
+    }
+}
 
 /// Last `n` non-empty stderr lines, chronological, for the log file.
 pub(crate) fn stderr_tail(text: &str, n: usize) -> String {
@@ -184,6 +209,34 @@ pub(crate) fn stderr_tail(text: &str, n: usize) -> String {
         .filter(|l| !l.is_empty())
         .collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// Last non-empty trimmed stderr line: failure message picker shared by
+/// every metric runner.
+pub(crate) fn last_err_line(stderr: &str) -> Option<&str> {
+    stderr.lines().map(str::trim).rfind(|l| !l.is_empty())
+}
+
+/// Empty-series failure: picks the tail line (or `fallback`), logs with a
+/// capped stderr dump, and returns the error `RunOutcome`.
+pub(crate) fn no_data_outcome(
+    name: &str,
+    dist_path: &str,
+    code: Option<i32>,
+    exec_s: f64,
+    stderr: &str,
+    fallback: &str,
+) -> RunOutcome {
+    let msg = last_err_line(stderr).unwrap_or(fallback).to_owned();
+    let dump = stderr_tail(stderr, STDERR_TAIL_LINES);
+    log::warn!(target: "rfmetrics::metric", "{name} no data for \"{dist_path}\" (exit {code:?}, {exec_s:.1}s): {msg}\n{dump}");
+    RunOutcome {
+        values: Vec::new(),
+        avg: None,
+        exec_s,
+        error: Some(msg),
+        detail: FrameDetail::None,
+    }
 }
 
 /// Per-frame value from a `stats_file=-` stdout line.
@@ -1123,6 +1176,19 @@ pub struct RunOutcome {
     pub detail: FrameDetail,
 }
 
+impl RunOutcome {
+    /// Empty failure outcome (spawn error, abort with no data).
+    pub fn error(msg: String, exec_s: f64) -> Self {
+        RunOutcome {
+            values: Vec::new(),
+            avg: None,
+            exec_s,
+            error: Some(msg),
+            detail: FrameDetail::None,
+        }
+    }
+}
+
 /// Per-frame detail rows for CSV export (raw planes/features; pooled
 /// `values` stay the single source for stats/plots).
 #[derive(Debug, Clone, Default)]
@@ -1325,13 +1391,7 @@ pub fn run_metric(
         ref_info.width,
         ref_info.height,
     );
-    let fail = |msg: String| RunOutcome {
-        values: Vec::new(),
-        avg: None,
-        exec_s: 0.0,
-        error: Some(msg),
-        detail: FrameDetail::None,
-    };
+    let fail = |msg: String| RunOutcome::error(msg, 0.0);
     let args = build_args(
         kind, ref_path, dist_path, ref_info, dist_info, skip, clip_dur, scaler, fps_mode,
         ref_pixfmt,
@@ -1352,17 +1412,7 @@ pub fn run_metric(
     // Live-curve tap: per-frame values stream to the plot in throttled
     // batches (the strict full series still lands on `Done`). No final
     // flush: `Done` arrives right behind and replaces the buffer.
-    let mut pending: Vec<f64> = Vec::new();
-    let mut last_emit = std::time::Instant::now();
-    let emit = |pending: &mut Vec<f64>, last_emit: &mut std::time::Instant| {
-        if !pending.is_empty()
-            && (pending.len() >= SERIES_BATCH || last_emit.elapsed() >= SERIES_THROTTLE)
-        {
-            on_series(pending);
-            pending.clear();
-            *last_emit = std::time::Instant::now();
-        }
-    };
+    let mut series = SeriesEmitter::new(on_series);
     let pumped = match pump_process(
         exe,
         &args,
@@ -1375,8 +1425,7 @@ pub fn run_metric(
                 kind => parse_frame_line(line, kind),
             } {
                 values.push(v);
-                pending.push(v);
-                emit(&mut pending, &mut last_emit);
+                series.push(v);
                 // A pooled value implies parseable planes (same line), so
                 // a missed row here is only theoretical; the writer zips.
                 match (&mut detail, kind) {
@@ -1410,26 +1459,17 @@ pub fn run_metric(
     let (code, err_text, exec_s) = (pumped.code, pumped.stderr, pumped.exec_s);
     if pumped.aborted {
         log::info!(target: "rfmetrics::metric", "{name} \"{dist_path}\" aborted after {exec_s:.1}s");
-        return RunOutcome {
-            values: Vec::new(),
-            avg: None,
-            exec_s,
-            error: Some("aborted".to_owned()),
-            detail: FrameDetail::None,
-        };
+        return RunOutcome::error("aborted".to_owned(), exec_s);
     }
     if values.is_empty() {
-        let tail = err_text.lines().map(str::trim).rfind(|l| !l.is_empty());
-        let msg = tail.unwrap_or(&format!("no {name} data")).to_owned();
-        let dump = stderr_tail(&err_text, STDERR_TAIL_LINES);
-        log::warn!(target: "rfmetrics::metric", "{name} no data for \"{dist_path}\" (exit {code:?}, {exec_s:.1}s): {msg}\n{dump}");
-        return RunOutcome {
-            values,
-            avg: None,
+        return no_data_outcome(
+            name,
+            dist_path,
+            code,
             exec_s,
-            error: Some(msg),
-            detail: FrameDetail::None,
-        };
+            &err_text,
+            &format!("no {name} data"),
+        );
     }
     let avg = match kind {
         MetricKind::Xpsnr => parse_xpsnr_summary(&err_text, weights),

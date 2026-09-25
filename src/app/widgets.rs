@@ -1,11 +1,8 @@
-//! Shared UI primitives for the `RFMetricsApp` windows.
-//!
-//! Extracted from `app.rs`: toast types, cursor helper, and the small pure
-//! `egui` helpers (`vline`, `sort_mark`, `panel_frame`, rank fills, running
-//! sweep, stat tooltips). `app.rs` re-exports these so existing
-//! `crate::app::…` paths keep working.
+//! Shared UI primitives for the `RFMetricsApp` windows: toast types,
+//! cursor helper, and the small pure `egui` helpers (`vline`,
+//! `sort_mark`, `panel_frame`, rank fills, running sweep, stat tooltips).
 
-use crate::app_queue::SortDir;
+use crate::app::queue::SortDir;
 
 /// Retrieves the cursor position in egui's logical point coordinates.
 /// During Windows OLE file drags, winit omits pointer move events, so egui's
