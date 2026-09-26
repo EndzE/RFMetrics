@@ -12,6 +12,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::metrics::ffmpeg::{dist_basename, last_err_line};
+
 /// Options combo labels; persisted as string like `vmaf_subsample`.
 pub const COUNT_LABELS: [&str; 10] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
 
@@ -60,7 +62,7 @@ pub fn ffmpeg_args(src: &str, dest: &str, offset: f64, fps: f64) -> Vec<String> 
         "-hide_banner".to_owned(),
         "-nostdin".to_owned(),
         "-probesize".to_owned(),
-        "50M".to_owned(),
+        crate::cmd::FFMPEG_PROBESIZE.to_owned(),
         "-accurate_seek".to_owned(),
         "-r".to_owned(),
         crate::probe::format_fps(fps),
@@ -175,19 +177,13 @@ pub fn tmp_dir() -> PathBuf {
 
 /// `<tmp>/<dist basename>.<METRIC>.bf<NNNNNN>.png` for viewer runs.
 pub fn tmp_dest_for(tmp: &Path, dist_path: &str, kind_name: &str, frame: usize) -> PathBuf {
-    let base = Path::new(dist_path)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| dist_path.to_owned());
+    let base = dist_basename(dist_path);
     tmp.join(format!("{base}.{kind_name}.bf{frame:06}.png"))
 }
 
 /// Same with `-ref` before the extension (original parity).
 pub fn tmp_dest_ref_for(tmp: &Path, dist_path: &str, kind_name: &str, frame: usize) -> PathBuf {
-    let base = Path::new(dist_path)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| dist_path.to_owned());
+    let base = dist_basename(dist_path);
     tmp.join(format!("{base}.{kind_name}.bf{frame:06}-ref.png"))
 }
 
@@ -201,10 +197,7 @@ pub fn export_dest_for(
     frame: usize,
     is_ref: bool,
 ) -> PathBuf {
-    let base = Path::new(dist_path)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| dist_path.to_owned());
+    let base = dist_basename(dist_path);
     let name = if is_ref {
         format!("{base}.{kind_name}.bf{frame:06}-ref.png")
     } else {
@@ -232,11 +225,7 @@ pub fn extract_one(ffmpeg: &Path, src: &str, dest: &Path, offset: f64, fps: f64)
         Ok(out) => {
             let _ = std::fs::remove_file(dest);
             let tail = String::from_utf8_lossy(&out.stderr);
-            let last = tail
-                .lines()
-                .map(str::trim)
-                .rfind(|l| !l.is_empty())
-                .unwrap_or("");
+            let last = last_err_line(&tail).unwrap_or("");
             log::warn!(target: "rfmetrics::badframes", "extract frame {offset:.3}s from \"{src}\" failed (exit {:?}): {last}", out.status.code());
             false
         }

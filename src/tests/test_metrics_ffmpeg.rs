@@ -865,3 +865,27 @@ fn format_legs_vmaf_canonicalizes_through_map() {
         )
     );
 }
+
+#[test]
+fn shared_helpers_stay_consistent() {
+    // Basename never alters beyond the suffix; bare names fall back verbatim.
+    assert_eq!(dist_basename("C:/vids/a.mkv"), "a.mkv");
+    assert_eq!(dist_basename("a.mkv"), "a.mkv");
+    // Preamble is the single probe-window source for ffmpeg + VMAF runs.
+    assert_eq!(
+        ffmpeg_preamble(),
+        vec![
+            "-hide_banner".to_owned(),
+            "-nostdin".to_owned(),
+            "-probesize".to_owned(),
+            crate::cmd::FFMPEG_PROBESIZE.to_owned(),
+        ]
+    );
+    // Parent creation is a no-op for bare filenames, creates nested dirs.
+    let dir = std::env::temp_dir().join(format!("rfmetrics-helper-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    ensure_parent(&dir.join("sub").join("out.csv")).unwrap();
+    assert!(dir.join("sub").is_dir());
+    ensure_parent(std::path::Path::new("out.csv")).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

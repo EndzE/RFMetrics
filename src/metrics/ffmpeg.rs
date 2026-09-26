@@ -34,7 +34,11 @@ impl MetricKind {
         MetricKind::Cvvdp,
     ];
 
-    /// Display name for cells, tooltips, and logs.
+    /// Display name for cells, tooltips, and logs; also the CSV stem
+    /// (`<dist>.<NAME>.csv`) and badframe stem. Intentionally short
+    /// (`BUTTER`, `SSIM2`): the longer plot titles (`BUTTERAUGLI`,
+    /// `SSIMULACRA2…`) live in `plot.rs` and stay display-only so file
+    /// outputs keep Python parity.
     pub fn name(self) -> &'static str {
         match self {
             Self::Psnr => "PSNR",
@@ -118,9 +122,10 @@ fn summary_re() -> &'static regex::Regex {
     RE.get_or_init(|| regex::Regex::new(r"average:(\S+)").unwrap())
 }
 
+/// Summary shares the frame pattern (`All:`); single source so the two
+/// call sites can't drift.
 fn ssim_summary_re() -> &'static regex::Regex {
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"All:(\S+)").unwrap())
+    ssim_frame_re()
 }
 
 /// Matches `_XPSNR_NUM`: plain/scientific floats plus `inf`/`nan`.
@@ -1100,6 +1105,40 @@ pub fn parse_xpsnr_summary(text: &str, weights: (f64, f64, f64)) -> Option<f64> 
     None
 }
 
+/// Distorted-file basename for derived outputs (CSV, badframe PNGs):
+/// never altered beyond the suffix, falls back to the full path when
+/// there is no file name. Single source for `csv_path_for`,
+/// `tmp_dest_for`, and `export_dest_for`.
+pub(crate) fn dist_basename(dist_path: &str) -> String {
+    Path::new(dist_path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dist_path.to_owned())
+}
+
+/// Create the parent dir of an output path, if any (a stale custom dir
+/// must not fail the export). Shared by CSV and results writers.
+pub(crate) fn ensure_parent(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+/// Shared ffmpeg preamble (`-hide_banner -nostdin -probesize …`):
+/// single source for `build_args` and `run_vmaf` so the probe window
+/// can't drift. See `crate::cmd::FFMPEG_PROBESIZE`.
+pub(crate) fn ffmpeg_preamble() -> Vec<String> {
+    vec![
+        "-hide_banner".to_owned(),
+        "-nostdin".to_owned(),
+        "-probesize".to_owned(),
+        crate::cmd::FFMPEG_PROBESIZE.to_owned(),
+    ]
+}
+
 /// Full ffmpeg argv (minus the exe) for a filter-metric run.
 #[allow(clippy::too_many_arguments)]
 pub fn build_args(
@@ -1114,14 +1153,7 @@ pub fn build_args(
     fps_mode: InputFpsMode,
     ref_pixfmt: RefPixFmt,
 ) -> Vec<String> {
-    let mut args = vec![
-        "-hide_banner".to_owned(),
-        "-nostdin".to_owned(),
-        // FFMetrics.conf `Metric.Template` parity: larger probe window for
-        // sparse headers (ts/m2ts/mxf); the original's log shows it live.
-        "-probesize".to_owned(),
-        "50M".to_owned(),
-    ];
+    let mut args = ffmpeg_preamble();
     args.extend(rate_args(fps_mode, ref_info, dist_info, true));
     args.push("-i".to_owned());
     args.push(dist_path.to_owned());

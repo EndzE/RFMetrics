@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::metrics::ffmpeg::{FrameDetail, MetricKind, RunOutcome};
+use crate::metrics::ffmpeg::{FrameDetail, MetricKind, RunOutcome, dist_basename, ensure_parent};
 
 /// Frozen-at-Start export setting (mid-run toggles must not half-apply).
 #[derive(Debug, Clone, Default)]
@@ -22,10 +22,7 @@ pub struct CsvCfg {
 /// `output-` keeps it verbatim. A bare filename (no parent) lands in
 /// the working directory.
 pub fn csv_path_for(dir: &str, dist_path: &str, kind: MetricKind) -> PathBuf {
-    let base = Path::new(dist_path)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| dist_path.to_owned());
+    let base = dist_basename(dist_path);
     let name = format!("{base}.{}.csv", kind.name());
     if dir.trim().is_empty() {
         match Path::new(dist_path).parent() {
@@ -100,11 +97,13 @@ pub fn write_metric_csv(
 ) -> Result<PathBuf, String> {
     let (header, rows, has_n) = render(kind, &outcome.detail, outcome.values.len())?;
     let path = csv_path_for(&cfg.dir, dist_path, kind);
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    }
+    ensure_parent(&path).map_err(|e| {
+        let parent = path
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        format!("{parent}: {e}")
+    })?;
     let mut text = String::with_capacity(header.len() + rows.len() * 50 + 2);
     text.push_str(&header);
     text.push_str("\r\n");
