@@ -220,7 +220,7 @@ fn count_packets(exe: &Path, path: &str) -> Option<i64> {
         "error",
         // FFMetrics.conf parity: larger probe window for sparse headers.
         "-probesize",
-        "50M",
+        crate::cmd::FFMPEG_PROBESIZE,
         "-select_streams",
         "v:0",
         "-count_packets",
@@ -275,7 +275,7 @@ fn probe_once(path: &str, exe: &Path) -> Result<MediaInfo, ProbeFail> {
         "quiet",
         // FFMetrics.conf parity: larger probe window for sparse headers.
         "-probesize",
-        "50M",
+        crate::cmd::FFMPEG_PROBESIZE,
         "-print_format",
         "json",
         "-show_format",

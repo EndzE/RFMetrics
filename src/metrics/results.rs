@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::metrics::DoneStats;
-use crate::metrics::ffmpeg::MetricKind;
+use crate::metrics::ffmpeg::{MetricKind, ensure_parent};
 use crate::metrics::vmaf::Pooling;
 
 /// Default results filename (save dialog preset + exe-dir fallback).
@@ -182,11 +182,7 @@ pub fn row(now: &str, data: &ResultsRow, app_version: &str, ffmpeg_version: &str
 /// when the file is new or empty. Missing parents are created (a stale
 /// custom dir must not fail the export). Returns rows appended.
 pub fn append(path: &Path, rows: &[String]) -> std::io::Result<usize> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
+    ensure_parent(path)?;
     let fresh = !path.is_file() || path.metadata().map(|m| m.len() == 0).unwrap_or(true);
     let mut f = std::fs::OpenOptions::new()
         .create(true)

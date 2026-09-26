@@ -24,6 +24,11 @@ pub const BADFRAME_TIMEOUT: Duration = Duration::from_secs(60);
 /// Stop/Reset); a healthy reap returns in ms.
 pub const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Shared ffmpeg/ffprobe probe window (FFMetrics.conf `Metric.Template` /
+/// `Thumbnail.Template` parity): larger window for sparse headers
+/// (ts/m2ts/mxf). Single source so the six call sites can't drift.
+pub const FFMPEG_PROBESIZE: &str = "50M";
+
 /// Windows: spawn CLI children (ffmpeg, ffprobe, FFVship) with
 /// `CREATE_NO_WINDOW` so version checks and probes don't each flash a
 /// console window (the app itself is already windowed in release).

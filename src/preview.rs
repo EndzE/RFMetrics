@@ -76,7 +76,7 @@ pub fn extract_thumbnail(
             "-nostdin",
             // FFMetrics.conf `Thumbnail.Template` parity.
             "-probesize",
-            "50M",
+            crate::cmd::FFMPEG_PROBESIZE,
             "-ss",
             ss,
             "-i",

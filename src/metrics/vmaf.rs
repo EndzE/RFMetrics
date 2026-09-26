@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::metrics::ffmpeg::{
-    FrameDetail, NORM, RunInputs, RunOutcome, ScaleMethod, last_err_line, no_data_outcome,
-    pump_process, rate_args, scale_filter, setrange_segment, trim_window,
+    FrameDetail, NORM, RunInputs, RunOutcome, ScaleMethod, ffmpeg_preamble, last_err_line,
+    no_data_outcome, pump_process, rate_args, scale_filter, setrange_segment, trim_window,
 };
 use crate::probe::MediaInfo;
 
@@ -449,13 +449,7 @@ pub fn run_vmaf(job: &RunInputs, cfg: &VmafCfg, on_progress: &(dyn Fn(u64) + Syn
             return fail(e);
         }
     };
-    let mut args = vec![
-        "-hide_banner".to_owned(),
-        "-nostdin".to_owned(),
-        // FFMetrics.conf parity (see `build_args`): sparse-header probe window.
-        "-probesize".to_owned(),
-        "50M".to_owned(),
-    ];
+    let mut args = ffmpeg_preamble();
     args.extend(rate_args(fps_mode, ref_info, dist_info, true));
     args.push("-i".to_owned());
     args.push(dist_path.to_owned());
