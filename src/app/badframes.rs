@@ -78,7 +78,8 @@ pub(crate) enum BadframeMsg {
     Finished { ok: usize, errors: Vec<String> },
 }
 
-/// One PNG to extract (owned snapshot for the worker thread).
+/// One worst-frame pick (owned snapshot for the worker threads):
+/// extracted by the viewer worker or exported direct-to-destination.
 pub(crate) struct BadframeJob {
     pub(crate) kind: MetricKind,
     pub(crate) dist_path: String,
@@ -102,15 +103,6 @@ pub(crate) enum BadframeExportScope {
     Pair,
     Metric,
     All,
-}
-
-/// One worst-frame pair to export (owned snapshot for the worker).
-pub(crate) struct BadframeExportPair {
-    pub(crate) kind: MetricKind,
-    pub(crate) dist_path: String,
-    pub(crate) dist_fps: f64,
-    pub(crate) frame: usize,
-    pub(crate) offset: f64,
 }
 
 /// Direct-to-destination extract (viewer tmp untouched, so no wipe and
@@ -379,7 +371,7 @@ impl crate::app::RFMetricsApp {
     /// Metric = every file × worst-N of the current tab, All = every tab
     /// with finished values. Rows without usable fps are skipped, like the
     /// Extract worker.
-    pub(crate) fn export_pairs(&self, scope: BadframeExportScope) -> Vec<BadframeExportPair> {
+    pub(crate) fn export_pairs(&self, scope: BadframeExportScope) -> Vec<BadframeJob> {
         let kinds: Vec<MetricKind> = match scope {
             BadframeExportScope::Pair | BadframeExportScope::Metric => vec![self.badframes.tab],
             BadframeExportScope::All => MetricKind::ALL.to_vec(),
@@ -423,7 +415,7 @@ impl crate::app::RFMetricsApp {
                     continue;
                 };
                 for (frame, offset) in frames {
-                    out.push(BadframeExportPair {
+                    out.push(BadframeJob {
                         kind,
                         dist_path: row.path.clone(),
                         dist_fps: dfps,
