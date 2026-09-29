@@ -414,6 +414,14 @@ impl eframe::App for RFMetricsApp {
             let _ = crate::state::save(&snap);
             self.ui.saved_snapshot = snap;
         }
+        // Viewer tmp is per-process: drop it here, or closing the main
+        // window with the viewer open leaks rfmetrics-bf-<pid> dirs
+        // (close_badframes, the only other deleter, never runs).
+        // Best-effort and fast (a few PNGs); a mid-shutdown worker stops
+        // at the abort and fails its remaining extracts harmlessly.
+        use std::sync::atomic::Ordering;
+        self.badframes.abort.store(true, Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(&self.badframes.tmp);
     }
 }
 #[cfg(test)]

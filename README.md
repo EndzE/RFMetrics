@@ -35,7 +35,7 @@
 
 ## Notes
 
-- **Worst-Frames Extraction**: Extracts the worst-N frames as PNGs into a temporary per-process directory (auto-deleted when the viewer is closed). Use the **Export** buttons to save permanent copies to a custom folder or directly beside each video file.
+- **Worst-Frames Extraction**: Extracts the worst-N frames as PNGs into a temporary per-process directory (auto-deleted when the viewer is closed or the app exits). Use the **Export** buttons to save permanent copies to a custom folder or directly beside each video file.
 - **VMAF Models**: VMAF JSON models are read from the `vmaf-models/` directory next to the executable. A built-in fallback model is included by default.
 - **Visibility Controls**: 
   - Toggling graphs off in the **Legend** simply hides them from the plot view.

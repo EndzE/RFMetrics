@@ -3096,6 +3096,28 @@ fn on_exit_flushes_dirty_state() {
     std::fs::remove_file(path.with_extension("json.tmp")).ok();
 }
 
+/// Exit cleanup: closing the main window with the viewer open skips
+/// `close_badframes`, so `on_exit` must drop the per-process tmp dir
+/// itself (and stop a mid-shutdown worker) instead of leaking it.
+#[test]
+fn on_exit_clears_badframes_tmp() {
+    let dir = std::env::temp_dir().join(format!("rfmetrics-bf-exit-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.PSNR.bf000001.png"), b"x").unwrap();
+    let mut app = RFMetricsApp::default();
+    app.badframes.tmp = dir.clone();
+    app.badframes.busy = true;
+    eframe::App::on_exit(&mut app);
+    assert!(!dir.exists(), "viewer tmp leaked on app exit");
+    assert!(
+        app.badframes
+            .abort
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "exit must stop the bad-frames worker"
+    );
+}
+
 /// Before/after timing: full `snapshot()` clone+compare (old per-frame
 /// path) vs `is_state_dirty` (new path) over a 200-row queue.
 #[test]
