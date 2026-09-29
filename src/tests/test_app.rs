@@ -2869,6 +2869,18 @@ fn csv_report_stash_and_generation() {
     assert_eq!(app.run.csv_report, Some((3, Vec::new())));
 }
 
+/// Reset drops a stashed report and a pending autosave: both belong to
+/// the discarded run (late messages are already fenced by generation).
+#[test]
+fn reset_clears_stashed_report_and_autosave() {
+    let mut app = RFMetricsApp::default();
+    app.run.csv_report = Some((2, Vec::new()));
+    app.run.results_autosave_pending = true;
+    app.reset_psnr();
+    assert_eq!(app.run.csv_report, None);
+    assert!(!app.run.results_autosave_pending);
+}
+
 /// CSV options persist and restore like the other Options keys.
 #[test]
 fn state_apply_restores_csv_options() {

@@ -114,6 +114,63 @@ fn write_atomic_fails_cleanly_without_side_effects() {
 }
 
 #[test]
+fn salvage_keeps_good_sections_past_bad_ones() {
+    // A null in files (untagged FileEntryRaw rejects it) plus a mistyped
+    // toggle must not take down the surviving sections.
+    let s = salvage(
+        r#"{"ref_path": "C:/r.mp4", "files": ["C:/a.mp4", null], "metrics": {"psnr": "yes"}}"#,
+    )
+    .expect("partial state must survive");
+    assert_eq!(s.ref_path, "C:/r.mp4");
+    assert_eq!(s.files, None);
+    assert_eq!(s.metrics, MetricsState::default());
+}
+
+#[test]
+fn salvage_rejects_garbage_and_non_objects() {
+    assert!(salvage("{oops").is_none());
+    assert!(salvage("[1, 2]").is_none());
+    assert!(salvage("null").is_none());
+    // Clean files still take the exact-shape path through load_from.
+    let dir = std::env::temp_dir().join(format!("rfmetrics-state-clean-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("rfmetrics-state.json");
+    std::fs::write(&path, r#"{"ref_path": "C:/r.mp4"}"#).unwrap();
+    let back = load_from(std::slice::from_ref(&path)).expect("clean file loads");
+    assert_eq!(back.ref_path, "C:/r.mp4");
+    assert!(
+        !dir.join("rfmetrics-state.json.bak").exists(),
+        "clean file quarantined"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn load_from_skips_corrupt_candidates_with_bak() {
+    let dir = std::env::temp_dir().join(format!("rfmetrics-state-rot-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let bad = dir.join("bad.json");
+    let good = dir.join("good.json");
+    std::fs::write(&bad, "{oops").unwrap();
+    std::fs::write(&good, r#"{"ref_path": "C:/r.mp4"}"#).unwrap();
+    let back = load_from(&[bad.clone(), good.clone()]).expect("valid candidate loads");
+    assert_eq!(back.ref_path, "C:/r.mp4");
+    assert!(!bad.exists(), "corrupt candidate left in place");
+    assert!(
+        dir.join("bad.json.bak").is_file(),
+        "corrupt candidate not quarantined"
+    );
+    assert!(good.is_file(), "valid candidate touched");
+    // Nothing usable anywhere: None, but the evidence survives.
+    std::fs::write(&bad, "{oops").unwrap();
+    assert!(load_from(std::slice::from_ref(&bad)).is_none());
+    assert!(dir.join("bad.json.bak").is_file());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn save_round_trip_is_atomic() {
     let dir = std::env::temp_dir().join(format!("rfmetrics-state-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

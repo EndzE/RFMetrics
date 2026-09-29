@@ -207,7 +207,7 @@ pub(crate) enum MetricMsg {
     /// End of the worker loop; `aborted` settles still-Running cells to
     /// Idle while keeping finished (`Done`) results on screen.
     Finished { generation: u64, aborted: bool },
-    /// CSV export summary from the worker (sent once before `Finished`
+    /// CSV export summary from the worker (sent once after `Finished`
     /// when export was enabled): files written vs. error strings.
     CsvReport {
         generation: u64,
@@ -275,6 +275,11 @@ impl crate::app::RFMetricsApp {
         self.run.generation = self.run.generation.wrapping_add(1);
         self.run.pending = 0;
         self.run.measuring = false;
+        // A stashed report / armed autosave belongs to the discarded run:
+        // late messages are dropped by generation, but these already
+        // landed and would otherwise toast/save for cleared cells.
+        self.run.csv_report = None;
+        self.run.results_autosave_pending = false;
         self.run.live_kind = None;
         self.run.live_key = None;
         for row in &mut self.queue.rows {
@@ -1193,7 +1198,7 @@ impl crate::app::RFMetricsApp {
                     crate::metrics::ffmpeg::run_metric(&job, &progress, &series)
                 };
                 // CSV export rides the worker (never the UI thread); the
-                // one-line summary lands before Finished.
+                // one-line summary lands after Finished.
                 if csv_cfg.enabled && out.error.is_none() && !out.values.is_empty() {
                     match crate::metrics::csv::write_metric_csv(&csv_cfg, kind, &dist_path, &out) {
                         Ok(path) => {
