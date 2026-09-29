@@ -4113,3 +4113,28 @@ fn running_sweep_ping_pongs() {
         assert!((0.0..=1.0).contains(&p), "pos {p} out of range at t={t}");
     }
 }
+
+#[test]
+fn toast_export_failure_pluralizes() {
+    let mut app = RFMetricsApp::default();
+    app.toast_export(0.0, 5, vec!["PSNR frame 1".to_owned()], "D:/out");
+    assert_eq!(
+        app.ui.toast.as_ref().expect("export toast shown").text,
+        "Export: 5 saved, 1 failure (PSNR frame 1) → D:/out"
+    );
+    app.toast_export(
+        0.0,
+        5,
+        vec!["PSNR frame 1".to_owned(), "PSNR frame 2".to_owned()],
+        "D:/out",
+    );
+    let text = app
+        .ui
+        .toast
+        .as_ref()
+        .expect("export toast shown")
+        .text
+        .clone();
+    assert_eq!(text, "Export: 5 saved, 2 failures (PSNR frame 1) → D:/out");
+    assert!(!text.contains("faileds"));
+}

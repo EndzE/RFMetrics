@@ -450,7 +450,7 @@ impl crate::app::RFMetricsApp {
             self.ui.toast(
                 now,
                 format!(
-                    "Export: {saved} saved, {} failed{s} ({first}) → {dest}",
+                    "Export: {saved} saved, {} failure{s} ({first}) → {dest}",
                     failed.len()
                 ),
                 crate::app::ToastKind::Error,
@@ -717,7 +717,7 @@ impl crate::app::RFMetricsApp {
                 self.ui.toast(
                     now,
                     format!(
-                        "Bad frames: {ok} saved, {} failed{s} ({first})",
+                        "Bad frames: {ok} saved, {} failure{s} ({first})",
                         errors.len()
                     ),
                     crate::app::ToastKind::Error,
