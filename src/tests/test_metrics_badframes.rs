@@ -44,6 +44,33 @@ fn argv_matches_original_template() {
 }
 
 #[test]
+fn argv_hybrid_seek_splits_around_input() {
+    let pos = |a: &[String], flag: &str, from: usize| {
+        a.iter()
+            .enumerate()
+            .skip(from)
+            .find(|(_, s)| s.as_str() == flag)
+            .map(|(i, _)| i)
+            .expect("flag present")
+    };
+    // Late offset: fast input seek + exact output remainder.
+    let a = ffmpeg_args("in.mkv", "o.png", 30.0, 60.0);
+    let i_in = pos(&a, "-i", 0);
+    let s_pre = pos(&a, "-ss", 0);
+    assert!(s_pre < i_in, "input -ss must precede -i: {}", a.join(" "));
+    assert_eq!(a[s_pre + 1], "25.000000");
+    let s_post = pos(&a, "-ss", s_pre + 1);
+    assert!(s_post > i_in, "output -ss must follow -i");
+    assert_eq!(a[s_post + 1], format!("{:.6}", SEEK_BACKOFF_SECS));
+    // Early offset: single output seek, no input -ss.
+    let b = ffmpeg_args("in.mkv", "o.png", 3.0, 60.0);
+    assert_eq!(b.iter().filter(|s| s.as_str() == "-ss").count(), 1);
+    let i_in = pos(&b, "-i", 0);
+    assert!(pos(&b, "-ss", 0) > i_in);
+    assert!(b.join(" ").contains("-ss 3.000000"));
+}
+
+#[test]
 fn extract_failure_preserves_preexisting_dest() {
     let dir = std::env::temp_dir().join(format!("rfmetrics-bf-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

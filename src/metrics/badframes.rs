@@ -54,11 +54,24 @@ pub fn stride_for(
     }
 }
 
+/// Seconds of content decoded before the target: the input `-ss` jumps
+/// to a keyframe, the output `-ss` forward-decodes the exact remainder,
+/// so late frames in long/heavy files cost seconds instead of a
+/// from-zero decode that can outrun `BADFRAME_TIMEOUT`.
+pub const SEEK_BACKOFF_SECS: f64 = 5.0;
+
 /// Single-frame ffmpeg argv (original `BadFrames.Template` parity):
 /// accurate post-input seek, per-file `-r`, `settb/setpts` normalize,
-/// `bgr24` + accurate chroma flags.
+/// `bgr24` + accurate chroma flags. Past `SEEK_BACKOFF_SECS` the seek is
+/// hybrid (fast input `-ss` + exact output `-ss` remainder); below it a
+/// single output `-ss` — identical frame either way.
 pub fn ffmpeg_args(src: &str, dest: &str, offset: f64, fps: f64) -> Vec<String> {
-    vec![
+    let (pre_ss, post_ss) = if offset > SEEK_BACKOFF_SECS {
+        (Some(offset - SEEK_BACKOFF_SECS), SEEK_BACKOFF_SECS)
+    } else {
+        (None, offset)
+    };
+    let mut args = vec![
         "-hide_banner".to_owned(),
         "-nostdin".to_owned(),
         "-y".to_owned(),
@@ -67,30 +80,47 @@ pub fn ffmpeg_args(src: &str, dest: &str, offset: f64, fps: f64) -> Vec<String> 
         "-accurate_seek".to_owned(),
         "-r".to_owned(),
         crate::probe::format_fps(fps),
-        "-i".to_owned(),
-        src.to_owned(),
-        "-ss".to_owned(),
-        format!("{offset:.6}"),
-        "-r".to_owned(),
-        "1".to_owned(),
-        "-frames:v".to_owned(),
-        "1".to_owned(),
-        "-f".to_owned(),
-        "image2".to_owned(),
-        // Explicit: image2 otherwise sniffs the codec off the filename
-        // extension, and our `<dest>.tmp` sibling sniffs as mjpeg.
-        "-c:v".to_owned(),
-        "png".to_owned(),
-        "-vf".to_owned(),
-        "settb=AVTB,setpts=PTS-STARTPTS".to_owned(),
-        "-pix_fmt".to_owned(),
-        "bgr24".to_owned(),
-        "-sws_flags".to_owned(),
-        "accurate_rnd+full_chroma_int+bitexact".to_owned(),
-        "-update".to_owned(),
-        "1".to_owned(),
-        dest.to_owned(),
-    ]
+    ];
+    if let Some(pre) = pre_ss {
+        args.push("-ss".to_owned());
+        args.push(format!("{pre:.6}"));
+    }
+    args.extend(
+        [
+            "-i",
+            src,
+            "-ss",
+            &format!("{post_ss:.6}"),
+            "-r",
+            "1",
+            "-frames:v",
+            "1",
+            "-f",
+            "image2",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+    args.extend(
+        [
+            // Explicit: image2 otherwise sniffs the codec off the filename
+            // extension, and our `<dest>.tmp` sibling sniffs as mjpeg.
+            "-c:v",
+            "png",
+            "-vf",
+            "settb=AVTB,setpts=PTS-STARTPTS",
+            "-pix_fmt",
+            "bgr24",
+            "-sws_flags",
+            "accurate_rnd+full_chroma_int+bitexact",
+            "-update",
+            "1",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+    args.push(dest.to_owned());
+    args
 }
 
 /// Union fit bounds for the viewer pair: both images centered at the
