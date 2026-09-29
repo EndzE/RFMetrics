@@ -36,9 +36,32 @@ fn argv_matches_original_template() {
         "-ss 1.500000",
         "settb=AVTB,setpts=PTS-STARTPTS",
         "accurate_rnd+full_chroma_int+bitexact",
+        "-y",
     ] {
         assert!(j.contains(token), "missing {token} in {j}");
     }
+}
+
+#[test]
+fn extract_failure_preserves_preexisting_dest() {
+    let dir = std::env::temp_dir().join(format!("rfmetrics-bf-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dest = dir.join("movie.mkv.PSNR.bf000007.png");
+    std::fs::write(&dest, b"good").unwrap();
+    let mut tmp = dest.as_os_str().to_owned();
+    tmp.push(".tmp");
+    std::fs::write(Path::new(&tmp), b"stale-partial").unwrap();
+    // Nonexistent exe: spawn fails, so ffmpeg never touches dest or tmp.
+    assert!(!extract_one(
+        Path::new("rfmetrics-definitely-missing-ffmpeg"),
+        "in.mkv",
+        &dest,
+        1.0,
+        30.0
+    ));
+    assert_eq!(std::fs::read(&dest).unwrap(), b"good");
+    assert!(!Path::new(&tmp).exists(), "partial tmp must be cleaned");
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

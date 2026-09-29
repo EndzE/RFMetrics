@@ -61,6 +61,7 @@ pub fn ffmpeg_args(src: &str, dest: &str, offset: f64, fps: f64) -> Vec<String> 
     vec![
         "-hide_banner".to_owned(),
         "-nostdin".to_owned(),
+        "-y".to_owned(),
         "-probesize".to_owned(),
         crate::cmd::FFMPEG_PROBESIZE.to_owned(),
         "-accurate_seek".to_owned(),
@@ -212,25 +213,38 @@ pub fn export_dest_for(
     }
 }
 
-/// Run one extraction; true iff ffmpeg exited 0 and `dest` exists.
+/// Run one extraction; true iff ffmpeg exited 0 and `dest` was replaced.
+/// ffmpeg writes a `<dest>.tmp` sibling (same dir, so same device) and it
+/// is renamed over `dest` only on success: a failed re-export never
+/// deletes or truncates the previous good PNG, and repeats overwrite.
 /// Failures log at warn with the repro argv (FFMetrics.log parity);
-/// a partial file is removed.
+/// a partial tmp is removed.
 pub fn extract_one(ffmpeg: &Path, src: &str, dest: &Path, offset: f64, fps: f64) -> bool {
-    let args = ffmpeg_args(src, &dest.to_string_lossy(), offset, fps);
+    let mut tmp = dest.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let args = ffmpeg_args(src, &tmp.to_string_lossy(), offset, fps);
     log::info!(target: "rfmetrics::badframes", "run: \"{}\" {}", ffmpeg.display(), args.join(" "));
     let mut cmd = std::process::Command::new(ffmpeg);
     cmd.args(&args);
     match crate::cmd::output_timeout(cmd, crate::cmd::BADFRAME_TIMEOUT) {
-        Ok(out) if out.status.success() && dest.is_file() => true,
+        Ok(out) if out.status.success() && tmp.is_file() => match std::fs::rename(&tmp, dest) {
+            Ok(()) => true,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                log::warn!(target: "rfmetrics::badframes", "extract frame {offset:.3}s from \"{src}\" rename failed: {e}");
+                false
+            }
+        },
         Ok(out) => {
-            let _ = std::fs::remove_file(dest);
+            let _ = std::fs::remove_file(&tmp);
             let tail = String::from_utf8_lossy(&out.stderr);
             let last = last_err_line(&tail).unwrap_or("");
             log::warn!(target: "rfmetrics::badframes", "extract frame {offset:.3}s from \"{src}\" failed (exit {:?}): {last}", out.status.code());
             false
         }
         Err(e) => {
-            let _ = std::fs::remove_file(dest);
+            let _ = std::fs::remove_file(&tmp);
             log::warn!(target: "rfmetrics::badframes", "extract frame {offset:.3}s from \"{src}\" failed: {e}");
             false
         }
