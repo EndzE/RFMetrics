@@ -1,9 +1,20 @@
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
-use flexi_logger::{FileSpec, Logger};
+use flexi_logger::{Cleanup, Criterion, FileSpec, Logger, LoggerHandle, Naming};
 
 /// Log file basename next to the executable: `<exe_dir>/rfmetrics.log`.
 const BASENAME: &str = "rfmetrics";
+
+/// Rotation bound: the current file rolls at 5 MB, keeping 4 rotated
+/// siblings (~25 MB worst case). Info-level volume makes one file last
+/// months; without this the single log grows forever.
+const MAX_LOG_BYTES: u64 = 5_000_000;
+const KEEP_ROTATED: usize = 4;
+
+/// Logger handle for an explicit flush at shutdown (a forgotten handle
+/// leaves the buffered tail to the OS instead).
+static HANDLE: OnceLock<LoggerHandle> = OnceLock::new();
 
 /// Directory for the log file: first writable of exe dir → cwd → temp,
 /// so a read-only install still logs instead of failing silently.
@@ -22,10 +33,20 @@ pub fn init_logging() {
             .basename(BASENAME)
             .suffix("log")
             .suppress_timestamp();
-        match Logger::try_with_str("info").and_then(|l| l.log_to_file(spec).append().start()) {
-            Ok(_handle) => {
-                // ponytail: leak handle; dropping it would flush + close the file
-                std::mem::forget(_handle);
+        match Logger::try_with_str("info").and_then(|l| {
+            l.log_to_file(spec)
+                .rotate(
+                    Criterion::Size(MAX_LOG_BYTES),
+                    Naming::Numbers,
+                    Cleanup::KeepLogFiles(KEEP_ROTATED),
+                )
+                .append()
+                .start()
+        }) {
+            Ok(handle) => {
+                if HANDLE.set(handle).is_err() {
+                    log::warn!("logging already initialized; discarding duplicate handle");
+                }
                 log::info!(
                     "RFMetrics {} logging to {}",
                     env!("CARGO_PKG_VERSION"),
@@ -37,6 +58,14 @@ pub fn init_logging() {
             }
         }
     });
+}
+
+/// Flush buffered log lines; safe before init (no-op). Called from
+/// `on_exit` so the shutdown tail reaches disk.
+pub fn flush_logging() {
+    if let Some(handle) = HANDLE.get() {
+        handle.flush();
+    }
 }
 #[cfg(test)]
 #[path = "tests/test_logging.rs"]

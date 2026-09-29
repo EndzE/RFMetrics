@@ -422,6 +422,9 @@ impl eframe::App for RFMetricsApp {
         use std::sync::atomic::Ordering;
         self.badframes.abort.store(true, Ordering::SeqCst);
         let _ = std::fs::remove_dir_all(&self.badframes.tmp);
+        // Buffered log tail (extract/file outcomes above) must reach
+        // disk; without this the last shutdown seconds can go missing.
+        crate::logging::flush_logging();
     }
 }
 #[cfg(test)]
