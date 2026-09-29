@@ -47,9 +47,9 @@ pub fn hide_console(cmd: &mut Command) {
 
 /// `Command::output()` with a wall-clock bound: stdin is nulled like
 /// `.output()` does, pipes are captured the same way, but if the child
-/// neither exits nor fills its pipes within `timeout` it is killed and
-/// reaped (no zombies/orphans) and `Err` with `ErrorKind::TimedOut` is
-/// returned. Spawn failures pass through as their `io::Error`.
+/// doesn't exit within `timeout` it is killed and reaped (no
+/// zombies/orphans) and `Err` with `ErrorKind::TimedOut` is returned.
+/// Spawn failures pass through as their `io::Error`.
 pub fn output_timeout(mut cmd: Command, timeout: Duration) -> io::Result<Output> {
     // Match `.output()` plumbing (callers never set stdio themselves).
     hide_console(&mut cmd);
@@ -57,29 +57,44 @@ pub fn output_timeout(mut cmd: Command, timeout: Duration) -> io::Result<Output>
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
-    match child.wait_timeout(timeout)? {
-        Some(status) => {
-            // Exited in time: drain the pipes (no deadlock — the child is
-            // gone, so reads terminate at EOF) and report like `.output()`.
-            use std::io::Read as _;
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            if let Some(mut o) = child.stdout.take() {
-                let _ = o.read_to_end(&mut stdout);
-            }
-            if let Some(mut e) = child.stderr.take() {
-                let _ = e.read_to_end(&mut stderr);
-            }
-            Ok(Output {
-                status,
-                stdout,
-                stderr,
-            })
+    // Drain pipes concurrently: a child writing more than the pipe buffer
+    // (~64KB Linux, ~4KB Windows anonymous pipe) blocks on write until
+    // someone reads, so waiting before reading deadlocks a healthy chatty
+    // child (large ffprobe JSON, thumb PNG) into a false TimedOut.
+    let mut so = child.stdout.take();
+    let mut se = child.stderr.take();
+    let t_out = std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut v = Vec::new();
+        if let Some(p) = so.as_mut() {
+            let _ = p.read_to_end(&mut v);
         }
+        v
+    });
+    let t_err = std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut v = Vec::new();
+        if let Some(p) = se.as_mut() {
+            let _ = p.read_to_end(&mut v);
+        }
+        v
+    });
+    match child.wait_timeout(timeout)? {
+        Some(status) => Ok(Output {
+            status,
+            stdout: t_out.join().unwrap_or_default(),
+            stderr: t_err.join().unwrap_or_default(),
+        }),
         None => {
             let _ = child.kill();
-            // Reap after kill so no zombie/defunct entry lingers.
+            // Reap after kill so no zombie/defunct entry lingers. Detach
+            // readers (no join): a grandchild inheriting the pipes (cmd
+            // -> ping) keeps them open past the kill, so joining here
+            // would block until it exits; detached readers end at EOF
+            // on their own.
             let _ = child.wait();
+            drop(t_out);
+            drop(t_err);
             Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!("command exceeded {timeout:?}"),
@@ -132,5 +147,37 @@ mod tests {
         let err = output_timeout(hang_cmd(), Duration::from_millis(300)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert!(start.elapsed() < Duration::from_secs(25));
+    }
+
+    /// Chatty child: >pipe buffer on both streams at once (~325KB each).
+    /// Old wait-then-drain deadlocked this into a false TimedOut.
+    #[cfg(windows)]
+    fn chatty_cmd() -> Command {
+        let mut c = Command::new("cmd");
+        c.args([
+            "/c",
+            "for /L %i in (1,1,5000) do @(echo 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF & echo ERR0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF 1>&2)",
+        ]);
+        c
+    }
+
+    /// Chatty child on unix.
+    #[cfg(not(windows))]
+    fn chatty_cmd() -> Command {
+        let mut c = Command::new("sh");
+        c.args([
+            "-c",
+            "i=0; while [ $i -lt 5000 ]; do echo 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF; echo ERR0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF >&2; i=$((i+1)); done",
+        ]);
+        c
+    }
+
+    #[test]
+    fn chatty_child_does_not_deadlock() {
+        let out =
+            output_timeout(chatty_cmd(), Duration::from_secs(10)).expect("chatty child must exit");
+        assert!(out.status.success());
+        assert!(out.stdout.len() > 200_000, "stdout {}", out.stdout.len());
+        assert!(out.stderr.len() > 200_000, "stderr {}", out.stderr.len());
     }
 }
