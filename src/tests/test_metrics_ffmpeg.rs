@@ -891,6 +891,20 @@ fn shared_helpers_stay_consistent() {
 }
 
 #[test]
+fn stderr_tail_ring_evicts_oldest_first() {
+    let mut tail = StderrTail::new(3);
+    for i in 0..5 {
+        tail.push(format!("frame= {i}"));
+    }
+    assert_eq!(tail.joined(), "frame= 2\nframe= 3\nframe= 4");
+    // Under cap: everything retained, chronological.
+    let mut tail = StderrTail::new(STDERR_RING_LINES);
+    tail.push("a".to_owned());
+    tail.push("b".to_owned());
+    assert_eq!(tail.joined(), "a\nb");
+}
+
+#[test]
 fn preset_abort_kills_child_before_readers() {
     // Stop landing between spawn and publish: abort set, slot empty, so
     // abort_worker kills nothing — pump must kill what it publishes instead

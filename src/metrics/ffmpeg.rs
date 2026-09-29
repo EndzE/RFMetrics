@@ -171,6 +171,38 @@ fn max_frame_in(text: &str) -> Option<u64> {
 /// `ERROR:` + stderr parity without progress-meter flooding).
 pub(crate) const STDERR_TAIL_LINES: usize = 30;
 
+/// Lines of stderr retained per run: every consumer (bottom-up summary
+/// scans, last-error pickers, the 30-line dump above) reads the tail,
+/// so long jobs keep kilobytes instead of megabytes of `frame=` meter.
+pub(crate) const STDERR_RING_LINES: usize = 50;
+
+/// Bounded chronological tail of stderr lines: drops the oldest past
+/// `cap`, so `pump_process` never retains a whole run's progress meter.
+pub(crate) struct StderrTail {
+    buf: std::collections::VecDeque<String>,
+    cap: usize,
+}
+
+impl StderrTail {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            buf: std::collections::VecDeque::new(),
+            cap,
+        }
+    }
+
+    pub(crate) fn push(&mut self, line: String) {
+        self.buf.push_back(line);
+        if self.buf.len() > self.cap {
+            self.buf.pop_front();
+        }
+    }
+
+    pub(crate) fn joined(self) -> String {
+        self.buf.into_iter().collect::<Vec<_>>().join("\n")
+    }
+}
+
 /// Live-curve throttle (shared with `run_ffvship`): a Series batch ships
 /// when it holds this many values or this much time passed since the last
 /// batch — whichever first. Plot repaints ride the existing
@@ -1305,7 +1337,7 @@ pub(crate) fn pump_process(
         let _ = c.kill();
         slot.replace(c);
     }
-    // Readers: live progress feed + full stderr capture.
+    // Readers: live progress feed + bounded stderr tail.
     // Scoped threads so borrowed callbacks need not be 'static.
     let max_sent = Arc::new(AtomicU64::new(0));
     let err_text = std::thread::scope(|s| {
@@ -1313,14 +1345,14 @@ pub(crate) fn pump_process(
         let err_handle = stderr.map(|err| {
             s.spawn(move || {
                 use std::io::Read;
-                let mut lines = Vec::new();
+                let mut lines = StderrTail::new(STDERR_RING_LINES);
                 let mut seg: Vec<u8> = Vec::new();
                 // ffmpeg draws its `frame=` meter with `\r` (no `\n` until
                 // exit); Python reads stderr in universal-newlines mode, so
                 // `\r` is a line boundary there too. Splitting on `\n` only
                 // yields zero complete lines mid-run — VMAF progress stuck
                 // at Frame: 0 with no stdout `n:` feed to fall back on.
-                let flush = |seg: &mut Vec<u8>, lines: &mut Vec<String>| {
+                let flush = |seg: &mut Vec<u8>, lines: &mut StderrTail| {
                     if seg.is_empty() {
                         return;
                     }
@@ -1351,7 +1383,7 @@ pub(crate) fn pump_process(
                     }
                 }
                 flush(&mut seg, &mut lines);
-                lines.join("\n")
+                lines.joined()
             })
         });
         if let Some(out) = stdout {
