@@ -77,6 +77,10 @@ pub fn ffmpeg_args(src: &str, dest: &str, offset: f64, fps: f64) -> Vec<String> 
         "1".to_owned(),
         "-f".to_owned(),
         "image2".to_owned(),
+        // Explicit: image2 otherwise sniffs the codec off the filename
+        // extension, and our `<dest>.tmp` sibling sniffs as mjpeg.
+        "-c:v".to_owned(),
+        "png".to_owned(),
         "-vf".to_owned(),
         "settb=AVTB,setpts=PTS-STARTPTS".to_owned(),
         "-pix_fmt".to_owned(),

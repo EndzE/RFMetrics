@@ -889,3 +889,32 @@ fn shared_helpers_stay_consistent() {
     ensure_parent(std::path::Path::new("out.csv")).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn preset_abort_kills_child_before_readers() {
+    // Stop landing between spawn and publish: abort set, slot empty, so
+    // abort_worker kills nothing — pump must kill what it publishes instead
+    // of running the job to completion. Single-process sleepers (no
+    // cmd-wrapper grandchild holding the pipes) so kill closes them fast.
+    #[cfg(windows)]
+    fn sleeper() -> (std::path::PathBuf, Vec<String>) {
+        (
+            "ping".into(),
+            vec!["-n".to_owned(), "30".to_owned(), "127.0.0.1".to_owned()],
+        )
+    }
+    #[cfg(not(windows))]
+    fn sleeper() -> (std::path::PathBuf, Vec<String>) {
+        ("sleep".into(), vec!["30".to_owned()])
+    }
+    let (exe, args) = sleeper();
+    let abort = std::sync::atomic::AtomicBool::new(true);
+    let slot = std::sync::Mutex::new(None);
+    let start = std::time::Instant::now();
+    let pumped = pump_process(&exe, &args, None, &abort, &slot, |_: &str| {}, &|_: u64| {})
+        .expect("pump with preset abort must return");
+    // Unfixed this runs the sleeper out (~30s); fixed it kills at publish.
+    assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    assert!(pumped.aborted);
+    assert!(slot.lock().unwrap().is_none());
+}

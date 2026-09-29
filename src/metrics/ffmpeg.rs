@@ -1295,6 +1295,16 @@ pub(crate) fn pump_process(
     {
         return Err("internal lock error".to_owned());
     }
+    // Stop may have landed between spawn and publish (slot was empty, so
+    // abort_worker killed nothing): re-check and kill what we published.
+    // Left in the slot so the tail reap below still reaps it.
+    if abort.load(Ordering::SeqCst)
+        && let Ok(mut slot) = child_slot.lock()
+        && let Some(mut c) = slot.take()
+    {
+        let _ = c.kill();
+        slot.replace(c);
+    }
     // Readers: live progress feed + full stderr capture.
     // Scoped threads so borrowed callbacks need not be 'static.
     let max_sent = Arc::new(AtomicU64::new(0));

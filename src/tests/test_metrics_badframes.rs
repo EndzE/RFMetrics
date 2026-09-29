@@ -37,6 +37,7 @@ fn argv_matches_original_template() {
         "settb=AVTB,setpts=PTS-STARTPTS",
         "accurate_rnd+full_chroma_int+bitexact",
         "-y",
+        "-c:v png",
     ] {
         assert!(j.contains(token), "missing {token} in {j}");
     }
