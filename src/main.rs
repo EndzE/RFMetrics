@@ -15,6 +15,9 @@ mod state;
 
 fn main() -> eframe::Result<()> {
     logging::init_logging();
+    // Crash orphans (never wiped, never adopted thanks to the random
+    // suffix); 24 h grace protects a live second instance.
+    metrics::badframes::sweep_stale_tmp();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1300.0, 600.0])

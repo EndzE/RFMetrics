@@ -415,7 +415,7 @@ impl eframe::App for RFMetricsApp {
             self.ui.saved_snapshot = snap;
         }
         // Viewer tmp is per-process: drop it here, or closing the main
-        // window with the viewer open leaks rfmetrics-bf-<pid> dirs
+        // window with the viewer open leaks rfmetrics-bf-<pid>-<rand> dirs
         // (close_badframes, the only other deleter, never runs).
         // Best-effort and fast (a few PNGs); a mid-shutdown worker stops
         // at the abort and fails its remaining extracts harmlessly.

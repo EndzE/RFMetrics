@@ -203,11 +203,66 @@ pub fn changed_overlay(dist: &image::RgbaImage, refr: &image::RgbaImage) -> imag
     out
 }
 
+/// Prefix for run-scoped viewer tmp dirs (see `tmp_dir`).
+const TMP_PREFIX: &str = "rfmetrics-bf-";
+
 /// Run-scoped tmp dir for viewer PNGs (bounded memory: 1080p RGBA stays
-/// on disk, only the visible pair becomes textures). Per-process so two
-/// instances never share it; best-effort cleanup by the caller.
+/// on disk, only the visible pair becomes textures). Stable within the
+/// process, unique across runs: pid alone collides after pid reuse, when
+/// a fresh run would adopt a crashed run's stale dir. Best-effort
+/// cleanup by the caller (viewer close / app exit); crash orphans fall
+/// to `sweep_stale_tmp`.
 pub fn tmp_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("rfmetrics-bf-{}", std::process::id()))
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        // ponytail: uniqueness, not security — pid + nanos is plenty here.
+        let rand = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("{TMP_PREFIX}{}-{rand:08x}", std::process::id()))
+    })
+    .clone()
+}
+
+/// Remove orphaned viewer tmp dirs of dead runs under `parent`, keeping
+/// `keep` (ours) and anything fresher than `max_age` — a live second
+/// instance's dir must never be touched. Returns removals.
+pub fn sweep_stale_tmp_in(parent: &Path, keep: &Path, max_age: std::time::Duration) -> usize {
+    let mut removed = 0;
+    let entries = match std::fs::read_dir(parent) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with(TMP_PREFIX) || path == keep {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().unwrap_or_default() > max_age)
+            .unwrap_or(false);
+        if stale && std::fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+            log::debug!(target: "rfmetrics::badframes", "swept stale {}", path.display());
+        }
+    }
+    removed
+}
+
+/// Startup sweep of this app's orphaned viewer tmp dirs (24 h grace so a
+/// live second instance is never disturbed). Called once from `main`.
+pub fn sweep_stale_tmp() {
+    sweep_stale_tmp_in(
+        &std::env::temp_dir(),
+        &tmp_dir(),
+        std::time::Duration::from_secs(24 * 3600),
+    );
 }
 
 /// `<tmp>/<dist basename>.<METRIC>.bf<NNNNNN>.png` for viewer runs.

@@ -185,3 +185,39 @@ fn tmp_names_match_beside_file_stems() {
     );
     assert!(tmp_dir().to_string_lossy().contains("rfmetrics-bf-"));
 }
+
+#[test]
+fn tmp_dir_stable_with_unique_suffix() {
+    // Same process, same dir (callers store it once); pid + suffix shape.
+    assert_eq!(tmp_dir(), tmp_dir());
+    let name = tmp_dir().file_name().unwrap().to_str().unwrap().to_owned();
+    assert!(name.starts_with(&format!("rfmetrics-bf-{}-", std::process::id())));
+}
+
+#[test]
+fn sweep_removes_only_stale_non_keep_dirs() {
+    let parent = std::env::temp_dir().join(format!("rfmetrics-bf-sweep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&parent);
+    std::fs::create_dir_all(&parent).unwrap();
+    let old = parent.join("rfmetrics-bf-1-dead");
+    let keep = parent.join("rfmetrics-bf-3-own");
+    let other = parent.join("unrelated");
+    for d in [&old, &keep, &other] {
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::write(d.join("a.png"), b"x").unwrap();
+    }
+    // Zero grace: stale candidates go, own + non-matching stay.
+    sweep_stale_tmp_in(&parent, &keep, std::time::Duration::ZERO);
+    assert!(!old.exists(), "stale orphan swept");
+    assert!(keep.join("a.png").is_file(), "keep dir touched");
+    assert!(other.join("a.png").is_file(), "non-matching dir touched");
+    // Huge grace: fresh dirs survive.
+    let fresh = parent.join("rfmetrics-bf-2-live");
+    std::fs::create_dir_all(&fresh).unwrap();
+    assert_eq!(
+        sweep_stale_tmp_in(&parent, &keep, std::time::Duration::from_secs(3600)),
+        0
+    );
+    assert!(fresh.is_dir());
+    let _ = std::fs::remove_dir_all(&parent);
+}
