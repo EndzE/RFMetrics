@@ -4,6 +4,11 @@
 use crate::metrics::ffmpeg::MetricKind;
 use std::sync::mpsc::{Receiver, Sender};
 
+/// Go-to-frame settle delay: typing restarts the timer, the pin applies
+/// once input is quiet this long (the plot repaints ~10 Hz idle, so
+/// 0.4 s lands a frame or two after the last keystroke).
+const GOTO_DEBOUNCE_S: f64 = 0.4;
+
 /// Metric plot viewport state (own OS viewport while open).
 /// Session-only, like the Python window — never persisted.
 pub(crate) struct PlotRuntime {
@@ -32,6 +37,11 @@ pub(crate) struct PlotRuntime {
     pub(crate) snap: bool,
     /// Go-to-frame text field (plot window help bar, session-only).
     pub(crate) goto_text: String,
+    /// Go-to-frame text the pin was last derived from (debounce guard:
+    /// re-applies only once the field differs from this).
+    pub(crate) goto_applied: String,
+    /// Last edit time of the Go-to-frame field (`None` = settled).
+    pub(crate) goto_changed_at: Option<f64>,
     /// Pinned crosshair frame (1-based), set by Go-to-frame; drawn with
     /// a corner readout until cleared or replaced.
     pub(crate) pinned: Option<i64>,
@@ -244,30 +254,39 @@ impl crate::app::RFMetricsApp {
                     {
                         self.plots.reset_pending = true;
                     }
-                    // Go to frame (jump-to-frame parity): Go/Enter pins
-                    // the crosshair at the exact 1-based frame, clamped
-                    // into the data; empty/garbage clears the pin.
+                    // Go to frame (jump-to-frame parity): pins the crosshair
+                    // at the exact 1-based frame as you type, clamped into
+                    // the data; empty/garbage clears the pin. Debounced:
+                    // typing restarts the timer, the pin applies once input
+                    // settles (the plot repaints ~10 Hz idle, continuously
+                    // while measuring, so the check always runs).
                     ui.label("Go to frame:");
-                    let goto_resp = ui.add_enabled(
-                        !borrowed.is_empty(),
-                        egui::TextEdit::singleline(&mut self.plots.goto_text)
-                            .desired_width(56.0)
-                            .hint_text("frame"),
-                    );
-                    let go_clicked = ui
-                        .add_enabled(!borrowed.is_empty(), egui::Button::new("Go"))
-                        .on_hover_text("Pin the crosshair at this exact frame (empty text clears it)")
-                        .clicked();
-                    if go_clicked
-                        || (goto_resp.lost_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                    {
+                    let goto_resp = ui
+                        .add_enabled(
+                            !borrowed.is_empty(),
+                            egui::TextEdit::singleline(&mut self.plots.goto_text)
+                                .desired_width(56.0)
+                                .hint_text("frame"),
+                        )
+                        .on_hover_text(
+                            "Pin the crosshair at this exact frame as you type (empty clears it)",
+                        );
+                    if goto_resp.changed() {
+                        self.plots.goto_changed_at = Some(ui.input(|i| i.time));
+                    }
+                    let settled = match self.plots.goto_changed_at {
+                        Some(t) => ui.input(|i| i.time) - t >= GOTO_DEBOUNCE_S,
+                        None => false,
+                    };
+                    if settled && self.plots.goto_applied != self.plots.goto_text {
+                        self.plots.goto_changed_at = None;
                         self.plots.pinned =
                             crate::plot::parse_goto_frame(&self.plots.goto_text, n_max);
                         // Reflect the clamp so the field shows the pin.
                         if let Some(f) = self.plots.pinned {
                             self.plots.goto_text = f.to_string();
                         }
+                        self.plots.goto_applied = self.plots.goto_text.clone();
                     }
                     let save_label = if self.plots.png_saving { "Saving…" } else { "Save PNG" };
                     let save_hover = if self.plots.png_saving {
