@@ -259,8 +259,17 @@ impl crate::app::RFMetricsApp {
                     // the data; empty/garbage clears the pin. Debounced:
                     // typing restarts the timer, the pin applies once input
                     // settles (the plot repaints ~10 Hz idle, continuously
-                    // while measuring, so the check always runs).
+                    // while measuring, so the check always runs). The −/+
+                    // steppers are deliberate commits: they apply at once.
                     ui.label("Go to frame:");
+                    let mut step = 0i64;
+                    if ui
+                        .add_enabled(!borrowed.is_empty(), egui::Button::new("-"))
+                        .on_hover_text("Previous frame")
+                        .clicked()
+                    {
+                        step = -1;
+                    }
                     let goto_resp = ui
                         .add_enabled(
                             !borrowed.is_empty(),
@@ -271,6 +280,23 @@ impl crate::app::RFMetricsApp {
                         .on_hover_text(
                             "Pin the crosshair at this exact frame as you type (empty clears it)",
                         );
+                    if ui
+                        .add_enabled(!borrowed.is_empty(), egui::Button::new("+"))
+                        .on_hover_text("Next frame")
+                        .clicked()
+                    {
+                        step = 1;
+                    }
+                    if step != 0 && n_max >= 1 {
+                        let base = self.plots.goto_text.trim().parse::<i64>().ok()
+                            .or(self.plots.pinned)
+                            .unwrap_or(0);
+                        let f = (base + step).clamp(1, n_max as i64);
+                        self.plots.goto_text = f.to_string();
+                        self.plots.goto_applied = self.plots.goto_text.clone();
+                        self.plots.pinned = Some(f);
+                        self.plots.goto_changed_at = None;
+                    }
                     if goto_resp.changed() {
                         self.plots.goto_changed_at = Some(ui.input(|i| i.time));
                     }
