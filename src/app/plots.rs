@@ -154,7 +154,7 @@ impl crate::app::RFMetricsApp {
         let id = egui::ViewportId::from_hash_of("metrics_plot");
         let builder = egui::ViewportBuilder::default()
             .with_title("Metrics")
-            .with_inner_size([1100.0, 700.0]);
+            .with_inner_size([1200.0, 700.0]);
         ctx.show_viewport_immediate(id, builder, |vui, _class| {
             // Window-manager close withdraws (Python `withdraw` parity);
             // Plot reopens it.
