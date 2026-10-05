@@ -8,6 +8,10 @@ use std::sync::mpsc::{Receiver, Sender};
 /// once input is quiet this long (the plot repaints ~10 Hz idle, so
 /// 0.4 s lands a frame or two after the last keystroke).
 const GOTO_DEBOUNCE_S: f64 = 0.4;
+/// Go-to-frame stepper hold-to-repeat: first repeat after this delay.
+const STEP_FIRST_DELAY_S: f64 = 0.4;
+/// Go-to-frame stepper hold-to-repeat: steady cadence while held.
+const STEP_REPEAT_S: f64 = 0.05;
 
 /// Metric plot viewport state (own OS viewport while open).
 /// Session-only, like the Python window — never persisted.
@@ -42,6 +46,9 @@ pub(crate) struct PlotRuntime {
     pub(crate) goto_applied: String,
     /// Last edit time of the Go-to-frame field (`None` = settled).
     pub(crate) goto_changed_at: Option<f64>,
+    /// Stepper hold-to-repeat arm: (direction, next fire time); cleared
+    /// on release.
+    pub(crate) step_repeat: Option<(i64, f64)>,
     /// Pinned crosshair frame (1-based), set by Go-to-frame; drawn with
     /// a corner readout until cleared or replaced.
     pub(crate) pinned: Option<i64>,
@@ -260,16 +267,13 @@ impl crate::app::RFMetricsApp {
                     // typing restarts the timer, the pin applies once input
                     // settles (the plot repaints ~10 Hz idle, continuously
                     // while measuring, so the check always runs). The −/+
-                    // steppers are deliberate commits: they apply at once.
+                    // steppers commit at once and repeat while held (first
+                    // repeat after a short delay, then a steady cadence).
                     ui.label("Go to frame:");
-                    let mut step = 0i64;
-                    if ui
+                    let now = ui.input(|i| i.time);
+                    let minus = ui
                         .add_enabled(!borrowed.is_empty(), egui::Button::new("-"))
-                        .on_hover_text("Previous frame")
-                        .clicked()
-                    {
-                        step = -1;
-                    }
+                        .on_hover_text("Previous frame (hold to repeat)");
                     let goto_resp = ui
                         .add_enabled(
                             !borrowed.is_empty(),
@@ -280,12 +284,42 @@ impl crate::app::RFMetricsApp {
                         .on_hover_text(
                             "Pin the crosshair at this exact frame as you type (empty clears it)",
                         );
-                    if ui
+                    let plus = ui
                         .add_enabled(!borrowed.is_empty(), egui::Button::new("+"))
-                        .on_hover_text("Next frame")
-                        .clicked()
-                    {
-                        step = 1;
+                        .on_hover_text("Next frame (hold to repeat)");
+                    // Hold-to-repeat: a fresh press steps at once and arms
+                    // the first repeat; a held press fires on cadence.
+                    // The arm drops on release so the next press — however
+                    // soon — steps at once instead of waiting out a stale
+                    // delay.
+                    let mut step = 0i64;
+                    let mut held = false;
+                    for (resp, dir) in [(minus, -1i64), (plus, 1i64)] {
+                        if resp.is_pointer_button_down_on() {
+                            held = true;
+                            match self.plots.step_repeat {
+                                Some((d, next)) if d == dir => {
+                                    if now >= next {
+                                        step = dir;
+                                        self.plots.step_repeat =
+                                            Some((dir, now + STEP_REPEAT_S));
+                                    }
+                                }
+                                _ => {
+                                    step = dir;
+                                    self.plots.step_repeat =
+                                        Some((dir, now + STEP_FIRST_DELAY_S));
+                                }
+                            }
+                        }
+                    }
+                    if !held {
+                        self.plots.step_repeat = None;
+                    }
+                    if self.plots.step_repeat.is_some() {
+                        // Held down: repaint continuously so the cadence
+                        // above fires on time even on the idle ~10 Hz tick.
+                        ui.ctx().request_repaint();
                     }
                     if step != 0 && n_max >= 1 {
                         let base = self.plots.goto_text.trim().parse::<i64>().ok()
