@@ -285,10 +285,18 @@ impl crate::app::RFMetricsApp {
                             let frame = egui::Frame::new()
                                 .fill(ui.visuals().text_edit_bg_color())
                                 .corner_radius(ui.visuals().widgets.inactive.corner_radius)
+                                // Constant 1.0 width in both states: the
+                                // unfocused border is transparent (native
+                                // look), the focused one blue. A 0.0→1.0
+                                // width step would grow the box on focus and
+                                // shove the whole help-bar row up.
                                 .stroke(if self.plots.goto_focused {
                                     ui.visuals().selection.stroke
                                 } else {
-                                    ui.visuals().widgets.inactive.bg_stroke
+                                    egui::Stroke::new(
+                                        1.0,
+                                        egui::Color32::TRANSPARENT,
+                                    )
                                 })
                                 .inner_margin(egui::Margin {
                                     left: 6,
