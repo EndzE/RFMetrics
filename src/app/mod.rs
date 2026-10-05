@@ -225,6 +225,7 @@ impl Default for RFMetricsApp {
                 goto_applied: String::new(),
                 goto_changed_at: None,
                 step_repeat: None,
+                step_hold: None,
                 pinned: None,
                 save_pending: None,
                 png_tx,

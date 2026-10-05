@@ -49,6 +49,10 @@ pub(crate) struct PlotRuntime {
     /// Stepper hold-to-repeat arm: (direction, next fire time); cleared
     /// on release.
     pub(crate) step_repeat: Option<(i64, f64)>,
+    /// Stepper hold latch: which direction is physically held. egui
+    /// retires its potential-click after `max_click_duration`, so the
+    /// hold must outlive `is_pointer_button_down_on`, which dies there.
+    pub(crate) step_hold: Option<i64>,
     /// Pinned crosshair frame (1-based), set by Go-to-frame; drawn with
     /// a corner readout until cleared or replaced.
     pub(crate) pinned: Option<i64>,
@@ -271,6 +275,7 @@ impl crate::app::RFMetricsApp {
                     // repeat after a short delay, then a steady cadence).
                     ui.label("Go to frame:");
                     let now = ui.input(|i| i.time);
+                    let down = ui.input(|i| i.pointer.primary_down());
                     let minus = ui
                         .add_enabled(!borrowed.is_empty(), egui::Button::new("-"))
                         .on_hover_text("Previous frame (hold to repeat)");
@@ -287,39 +292,46 @@ impl crate::app::RFMetricsApp {
                     let plus = ui
                         .add_enabled(!borrowed.is_empty(), egui::Button::new("+"))
                         .on_hover_text("Next frame (hold to repeat)");
-                    // Hold-to-repeat: a fresh press steps at once and arms
-                    // the first repeat; a held press fires on cadence.
-                    // The arm drops on release so the next press — however
-                    // soon — steps at once instead of waiting out a stale
-                    // delay.
+                    // Hold-to-repeat: a fresh press steps at once and latches
+                    // the hold; the latched hold fires on cadence off the
+                    // physical button state, past egui's click window (its
+                    // potential-click retires after `max_click_duration`,
+                    // which stalled longer holds). The latch drops on
+                    // release, so the next press — however soon — steps at
+                    // once instead of waiting out a stale delay. Keyboard
+                    // (Space/Enter) activation has no press edge: it steps
+                    // via `clicked`, skipped for a latched mouse press so
+                    // its release never double-steps.
                     let mut step = 0i64;
-                    let mut held = false;
                     for (resp, dir) in [(minus, -1i64), (plus, 1i64)] {
-                        if resp.is_pointer_button_down_on() {
-                            held = true;
-                            match self.plots.step_repeat {
-                                Some((d, next)) if d == dir => {
-                                    if now >= next {
-                                        step = dir;
-                                        self.plots.step_repeat =
-                                            Some((dir, now + STEP_REPEAT_S));
-                                    }
-                                }
-                                _ => {
-                                    step = dir;
-                                    self.plots.step_repeat =
-                                        Some((dir, now + STEP_FIRST_DELAY_S));
-                                }
-                            }
+                        if resp.is_pointer_button_down_on()
+                            && self.plots.step_hold != Some(dir)
+                        {
+                            step = dir;
+                            self.plots.step_hold = Some(dir);
+                            self.plots.step_repeat = Some((dir, now + STEP_FIRST_DELAY_S));
+                        } else if resp.clicked() && self.plots.step_hold != Some(dir) {
+                            step = dir;
                         }
                     }
-                    if !held {
-                        self.plots.step_repeat = None;
-                    }
-                    if self.plots.step_repeat.is_some() {
-                        // Held down: repaint continuously so the cadence
-                        // above fires on time even on the idle ~10 Hz tick.
-                        ui.ctx().request_repaint();
+                    match (down, self.plots.step_hold) {
+                        (true, Some(d)) => {
+                            if self
+                                .plots
+                                .step_repeat
+                                .is_some_and(|(_, next)| now >= next)
+                            {
+                                step = d;
+                                self.plots.step_repeat = Some((d, now + STEP_REPEAT_S));
+                            }
+                            // Held down: repaint continuously so the cadence
+                            // above fires on time even on the idle ~10 Hz tick.
+                            ui.ctx().request_repaint();
+                        }
+                        _ => {
+                            self.plots.step_hold = None;
+                            self.plots.step_repeat = None;
+                        }
                     }
                     if step != 0 && n_max >= 1 {
                         let base = self.plots.goto_text.trim().parse::<i64>().ok()
