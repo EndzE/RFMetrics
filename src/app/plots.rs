@@ -30,6 +30,11 @@ pub(crate) struct PlotRuntime {
     /// clamped to the first/last frame on x and the plotted min/max on y;
     /// zooming and in-limits panning stay free.
     pub(crate) snap: bool,
+    /// Go-to-frame text field (plot window help bar, session-only).
+    pub(crate) goto_text: String,
+    /// Pinned crosshair frame (1-based), set by Go-to-frame; drawn with
+    /// a corner readout until cleared or replaced.
+    pub(crate) pinned: Option<i64>,
     /// Pending plot export (Save PNG / Copy button), executed in the
     /// central panel where the plot id scope lives.
     pub(crate) save_pending: Option<PlotExport>,
@@ -211,6 +216,8 @@ impl crate::app::RFMetricsApp {
             // the help-bar Reset below pokes the same memory entry the
             // canvas, snap clamp, and export snapshot use.
             let plot_id = format!("plot-{}", crate::plot::tab_title(kind).to_lowercase());
+            // Longest visible series: Go-to-frame clamp + Reset enablement.
+            let n_max = borrowed.iter().map(|s| s.len()).max().unwrap_or(0);
             // Help bar pinned to the bottom (Python `side="bottom"` parity).
             egui::Panel::bottom("plot_help").show(vui, |ui| {
                 ui.horizontal(|ui| {
@@ -236,6 +243,31 @@ impl crate::app::RFMetricsApp {
                         .clicked()
                     {
                         self.plots.reset_pending = true;
+                    }
+                    // Go to frame (jump-to-frame parity): Go/Enter pins
+                    // the crosshair at the exact 1-based frame, clamped
+                    // into the data; empty/garbage clears the pin.
+                    ui.label("Go to frame:");
+                    let goto_resp = ui.add_enabled(
+                        !borrowed.is_empty(),
+                        egui::TextEdit::singleline(&mut self.plots.goto_text)
+                            .desired_width(56.0)
+                            .hint_text("frame"),
+                    );
+                    let go_clicked = ui
+                        .add_enabled(!borrowed.is_empty(), egui::Button::new("Go"))
+                        .on_hover_text("Pin the crosshair at this exact frame (empty text clears it)")
+                        .clicked();
+                    if go_clicked
+                        || (goto_resp.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    {
+                        self.plots.pinned =
+                            crate::plot::parse_goto_frame(&self.plots.goto_text, n_max);
+                        // Reflect the clamp so the field shows the pin.
+                        if let Some(f) = self.plots.pinned {
+                            self.plots.goto_text = f.to_string();
+                        }
                     }
                     let save_label = if self.plots.png_saving { "Saving…" } else { "Save PNG" };
                     let save_hover = if self.plots.png_saving {
@@ -501,6 +533,23 @@ impl crate::app::RFMetricsApp {
                         }
                     }
                 }
+                // Pinned Go-to-frame crosshair: valid while inside the
+                // longest visible series; per-series readout feeds the
+                // corner overlay below.
+                let pinned = self
+                    .plots
+                    .pinned
+                    .filter(|&f| f >= 1 && (f as usize) <= n_max);
+                let goto_info: Option<String> = pinned.map(|f| {
+                    let mut s = format!("Frame={f}");
+                    for (name, _, values) in &done {
+                        match values.get(f as usize - 1) {
+                            Some(v) => s.push_str(&format!("\n{name}: {v:.4}")),
+                            None => s.push_str(&format!("\n{name}: —")),
+                        }
+                    }
+                    s
+                });
                 let plot_resp = egui_plot::Plot::new(plot_id)
                     .x_axis_label("Frames")
                     .y_axis_label(def.label)
@@ -534,6 +583,7 @@ impl crate::app::RFMetricsApp {
                             && !plot_ui.response().dragged();
                         let hover_pos = plot_ui.response().hover_pos();
                         let ptr = plot_ui.pointer_coordinate();
+                        let mut readout: Option<String> = None;
                         if let (true, Some(mouse), Some(p)) = (hovering, hover_pos, ptr) {
                             let to_screen = |fx: f64, fy: f64| {
                                 let sp = plot_ui.screen_from_plot(
@@ -550,13 +600,31 @@ impl crate::app::RFMetricsApp {
                                 let fx = frame as f64;
                                 plot_ui.vline(egui_plot::VLine::new("", fx));
                                 plot_ui.hline(egui_plot::HLine::new("", value));
-                                return Some(format!(
+                                readout = Some(format!(
                                     "{}\nFrame={frame}, Metric={value:.4}",
                                     done[si].0
                                 ));
                             }
                         }
-                        None
+                        // Pinned fallback (Go to frame): exact-frame vline
+                        // plus per-series markers in their line colors;
+                        // a hover hit wins on overlap.
+                        if readout.is_none()
+                            && let Some(f) = pinned
+                        {
+                            let fx = f as f64;
+                            plot_ui.vline(egui_plot::VLine::new("", fx));
+                            for (_, slot, values) in &done {
+                                if let Some(&v) = values.get(f as usize - 1) {
+                                    plot_ui.points(
+                                        egui_plot::Points::new("", vec![[fx, v]])
+                                            .color(crate::plot::series_egui_color(*slot))
+                                            .radius(4.0),
+                                    );
+                                }
+                            }
+                        }
+                        readout
                     });
                 // Native tooltip at the pointer: readable body text on a
                 // theme background (Python yellow annotation-box parity).
@@ -566,6 +634,18 @@ impl crate::app::RFMetricsApp {
                         .gap(12.0)
                         .show(|ui| {
                             ui.label(text);
+                        });
+                }
+                // Pinned-frame readout (Go to frame): fixed corner card —
+                // the hover tooltip only exists under the pointer.
+                if let Some(text) = goto_info {
+                    egui::Area::new(egui::Id::new("plot_goto"))
+                        .anchor(egui::Align2::LEFT_TOP, egui::vec2(8.0, 8.0))
+                        .order(egui::Order::Foreground)
+                        .show(ui.ctx(), |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                ui.label(text);
+                            });
                         });
                 }
                 // Mirror the main-window toast here (PNG saver results land

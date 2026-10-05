@@ -113,6 +113,18 @@ fn hover_skips_empty_series() {
 }
 
 #[test]
+fn goto_frame_parses_and_clamps() {
+    assert_eq!(parse_goto_frame("12", 100), Some(12));
+    assert_eq!(parse_goto_frame(" 7 ", 100), Some(7));
+    assert_eq!(parse_goto_frame("9999", 100), Some(100));
+    assert_eq!(parse_goto_frame("0", 100), None);
+    assert_eq!(parse_goto_frame("-3", 100), None);
+    assert_eq!(parse_goto_frame("", 100), None);
+    assert_eq!(parse_goto_frame("abc", 100), None);
+    assert_eq!(parse_goto_frame("12", 0), None);
+}
+
+#[test]
 fn defs_match_python_plot_defs() {
     use crate::metrics::ffmpeg::MetricKind;
     let def = plot_def(MetricKind::Psnr);

@@ -204,6 +204,20 @@ pub fn clamp_range(view: (f64, f64), lim: (f64, f64)) -> (f64, f64) {
     (s0, s0 + span)
 }
 
+/// "Go to frame" parse (plot window text field): 1-based frame clamped
+/// into `[1, n]`; `None` clears the pin (empty/garbage/`0`/negative),
+/// and `None` when there is no data (`n == 0`).
+pub fn parse_goto_frame(text: &str, n: usize) -> Option<i64> {
+    if n == 0 {
+        return None;
+    }
+    let f: i64 = text.trim().parse().ok()?;
+    if f < 1 {
+        return None;
+    }
+    Some((f as usize).min(n) as i64)
+}
+
 /// Max screen distance for a hover hit (Python `best[0] > 30` parity:
 /// anything farther hides the crosshair).
 pub const HOVER_MAX_PX: f32 = 30.0;
