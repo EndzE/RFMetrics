@@ -697,13 +697,12 @@ impl crate::app::RFMetricsApp {
                                 ));
                             }
                         }
-                        // Pinned fallback (Go to frame): exact-frame vline
-                        // plus per-series markers in their line colors over
-                        // a white halo, so the dot reads even where it sits
-                        // on its own same-color line in a dense graph;
-                        // a hover hit wins on overlap.
-                        if readout.is_none()
-                            && let Some(f) = pinned
+                        // Pinned Go-to-frame crosshair: always drawn while
+                        // valid, even under a hover hit — the two
+                        // crosshairs coexist (only the tooltip readout
+                        // prefers hover). Markers ride a white halo so the
+                        // dot reads even on its own same-color line.
+                        if let Some(f) = pinned
                         {
                             let fx = f as f64;
                             plot_ui.vline(egui_plot::VLine::new("", fx));
