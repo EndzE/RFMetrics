@@ -354,7 +354,7 @@ fn sanitize_db_pins_inf_and_nan() {
 fn live_feed_flags() {
     use super::MetricKind::*;
     assert!(!Vmaf.streams_live_values());
-    for k in [Psnr, Ssim, Xpsnr, Ssim2, But, Cvvdp] {
+    for k in [Psnr, Ssim, Xpsnr, Ssim2, Butter, Cvvdp] {
         assert!(k.streams_live_values());
     }
 }

@@ -774,7 +774,7 @@ impl crate::app::RFMetricsApp {
                                 (&mut self.config.metrics.vmaf, "VMAF", vmaf_ok, MetricKind::Vmaf),
                                 (&mut self.config.metrics.xpsnr, "XPSNR", xpsnr_ok, MetricKind::Xpsnr),
                                 (&mut self.config.metrics.ssim2, "SSIM2", ffvship_ok, MetricKind::Ssim2),
-                                (&mut self.config.metrics.butteraugli, "BUTTER", ffvship_ok, MetricKind::But),
+                                (&mut self.config.metrics.butteraugli, "BUTTER", ffvship_ok, MetricKind::Butter),
                                 (&mut self.config.metrics.cvvdp, "CVVDP", ffvship_ok, MetricKind::Cvvdp),
                             ] {
                                 header.col(|ui| vline(ui, egui::Color32::from_gray(0x8A)));

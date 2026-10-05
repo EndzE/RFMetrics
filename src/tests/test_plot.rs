@@ -121,7 +121,7 @@ fn defs_match_python_plot_defs() {
     let def = plot_def(MetricKind::Ssim);
     assert_eq!(def.label, "SSIM (higher is better, min 0, max 1)");
     assert_eq!((def.lo, def.hi), (0.0, 1.0));
-    let def = plot_def(MetricKind::But);
+    let def = plot_def(MetricKind::Butter);
     assert_eq!(def.label, "BUTTERAUGLI (lower is better, min 0)");
     assert_eq!((def.lo, def.hi), (0.0, 10.0));
     let def = plot_def(MetricKind::Cvvdp);

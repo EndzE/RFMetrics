@@ -885,7 +885,7 @@ impl crate::app::RFMetricsApp {
                     self.config.metrics.xpsnr && self.binaries.ffmpeg.supported_metrics.contains(k)
                 }
                 MetricKind::Ssim2 => self.config.metrics.ssim2,
-                MetricKind::But => self.config.metrics.butteraugli,
+                MetricKind::Butter => self.config.metrics.butteraugli,
                 MetricKind::Cvvdp => self.config.metrics.cvvdp,
             })
             .collect();

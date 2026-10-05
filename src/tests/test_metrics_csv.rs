@@ -152,7 +152,7 @@ fn golden_ffvship_shapes() {
     );
     let p = write_metric_csv(
         &cfg,
-        MetricKind::But,
+        MetricKind::Butter,
         dist,
         &outcome(
             FrameDetail::Scores {

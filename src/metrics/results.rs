@@ -34,7 +34,7 @@ pub const ORDER: [MetricKind; 7] = [
     MetricKind::Vmaf,
     MetricKind::Xpsnr,
     MetricKind::Ssim2,
-    MetricKind::But,
+    MetricKind::Butter,
     MetricKind::Cvvdp,
 ];
 

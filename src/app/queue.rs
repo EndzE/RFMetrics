@@ -95,7 +95,7 @@ impl QueueRow {
             MetricKind::Vmaf => &self.vmaf,
             MetricKind::Xpsnr => &self.xpsnr,
             MetricKind::Ssim2 => &self.ssim2,
-            MetricKind::But => &self.butter,
+            MetricKind::Butter => &self.butter,
             MetricKind::Cvvdp => &self.cvvdp,
         }
     }
@@ -107,7 +107,7 @@ impl QueueRow {
             MetricKind::Vmaf => &mut self.vmaf,
             MetricKind::Xpsnr => &mut self.xpsnr,
             MetricKind::Ssim2 => &mut self.ssim2,
-            MetricKind::But => &mut self.butter,
+            MetricKind::Butter => &mut self.butter,
             MetricKind::Cvvdp => &mut self.cvvdp,
         }
     }
@@ -119,7 +119,7 @@ impl QueueRow {
             MetricKind::Vmaf => &self.vmaf_cache,
             MetricKind::Xpsnr => &self.xpsnr_cache,
             MetricKind::Ssim2 => &self.ssim2_cache,
-            MetricKind::But => &self.butter_cache,
+            MetricKind::Butter => &self.butter_cache,
             MetricKind::Cvvdp => &self.cvvdp_cache,
         }
     }
@@ -131,7 +131,7 @@ impl QueueRow {
             MetricKind::Vmaf => &mut self.vmaf_cache,
             MetricKind::Xpsnr => &mut self.xpsnr_cache,
             MetricKind::Ssim2 => &mut self.ssim2_cache,
-            MetricKind::But => &mut self.butter_cache,
+            MetricKind::Butter => &mut self.butter_cache,
             MetricKind::Cvvdp => &mut self.cvvdp_cache,
         }
     }
@@ -340,7 +340,7 @@ pub(crate) fn initial_dir(col: SortColumn, stat: crate::metrics::CellStat) -> So
         SortColumn::Path => SortDir::Asc,
         // Butteraugli is lower-better on every stat, StdDev on every
         // metric (mirrors the rank logic).
-        SortColumn::Metric(MetricKind::But) => SortDir::Asc,
+        SortColumn::Metric(MetricKind::Butter) => SortDir::Asc,
         SortColumn::Metric(_) if stat == CellStat::StdDev => SortDir::Asc,
         SortColumn::Metric(_) => SortDir::Desc,
     }
@@ -458,7 +458,7 @@ pub(crate) const METRIC_COLUMNS: [(Option<MetricKind>, &str); 7] = [
     (Some(MetricKind::Vmaf), "VMAF"),
     (Some(MetricKind::Xpsnr), "XPSNR"),
     (Some(MetricKind::Ssim2), "SSIM2"),
-    (Some(MetricKind::But), "BUTTER"),
+    (Some(MetricKind::Butter), "BUTTER"),
     (Some(MetricKind::Cvvdp), "CVVDP"),
 ];
 
@@ -562,7 +562,7 @@ impl QueueModel {
                     let (_, v, lower_better) = comp[k];
                     // BUTTERAUGLI is lower-is-better on every stat (Python
                     // "lower is better, min 0"); StdDev already is.
-                    ranks[k] = if lower_better || kind == MetricKind::But {
+                    ranks[k] = if lower_better || kind == MetricKind::Butter {
                         crate::metrics::rank_low(v, stat_lo[k], stat_hi[k])
                     } else {
                         crate::metrics::rank(v, stat_lo[k], stat_hi[k])

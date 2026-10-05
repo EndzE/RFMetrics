@@ -184,7 +184,7 @@ impl crate::app::RFMetricsApp {
                 } if !values.is_empty() => (values.clone(), vmaf_cfg.clone()),
                 _ => continue,
             };
-            let picks = badframes::worst_n(&values, n, kind == MetricKind::But);
+            let picks = badframes::worst_n(&values, n, kind == MetricKind::Butter);
             let stride = badframes::stride_for(kind, vmaf_cfg.as_ref());
             for (idx, _) in picks {
                 let frame = idx.saturating_mul(stride);
@@ -253,7 +253,7 @@ impl crate::app::RFMetricsApp {
             .filter(|n| *n >= 1)
             .unwrap_or(5);
         let stride = badframes::stride_for(kind, vmaf_cfg.as_ref());
-        badframes::worst_n(values, n, kind == MetricKind::But)
+        badframes::worst_n(values, n, kind == MetricKind::Butter)
             .into_iter()
             .map(|(idx, v)| {
                 let frame = idx.saturating_mul(stride);

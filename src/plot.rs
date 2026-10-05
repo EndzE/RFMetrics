@@ -43,7 +43,7 @@ pub fn plot_def(kind: MetricKind) -> PlotDef {
             lo: 0.0,
             hi: 100.0,
         },
-        MetricKind::But => PlotDef {
+        MetricKind::Butter => PlotDef {
             label: "BUTTERAUGLI (lower is better, min 0)",
             lo: 0.0,
             hi: 10.0,
@@ -65,7 +65,7 @@ pub fn tab_title(kind: MetricKind) -> &'static str {
         MetricKind::Vmaf => "VMAF",
         MetricKind::Xpsnr => "XPSNR",
         MetricKind::Ssim2 => "SSIM2",
-        MetricKind::But => "BUTTERAUGLI",
+        MetricKind::Butter => "BUTTERAUGLI",
         MetricKind::Cvvdp => "CVVDP",
     }
 }

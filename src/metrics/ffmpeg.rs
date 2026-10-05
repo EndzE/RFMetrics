@@ -17,7 +17,7 @@ pub enum MetricKind {
     Xpsnr,
     Vmaf,
     Ssim2,
-    But,
+    Butter,
     Cvvdp,
 }
 
@@ -30,7 +30,7 @@ impl MetricKind {
         MetricKind::Vmaf,
         MetricKind::Xpsnr,
         MetricKind::Ssim2,
-        MetricKind::But,
+        MetricKind::Butter,
         MetricKind::Cvvdp,
     ];
 
@@ -46,14 +46,14 @@ impl MetricKind {
             Self::Xpsnr => "XPSNR",
             Self::Vmaf => "VMAF",
             Self::Ssim2 => "SSIM2",
-            Self::But => "BUTTER",
+            Self::Butter => "BUTTER",
             Self::Cvvdp => "CVVDP",
         }
     }
 
     /// FFVship-backed metrics ride `run_ffvship`, not the ffmpeg engine.
     pub fn is_ffvship(self) -> bool {
-        matches!(self, Self::Ssim2 | Self::But | Self::Cvvdp)
+        matches!(self, Self::Ssim2 | Self::Butter | Self::Cvvdp)
     }
 
     /// Metrics whose runner streams per-frame live values (the plot
@@ -70,7 +70,7 @@ impl MetricKind {
         use crate::metrics::ffvship::FfvshipKind;
         match self {
             Self::Ssim2 => Some(FfvshipKind::Ssimulacra2),
-            Self::But => Some(FfvshipKind::Butteraugli),
+            Self::Butter => Some(FfvshipKind::Butteraugli),
             Self::Cvvdp => Some(FfvshipKind::Cvvdp),
             Self::Psnr | Self::Ssim | Self::Xpsnr | Self::Vmaf => None,
         }
@@ -87,7 +87,7 @@ impl MetricKind {
             Self::Xpsnr => "xpsnr",
             // VMAF never uses `filtergraph` (own libvmaf builder in vmaf.rs).
             Self::Vmaf => "libvmaf",
-            Self::Ssim2 | Self::But | Self::Cvvdp => {
+            Self::Ssim2 | Self::Butter | Self::Cvvdp => {
                 unreachable!("FFVship metrics have no ffmpeg filter")
             }
         }
@@ -300,7 +300,7 @@ pub fn parse_frame_line(line: &str, kind: MetricKind) -> Option<f64> {
         MetricKind::Xpsnr
         | MetricKind::Vmaf
         | MetricKind::Ssim2
-        | MetricKind::But
+        | MetricKind::Butter
         | MetricKind::Cvvdp => {
             return None;
         }
@@ -392,7 +392,7 @@ pub fn parse_summary(text: &str, kind: MetricKind) -> Option<f64> {
             MetricKind::Xpsnr
             | MetricKind::Vmaf
             | MetricKind::Ssim2
-            | MetricKind::But
+            | MetricKind::Butter
             | MetricKind::Cvvdp => {}
         }
     }

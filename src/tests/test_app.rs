@@ -21,7 +21,7 @@ fn metric_columns_keep_live_cells_under_their_headers() {
             Some(MetricKind::Vmaf),
             Some(MetricKind::Xpsnr),
             Some(MetricKind::Ssim2),
-            Some(MetricKind::But),
+            Some(MetricKind::Butter),
             Some(MetricKind::Cvvdp),
         ]
     );
@@ -1113,7 +1113,7 @@ fn done_stale_marking_matches_recompute_rules() {
         pf
     ));
     assert!(!done_is_stale(
-        MetricKind::But,
+        MetricKind::Butter,
         &done_psnr,
         s,
         c,
@@ -2584,7 +2584,7 @@ fn butter_rank_is_min_wins() {
         app.queue.rows[i].butter_cache.stats = stats;
     }
     app.queue
-        .refresh_ranks(crate::metrics::ffmpeg::MetricKind::But);
+        .refresh_ranks(crate::metrics::ffmpeg::MetricKind::Butter);
     assert_eq!(app.queue.rows[0].butter_cache.ranks[0], StatRank::Best);
     assert_eq!(app.queue.rows[1].butter_cache.ranks[0], StatRank::Worst);
 }
@@ -3911,7 +3911,7 @@ fn sort_cycle_path_and_metrics() {
     );
     // Butteraugli is lower-better: best first is ascending.
     assert_eq!(
-        initial_dir(SortColumn::Metric(MetricKind::But), CellStat::Avg),
+        initial_dir(SortColumn::Metric(MetricKind::Butter), CellStat::Avg),
         SortDir::Asc
     );
     // StdDev is lower-better on every metric: best first is ascending.
@@ -3985,13 +3985,13 @@ fn sort_view_orders_and_restores() {
     );
     // Butteraugli best first is ascending (lower wins).
     let rows = vec![
-        sort_test_row("a.mp4", MetricKind::But, Some(2.0)),
-        sort_test_row("b.mp4", MetricKind::But, Some(1.0)),
+        sort_test_row("a.mp4", MetricKind::Butter, Some(2.0)),
+        sort_test_row("b.mp4", MetricKind::Butter, Some(1.0)),
     ];
     assert_eq!(
         sort_view(
             &rows,
-            Some((SortColumn::Metric(MetricKind::But), SortDir::Asc)),
+            Some((SortColumn::Metric(MetricKind::Butter), SortDir::Asc)),
             CellStat::Avg
         ),
         vec![1, 0]
