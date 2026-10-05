@@ -626,7 +626,9 @@ impl crate::app::RFMetricsApp {
                             }
                         }
                         // Pinned fallback (Go to frame): exact-frame vline
-                        // plus per-series markers in their line colors;
+                        // plus per-series markers in their line colors over
+                        // a white halo, so the dot reads even where it sits
+                        // on its own same-color line in a dense graph;
                         // a hover hit wins on overlap.
                         if readout.is_none()
                             && let Some(f) = pinned
@@ -635,6 +637,11 @@ impl crate::app::RFMetricsApp {
                             plot_ui.vline(egui_plot::VLine::new("", fx));
                             for (_, slot, values) in &done {
                                 if let Some(&v) = values.get(f as usize - 1) {
+                                    plot_ui.points(
+                                        egui_plot::Points::new("", vec![[fx, v]])
+                                            .color(egui::Color32::WHITE)
+                                            .radius(7.0),
+                                    );
                                     plot_ui.points(
                                         egui_plot::Points::new("", vec![[fx, v]])
                                             .color(crate::plot::series_egui_color(*slot))
