@@ -269,20 +269,14 @@ impl crate::app::RFMetricsApp {
                     {
                         self.plots.reset_pending = true;
                     }
-                    // Go to frame (jump-to-frame parity): pins the crosshair
-                    // at the exact 1-based frame as you type, clamped into
-                    // the data; empty/garbage clears the pin. Debounced:
-                    // typing restarts the timer, the pin applies once input
-                    // settles (the plot repaints ~10 Hz idle, continuously
-                    // while measuring, so the check always runs). The −/+
-                    // steppers commit at once and repeat while held (first
-                    // repeat after a short delay, then a steady cadence).
                     // Go to frame spinbox (jump-to-frame parity): frameless
-                    // field + docked ▲▼ chevrons in one text-edit-styled
-                    // frame (glyphs, not text: the bundled UI font has no
-                    // ▲▼ — see `step_button`). Typing pins the crosshair at
-                    // the exact 1-based frame debounced; chevrons commit at
-                    // once and repeat while held; empty/garbage clears it.
+                    // field + side-by-side ▲▼ chevrons in one
+                    // text-edit-styled frame (glyphs, not text: the bundled
+                    // UI font has no ▲▼ — see `step_button`). Typing pins
+                    // the crosshair at the exact 1-based frame debounced;
+                    // chevrons commit at once and repeat while held (first
+                    // repeat after a short delay, then a steady cadence);
+                    // empty/garbage clears the pin.
                     ui.label("Go to frame:");
                     let now = ui.input(|i| i.time);
                     let down = ui.input(|i| i.pointer.primary_down());
@@ -320,25 +314,16 @@ impl crate::app::RFMetricsApp {
                                                 .on_hover_text(
                                                     "Pin the crosshair at this exact frame as you type (empty clears it)",
                                                 );
-                                            let chevs = ui
-                                                .vertical(|ui| {
-                                                    ui.spacing_mut().item_spacing.y = 0.0;
-                                                    let up = crate::app::widgets::step_button(
-                                                        ui, true,
-                                                    )
-                                                    .on_hover_text(
-                                                        "Next frame (hold to repeat)",
-                                                    );
-                                                    let down_btn = crate::app::widgets::step_button(
-                                                        ui, false,
-                                                    )
+                                            let up = crate::app::widgets::step_button(ui, true)
+                                                .on_hover_text(
+                                                    "Next frame (hold to repeat)",
+                                                );
+                                            let down_btn =
+                                                crate::app::widgets::step_button(ui, false)
                                                     .on_hover_text(
                                                         "Previous frame (hold to repeat)",
                                                     );
-                                                    (down_btn, up)
-                                                })
-                                                .inner;
-                                            (field, chevs.0, chevs.1)
+                                            (field, down_btn, up)
                                         },
                                     )
                                     .inner
