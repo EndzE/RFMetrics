@@ -122,35 +122,40 @@ pub(crate) fn sort_mark(ui: &mut egui::Ui, dir: Option<SortDir>) -> egui::Respon
     resp
 }
 
-/// Painted up/down stepper button: triangle glyph, not text — the bundled
-/// UI font has no ▲▼ glyphs (tofu squares; see `sort_mark`). State-aware
-/// button frame (hover/press/disabled via `interact`), triangle in the
-/// matching text color. Returns the click response, so it drops into
-/// `clicked` / hold-to-repeat call sites like a text button.
+/// Painted up/down stepper chevron: stroked ^/v glyph, not text — the
+/// bundled UI font has no ▲▼ glyphs (tofu squares; see `sort_mark`).
+/// Bare on the spinbox field (no button chrome; faint fill on
+/// hover/press only), stroked chevron in the matching text color so it
+/// dims with the field when disabled. Returns the click response, so it
+/// drops into `clicked` / hold-to-repeat call sites like a text button.
 pub(crate) fn step_button(ui: &mut egui::Ui, up: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 15.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(18.0, 11.0), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         let v = ui.style().interact(&resp);
-        ui.painter().rect_filled(rect, v.corner_radius, v.bg_fill);
+        if resp.is_pointer_button_down_on() {
+            ui.painter().rect_filled(rect, v.corner_radius, v.bg_fill);
+        } else if resp.hovered() {
+            ui.painter()
+                .rect_filled(rect, v.corner_radius, v.weak_bg_fill);
+        }
         let c = rect.center();
-        let r = 4.5;
+        let (r, h) = (3.5, 2.2);
         let pts = if up {
             vec![
-                egui::pos2(c.x - r, c.y + r * 0.8),
-                egui::pos2(c.x + r, c.y + r * 0.8),
-                egui::pos2(c.x, c.y - r * 0.8),
+                egui::pos2(c.x - r, c.y + h),
+                egui::pos2(c.x, c.y - h),
+                egui::pos2(c.x + r, c.y + h),
             ]
         } else {
             vec![
-                egui::pos2(c.x - r, c.y - r * 0.8),
-                egui::pos2(c.x + r, c.y - r * 0.8),
-                egui::pos2(c.x, c.y + r * 0.8),
+                egui::pos2(c.x - r, c.y - h),
+                egui::pos2(c.x, c.y + h),
+                egui::pos2(c.x + r, c.y - h),
             ]
         };
-        ui.painter().add(egui::Shape::convex_polygon(
+        ui.painter().add(egui::Shape::line(
             pts,
-            v.text_color(),
-            egui::Stroke::NONE,
+            egui::Stroke::new(1.5, v.text_color()),
         ));
     }
     resp

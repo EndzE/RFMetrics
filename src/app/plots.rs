@@ -46,6 +46,10 @@ pub(crate) struct PlotRuntime {
     pub(crate) goto_applied: String,
     /// Last edit time of the Go-to-frame field (`None` = settled).
     pub(crate) goto_changed_at: Option<f64>,
+    /// Go-to-frame field focus (previous frame): drives the spinbox
+    /// wrapper's focus ring — the frame paints before the field exists,
+    /// so the current frame's focus is only known a frame late.
+    pub(crate) goto_focused: bool,
     /// Stepper hold-to-repeat arm: (direction, next fire time); cleared
     /// on release.
     pub(crate) step_repeat: Option<(i64, f64)>,
@@ -273,40 +277,76 @@ impl crate::app::RFMetricsApp {
                     // while measuring, so the check always runs). The −/+
                     // steppers commit at once and repeat while held (first
                     // repeat after a short delay, then a steady cadence).
+                    // Go to frame spinbox (jump-to-frame parity): frameless
+                    // field + docked ▲▼ chevrons in one text-edit-styled
+                    // frame (glyphs, not text: the bundled UI font has no
+                    // ▲▼ — see `step_button`). Typing pins the crosshair at
+                    // the exact 1-based frame debounced; chevrons commit at
+                    // once and repeat while held; empty/garbage clears it.
                     ui.label("Go to frame:");
                     let now = ui.input(|i| i.time);
                     let down = ui.input(|i| i.pointer.primary_down());
-                    let goto_resp = ui
-                        .add_enabled(
-                            !borrowed.is_empty(),
-                            egui::TextEdit::singleline(&mut self.plots.goto_text)
-                                .desired_width(56.0)
-                                .hint_text("frame"),
-                        )
-                        .on_hover_text(
-                            "Pin the crosshair at this exact frame as you type (empty clears it)",
-                        );
-                    // Painted ▲▼ spinbox (glyphs, not text: the bundled UI
-                    // font has no ▲▼ — see `step_button`): up steps to the
-                    // next frame, down to the previous; hold repeats either.
-                    let (minus, plus) = ui
-                        .vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 1.0;
-                            let up_btn = ui
-                                .add_enabled_ui(!borrowed.is_empty(), |ui| {
-                                    crate::app::widgets::step_button(ui, true)
+                    let (goto_resp, minus, plus) = ui
+                        .add_enabled_ui(!borrowed.is_empty(), |ui| {
+                            let frame = egui::Frame::new()
+                                .fill(ui.visuals().text_edit_bg_color())
+                                .corner_radius(ui.visuals().widgets.inactive.corner_radius)
+                                .stroke(if self.plots.goto_focused {
+                                    ui.visuals().selection.stroke
+                                } else {
+                                    ui.visuals().widgets.inactive.bg_stroke
+                                })
+                                .inner_margin(egui::Margin {
+                                    left: 6,
+                                    right: 3,
+                                    top: 2,
+                                    bottom: 2,
+                                });
+                            frame
+                                .show(ui, |ui| {
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.spacing_mut().item_spacing.x = 2.0;
+                                            let field = ui
+                                                .add(
+                                                    egui::TextEdit::singleline(
+                                                        &mut self.plots.goto_text,
+                                                    )
+                                                    .frame(egui::Frame::NONE)
+                                                    .desired_width(44.0)
+                                                    .hint_text("frame"),
+                                                )
+                                                .on_hover_text(
+                                                    "Pin the crosshair at this exact frame as you type (empty clears it)",
+                                                );
+                                            let chevs = ui
+                                                .vertical(|ui| {
+                                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                                    let up = crate::app::widgets::step_button(
+                                                        ui, true,
+                                                    )
+                                                    .on_hover_text(
+                                                        "Next frame (hold to repeat)",
+                                                    );
+                                                    let down_btn = crate::app::widgets::step_button(
+                                                        ui, false,
+                                                    )
+                                                    .on_hover_text(
+                                                        "Previous frame (hold to repeat)",
+                                                    );
+                                                    (down_btn, up)
+                                                })
+                                                .inner;
+                                            (field, chevs.0, chevs.1)
+                                        },
+                                    )
+                                    .inner
                                 })
                                 .inner
-                                .on_hover_text("Next frame (hold to repeat)");
-                            let down_btn = ui
-                                .add_enabled_ui(!borrowed.is_empty(), |ui| {
-                                    crate::app::widgets::step_button(ui, false)
-                                })
-                                .inner
-                                .on_hover_text("Previous frame (hold to repeat)");
-                            (down_btn, up_btn)
                         })
                         .inner;
+                    self.plots.goto_focused = goto_resp.has_focus();
                     // Hold-to-repeat: a fresh press steps at once and latches
                     // the hold; the latched hold fires on cadence off the
                     // physical button state, past egui's click window (its
