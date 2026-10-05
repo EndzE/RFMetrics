@@ -122,6 +122,40 @@ pub(crate) fn sort_mark(ui: &mut egui::Ui, dir: Option<SortDir>) -> egui::Respon
     resp
 }
 
+/// Painted up/down stepper button: triangle glyph, not text — the bundled
+/// UI font has no ▲▼ glyphs (tofu squares; see `sort_mark`). State-aware
+/// button frame (hover/press/disabled via `interact`), triangle in the
+/// matching text color. Returns the click response, so it drops into
+/// `clicked` / hold-to-repeat call sites like a text button.
+pub(crate) fn step_button(ui: &mut egui::Ui, up: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 15.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let v = ui.style().interact(&resp);
+        ui.painter().rect_filled(rect, v.corner_radius, v.bg_fill);
+        let c = rect.center();
+        let r = 4.5;
+        let pts = if up {
+            vec![
+                egui::pos2(c.x - r, c.y + r * 0.8),
+                egui::pos2(c.x + r, c.y + r * 0.8),
+                egui::pos2(c.x, c.y - r * 0.8),
+            ]
+        } else {
+            vec![
+                egui::pos2(c.x - r, c.y - r * 0.8),
+                egui::pos2(c.x + r, c.y - r * 0.8),
+                egui::pos2(c.x, c.y + r * 0.8),
+            ]
+        };
+        ui.painter().add(egui::Shape::convex_polygon(
+            pts,
+            v.text_color(),
+            egui::Stroke::NONE,
+        ));
+    }
+    resp
+}
+
 /// Panel frame with Python's drag-enter green (#2FA572) while hovered.
 pub(crate) fn panel_frame(ui: &egui::Ui, hovering: bool) -> egui::Frame {
     let mut frame = egui::Frame::group(ui.style());

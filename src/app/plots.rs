@@ -276,9 +276,6 @@ impl crate::app::RFMetricsApp {
                     ui.label("Go to frame:");
                     let now = ui.input(|i| i.time);
                     let down = ui.input(|i| i.pointer.primary_down());
-                    let minus = ui
-                        .add_enabled(!borrowed.is_empty(), egui::Button::new("-"))
-                        .on_hover_text("Previous frame (hold to repeat)");
                     let goto_resp = ui
                         .add_enabled(
                             !borrowed.is_empty(),
@@ -289,9 +286,27 @@ impl crate::app::RFMetricsApp {
                         .on_hover_text(
                             "Pin the crosshair at this exact frame as you type (empty clears it)",
                         );
-                    let plus = ui
-                        .add_enabled(!borrowed.is_empty(), egui::Button::new("+"))
-                        .on_hover_text("Next frame (hold to repeat)");
+                    // Painted ▲▼ spinbox (glyphs, not text: the bundled UI
+                    // font has no ▲▼ — see `step_button`): up steps to the
+                    // next frame, down to the previous; hold repeats either.
+                    let (minus, plus) = ui
+                        .vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            let up_btn = ui
+                                .add_enabled_ui(!borrowed.is_empty(), |ui| {
+                                    crate::app::widgets::step_button(ui, true)
+                                })
+                                .inner
+                                .on_hover_text("Next frame (hold to repeat)");
+                            let down_btn = ui
+                                .add_enabled_ui(!borrowed.is_empty(), |ui| {
+                                    crate::app::widgets::step_button(ui, false)
+                                })
+                                .inner
+                                .on_hover_text("Previous frame (hold to repeat)");
+                            (down_btn, up_btn)
+                        })
+                        .inner;
                     // Hold-to-repeat: a fresh press steps at once and latches
                     // the hold; the latched hold fires on cadence off the
                     // physical button state, past egui's click window (its
