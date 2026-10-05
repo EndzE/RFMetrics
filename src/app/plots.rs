@@ -276,7 +276,7 @@ impl crate::app::RFMetricsApp {
                     // the crosshair at the exact 1-based frame debounced;
                     // chevrons commit at once and repeat while held (first
                     // repeat after a short delay, then a steady cadence);
-                    // empty/garbage clears the pin.
+                    // stepping down to 0, empty, or garbage clears the pin.
                     ui.label("Go to frame:");
                     let now = ui.input(|i| i.time);
                     let down = ui.input(|i| i.pointer.primary_down());
@@ -385,10 +385,15 @@ impl crate::app::RFMetricsApp {
                         let base = self.plots.goto_text.trim().parse::<i64>().ok()
                             .or(self.plots.pinned)
                             .unwrap_or(0);
-                        let f = (base + step).clamp(1, n_max as i64);
+                        // Stepping below 1 lands on 0 and clears the pin
+                        // (no manual backspace needed); stepping back up
+                        // re-pins from 1. Pin derivation stays in
+                        // `parse_goto_frame` (0 → `None` = cleared).
+                        let f = (base + step).clamp(0, n_max as i64);
                         self.plots.goto_text = f.to_string();
                         self.plots.goto_applied = self.plots.goto_text.clone();
-                        self.plots.pinned = Some(f);
+                        self.plots.pinned =
+                            crate::plot::parse_goto_frame(&self.plots.goto_text, n_max);
                         self.plots.goto_changed_at = None;
                     }
                     if goto_resp.changed() {
