@@ -322,15 +322,23 @@ impl crate::app::RFMetricsApp {
                                                 .on_hover_text(
                                                     "Pin the crosshair at this exact frame as you type (empty clears it)",
                                                 );
-                                            let up = crate::app::widgets::step_button(ui, true)
-                                                .on_hover_text(
-                                                    "Next frame (hold to repeat)",
-                                                );
+                                            let up = crate::app::widgets::step_button(
+                                                ui,
+                                                true,
+                                                self.plots.step_hold == Some(1),
+                                            )
+                                            .on_hover_text(
+                                                "Next frame (hold to repeat)",
+                                            );
                                             let down_btn =
-                                                crate::app::widgets::step_button(ui, false)
-                                                    .on_hover_text(
-                                                        "Previous frame (hold to repeat)",
-                                                    );
+                                                crate::app::widgets::step_button(
+                                                    ui,
+                                                    false,
+                                                    self.plots.step_hold == Some(-1),
+                                                )
+                                                .on_hover_text(
+                                                    "Previous frame (hold to repeat)",
+                                                );
                                             (field, down_btn, up)
                                         },
                                     )

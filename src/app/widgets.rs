@@ -126,13 +126,21 @@ pub(crate) fn sort_mark(ui: &mut egui::Ui, dir: Option<SortDir>) -> egui::Respon
 /// bundled UI font has no ▲▼ glyphs (tofu squares; see `sort_mark`).
 /// Bare on the spinbox field (no button chrome; faint fill on
 /// hover/press only), stroked chevron in the matching text color so it
-/// dims with the field when disabled. Returns the click response, so it
+/// dims with the field when disabled. `held` is the caller's own hold
+/// latch: egui retires its hover/press flags after `max_click_duration`,
+/// which would un-highlight a still-repeating button — a latched hold
+/// forces active visuals instead. Returns the click response, so it
 /// drops into `clicked` / hold-to-repeat call sites like a text button.
-pub(crate) fn step_button(ui: &mut egui::Ui, up: bool) -> egui::Response {
+pub(crate) fn step_button(ui: &mut egui::Ui, up: bool, held: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(18.0, 11.0), egui::Sense::click());
     if ui.is_rect_visible(rect) {
-        let v = ui.style().interact(&resp);
-        if resp.is_pointer_button_down_on() {
+        let pressed = held && resp.enabled();
+        let v = if pressed {
+            &ui.visuals().widgets.active
+        } else {
+            ui.style().interact(&resp)
+        };
+        if pressed || resp.is_pointer_button_down_on() {
             ui.painter().rect_filled(rect, v.corner_radius, v.bg_fill);
         } else if resp.hovered() {
             ui.painter()
