@@ -385,18 +385,36 @@ impl crate::app::RFMetricsApp {
                 open = false;
                 return;
             }
+            // Control buttons docked to the bottom (dialog button bar);
+            // the form keeps the central area.
+            egui::Panel::bottom("cvdisp_buttons").show(vui, |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let now = ui.input(|i| i.time);
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                    if ui.button("Save as new preset").clicked() {
+                        self.cvdisp_save(now, true, &mut close);
+                    }
+                    let can_save = self.cvdisp.own.is_some() && !self.cvdisp.adding;
+                    if can_save && ui.button("Save preset").clicked() {
+                        self.cvdisp_save(now, false, &mut close);
+                    }
+                });
+            });
             // CentralPanel: main-window background + margins (a bare
             // viewport Ui starts at the raw origin on flat black).
             egui::CentralPanel::default().show(vui, |ui| {
-                self.cvdisp_form(ui, &mut close);
+                self.cvdisp_form(ui);
             });
         });
         self.cvdisp.open = open && !close;
     }
 
     /// The editor form (VideoMetricsLab `CvvdpDisplayDialog` parity:
-    /// fields, ranges, units, and the live screen-height note).
-    fn cvdisp_form(&mut self, ui: &mut egui::Ui, close: &mut bool) {
+    /// fields, ranges, units, and the live screen-height note). Control
+    /// buttons live in the bottom bar below, not here.
+    fn cvdisp_form(&mut self, ui: &mut egui::Ui) {
         egui::Grid::new("cvdisp_form")
             .num_columns(2)
             .spacing([8.0, 4.0])
@@ -407,18 +425,22 @@ impl crate::app::RFMetricsApp {
                 } else {
                     "Type a name and click Save as new preset to keep this display as a preset."
                 };
-                ui.text_edit_singleline(&mut self.cvdisp.draft.name)
-                    .on_hover_text(name_tip);
+                crate::app::widgets::hover_wrap(
+                    ui.text_edit_singleline(&mut self.cvdisp.draft.name),
+                    name_tip,
+                );
                 ui.end_row();
                 ui.label("Resolution:");
                 ui.horizontal(|ui| {
-                    ui.add(
-                        egui::DragValue::new(&mut self.cvdisp.draft.width)
-                            .range(16.0..=8192.0)
-                            .speed(1.0)
-                            .max_decimals(0),
-                    )
-                    .on_hover_text("The display's own resolution in pixels (not the video's).");
+                    crate::app::widgets::hover_wrap(
+                        ui.add(
+                            egui::DragValue::new(&mut self.cvdisp.draft.width)
+                                .range(16.0..=8192.0)
+                                .speed(1.0)
+                                .max_decimals(0),
+                        ),
+                        "The display's own resolution in pixels (not the video's).",
+                    );
                     ui.label("x");
                     ui.add(
                         egui::DragValue::new(&mut self.cvdisp.draft.height)
@@ -440,14 +462,14 @@ impl crate::app::RFMetricsApp {
                 ui.end_row();
                 ui.label("Viewing distance:");
                 ui.horizontal(|ui| {
-                    ui.add(
-                        egui::DragValue::new(&mut self.cvdisp.draft.distance)
-                            .range(0.05..=50.0)
-                            .speed(0.05)
-                            .max_decimals(4)
-                            .suffix(" m"),
-                    )
-                    .on_hover_text(
+                    crate::app::widgets::hover_wrap(
+                        ui.add(
+                            egui::DragValue::new(&mut self.cvdisp.draft.distance)
+                                .range(0.05..=50.0)
+                                .speed(0.05)
+                                .max_decimals(4)
+                                .suffix(" m"),
+                        ),
                         "How far the viewer's eyes are from the screen. Closer makes \
                      small artifacts easier to see.",
                     );
@@ -465,103 +487,94 @@ impl crate::app::RFMetricsApp {
                 });
                 ui.end_row();
                 ui.label("Peak brightness:");
-                ui.add(
-                    egui::DragValue::new(&mut self.cvdisp.draft.peak)
-                        .range(1.0..=10000.0)
-                        .speed(10.0)
-                        .max_decimals(0)
-                        .suffix(" nits"),
-                )
-                .on_hover_text(
+                crate::app::widgets::hover_wrap(
+                    ui.add(
+                        egui::DragValue::new(&mut self.cvdisp.draft.peak)
+                            .range(1.0..=10000.0)
+                            .speed(10.0)
+                            .max_decimals(0)
+                            .suffix(" nits"),
+                    ),
                     "The display's peak brightness: about 200 for an office monitor, \
                  600-1500 for an HDR monitor, 1000-4000 for an HDR TV.",
                 );
                 ui.end_row();
                 ui.label("Contrast:");
-                ui.add(
-                    egui::DragValue::new(&mut self.cvdisp.draft.contrast)
-                        .range(1.0..=10_000_000.0)
-                        .speed(100.0)
-                        .max_decimals(0)
-                        .suffix(" : 1"),
-                )
-                .on_hover_text(
+                crate::app::widgets::hover_wrap(
+                    ui.add(
+                        egui::DragValue::new(&mut self.cvdisp.draft.contrast)
+                            .range(1.0..=10_000_000.0)
+                            .speed(100.0)
+                            .max_decimals(0)
+                            .suffix(" : 1"),
+                    ),
                     "Peak to black: about 1000:1 for a typical LCD, 1,000,000:1 \
                  for OLED or the official HDR displays.",
                 );
                 ui.end_row();
                 ui.label("Room light:");
-                ui.add(
-                    egui::DragValue::new(&mut self.cvdisp.draft.ambient)
-                        .range(0.0..=100_000.0)
-                        .speed(10.0)
-                        .max_decimals(1)
-                        .suffix(" lux"),
-                )
-                .on_hover_text(
+                crate::app::widgets::hover_wrap(
+                    ui.add(
+                        egui::DragValue::new(&mut self.cvdisp.draft.ambient)
+                            .range(0.0..=100_000.0)
+                            .speed(10.0)
+                            .max_decimals(1)
+                            .suffix(" lux"),
+                    ),
                     "Light falling on the screen: about 250 lux in an office, 5-10 \
                  watching a film with the lights low, 0 in the dark.",
                 );
                 ui.end_row();
                 ui.label("Screen reflectivity:");
-                ui.add(
-                    egui::DragValue::new(&mut self.cvdisp.draft.reflect_pct)
-                        .range(0.0..=99.9)
-                        .speed(0.1)
-                        .max_decimals(2)
-                        .suffix(" %"),
-                )
-                .on_hover_text(
+                crate::app::widgets::hover_wrap(
+                    ui.add(
+                        egui::DragValue::new(&mut self.cvdisp.draft.reflect_pct)
+                            .range(0.0..=99.9)
+                            .speed(0.1)
+                            .max_decimals(2)
+                            .suffix(" %"),
+                    ),
                     "How much of the room light the screen reflects back at the \
                  viewer; 0.5% is the official models' value.",
                 );
                 ui.end_row();
                 ui.label("Exposure:");
-                ui.add(
-                    egui::DragValue::new(&mut self.cvdisp.draft.exposure)
-                        .range(0.01..=100.0)
-                        .speed(0.1)
-                        .max_decimals(2),
-                )
-                .on_hover_text("Brightness multiplier for the pictures; 1 shows them as encoded.");
+                crate::app::widgets::hover_wrap(
+                    ui.add(
+                        egui::DragValue::new(&mut self.cvdisp.draft.exposure)
+                            .range(0.01..=100.0)
+                            .speed(0.1)
+                            .max_decimals(2),
+                    ),
+                    "Brightness multiplier for the pictures; 1 shows them as encoded.",
+                );
                 ui.end_row();
                 ui.label("Colorspace:");
-                egui::ComboBox::from_id_salt("cvdisp_colorspace")
-                    .selected_text(self.cvdisp.draft.colorspace.as_str())
-                    .show_ui(ui, |ui| {
-                        for c in crate::metrics::ffvship::DISPLAY_COLORSPACES {
-                            ui.selectable_value(
-                                &mut self.cvdisp.draft.colorspace,
-                                (*c).to_owned(),
-                                *c,
-                            )
-                            .on_hover_text(colorspace_tip(c));
-                        }
-                    })
-                    .response
-                    .on_hover_text(
-                        "Transfer function of the content: SDR for regular videos, \
-                         the HDR one matching the footage, linear for absolute \
-                         linear-light frames.",
-                    );
+                crate::app::widgets::hover_wrap(
+                    egui::ComboBox::from_id_salt("cvdisp_colorspace")
+                        .selected_text(self.cvdisp.draft.colorspace.as_str())
+                        .show_ui(ui, |ui| {
+                            for c in crate::metrics::ffvship::DISPLAY_COLORSPACES {
+                                crate::app::widgets::hover_wrap(
+                                    ui.selectable_value(
+                                        &mut self.cvdisp.draft.colorspace,
+                                        (*c).to_owned(),
+                                        *c,
+                                    ),
+                                    colorspace_tip(c),
+                                );
+                            }
+                        })
+                        .response,
+                    "Transfer function of the content: SDR for regular videos, \
+                     the HDR one matching the footage, linear for absolute \
+                     linear-light frames.",
+                );
                 ui.end_row();
             });
         if !self.cvdisp.warning.is_empty() {
             ui.colored_label(ui.visuals().error_fg_color, &self.cvdisp.warning);
         }
-        ui.horizontal(|ui| {
-            let now = ui.input(|i| i.time);
-            let can_save = self.cvdisp.own.is_some() && !self.cvdisp.adding;
-            if can_save && ui.button("Save preset").clicked() {
-                self.cvdisp_save(now, false, close);
-            }
-            if ui.button("Save as new preset").clicked() {
-                self.cvdisp_save(now, true, close);
-            }
-            if ui.button("Cancel").clicked() {
-                *close = true;
-            }
-        });
     }
 
     /// Run one save flow: build + preserve + validate, then store, select

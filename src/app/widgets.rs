@@ -169,6 +169,17 @@ pub(crate) fn step_button(ui: &mut egui::Ui, up: bool, held: bool) -> egui::Resp
     resp
 }
 
+/// Hover tooltip that wraps instead of clipping: viewport-bound popups
+/// cut long single-line texts (e.g. in the narrow preset editor), so
+/// informational hovers go through this. Fixed max width, full text kept.
+pub(crate) fn hover_wrap(response: egui::Response, text: &str) -> egui::Response {
+    response.on_hover_ui(|ui| {
+        ui.set_max_width(260.0);
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        ui.label(text);
+    })
+}
+
 /// Panel frame with Python's drag-enter green (#2FA572) while hovered.
 pub(crate) fn panel_frame(ui: &egui::Ui, hovering: bool) -> egui::Frame {
     let mut frame = egui::Frame::group(ui.style());
