@@ -82,7 +82,7 @@ pub fn options_for(
     skip: Option<f64>,
     clip_dur: Option<f64>,
     vmaf_cfg: Option<(&str, Pooling)>,
-    cvvdp_display: Option<crate::metrics::ffvship::CvvdpDisplay>,
+    cvvdp_display: Option<&str>,
 ) -> String {
     let _ = kind;
     let mut parts = Vec::new();
@@ -97,7 +97,7 @@ pub fn options_for(
         parts.push(format!("Pool={}", pooling.as_filter_str()));
     }
     if let Some(display) = cvvdp_display {
-        parts.push(format!("Display={}", display.label()));
+        parts.push(format!("Display={display}"));
     }
     parts.join(", ")
 }

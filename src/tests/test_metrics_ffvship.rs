@@ -126,7 +126,7 @@ fn args_shape() {
         "ref.mp4",
         "dist.mp4",
         &["--start".to_owned(), "100".to_owned()],
-        CvvdpDisplay::default(),
+        None,
     );
     assert_eq!(
         a,
@@ -145,32 +145,74 @@ fn args_shape() {
 }
 
 #[test]
-fn display_model_flag_only_off_default() {
+fn display_flags_only_off_default() {
     use FfvshipKind::Cvvdp;
+    use std::path::Path;
     // Default display is the binary's own: omitted (argv parity).
-    let a = build_args(Cvvdp, "r.mp4", "d.mp4", &[], CvvdpDisplay::default());
+    let a = build_args(Cvvdp, "r.mp4", "d.mp4", &[], None);
     assert!(!a.iter().any(|s| s == "--displayModel"));
-    // Any other preset rides `--displayModel`.
-    let a = build_args(Cvvdp, "r.mp4", "d.mp4", &[], CvvdpDisplay::Standard4k);
-    assert_eq!(a[a.len() - 2..], ["--displayModel", "standard_4k"]);
-    // Non-CVVDP metrics never take the flag, even off-default.
+    assert!(!a.iter().any(|s| s == "--displayConfig"));
+    // Any other key rides `--displayConfig` + `--displayModel`.
+    let cfg = Path::new("C:/tmp/rfmetrics-cvvdp-1-standard_4k.json");
+    let a = build_args(Cvvdp, "r.mp4", "d.mp4", &[], Some(("standard_4k", cfg)));
+    assert_eq!(
+        &a[a.len() - 4..],
+        [
+            "--displayConfig",
+            "C:/tmp/rfmetrics-cvvdp-1-standard_4k.json",
+            "--displayModel",
+            "standard_4k"
+        ]
+    );
+    // Non-CVVDP metrics never take the flags, even off-default.
     let a = build_args(
         FfvshipKind::Ssimulacra2,
         "r.mp4",
         "d.mp4",
         &[],
-        CvvdpDisplay::Standard4k,
+        Some(("standard_4k", cfg)),
     );
     assert!(!a.iter().any(|s| s == "--displayModel"));
+    assert!(!a.iter().any(|s| s == "--displayConfig"));
 }
 
 #[test]
-fn display_labels_round_trip() {
-    for d in CvvdpDisplay::ALL {
-        assert_eq!(CvvdpDisplay::from_label(d.label()), Some(d));
+fn registry_holds_all_models_split_by_group() {
+    let reg = display_registry();
+    assert_eq!(reg.len(), 26);
+    assert_eq!(reg.iter().filter(|m| m.vmlab).count(), 8);
+    assert_eq!(reg.iter().filter(|m| !m.vmlab).count(), 18);
+    // Unique keys; friendly names never empty or key-identical.
+    let mut keys = std::collections::HashSet::new();
+    for m in reg {
+        assert!(keys.insert(m.key.clone()), "duplicate key {}", m.key);
+        assert!(!m.name.is_empty());
     }
-    assert_eq!(CvvdpDisplay::from_label("standard_phone"), None);
-    assert_eq!(CvvdpDisplay::default().label(), "standard_fhd");
+    // Required display fields on every entry (FFVship validation).
+    for f in [
+        "colorspace",
+        "contrast",
+        "diagonal_size_inches",
+        "E_ambient",
+        "max_luminance",
+        "resolution",
+        "viewing_distance_meters",
+    ] {
+        for m in reg {
+            assert!(m.display.contains_key(f), "{} misses {f}", m.key);
+        }
+    }
+    // Default + lookup.
+    assert_eq!(DEFAULT_DISPLAY_KEY, "standard_fhd");
+    assert_eq!(
+        display_named("standard_4k").map(|m| m.name.as_str()),
+        Some("30-inch 4K monitor, office")
+    );
+    assert_eq!(
+        display_named("iphone_14_pro").map(|m| m.name.as_str()),
+        Some("iPhone 14 Pro")
+    );
+    assert!(display_named("bogus_display_xyz").is_none());
 }
 
 #[test]

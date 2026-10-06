@@ -1,0 +1,496 @@
+{
+  "_meta": {
+    "source": "https://github.com/gfxdisp/ColorVideoVDP/blob/main/pycvvdp/vvdp_data/display_models.json",
+    "note": "Normalized for FFVship --displayConfig (single-object values keyed by model key). Every entry verified live against FFVship 5.1.1 on 60 frames of a 1600x1080p60 transcode pair: embedded twins reproduce exactly, the rest strict-parse with stable JODs.",
+    "normalization": [
+      "viewing_distance_inches * 0.0254 -> viewing_distance_meters",
+      "contrast = max_luminance / min_luminance where upstream gives min_luminance",
+      "colorspace injected (upstream omits it on SDR entries): SDR unless HDR content needs BT.2020-PQ / BT.2020-HLG / BT.709-linear",
+      "k_refl 0.005 + exposure 1.0 defaults where upstream omits them (official-tool defaults; exact-score reproductions confirm)"
+    ]
+  },
+  "models": [
+    {
+      "key": "standard_fhd",
+      "name": "24-inch 1080p monitor, office",
+      "group": "vmlab",
+      "display": {
+        "name": "24-inch 1080p monitor, office",
+        "colorspace": "SDR",
+        "resolution": [1920, 1080],
+        "viewing_distance_meters": 0.6,
+        "diagonal_size_inches": 24,
+        "max_luminance": 200,
+        "contrast": 1000,
+        "E_ambient": 250,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "standard_4k",
+      "name": "30-inch 4K monitor, office",
+      "group": "vmlab",
+      "display": {
+        "name": "30-inch 4K monitor, office",
+        "colorspace": "SDR",
+        "resolution": [3840, 2160],
+        "viewing_distance_meters": 0.7472,
+        "diagonal_size_inches": 30,
+        "max_luminance": 200,
+        "contrast": 1000,
+        "E_ambient": 250,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "standard_hdr_pq",
+      "name": "30-inch 4K HDR monitor, dim room",
+      "group": "vmlab",
+      "display": {
+        "name": "30-inch 4K HDR monitor, dim room",
+        "colorspace": "BT.2020-PQ",
+        "resolution": [3840, 2160],
+        "viewing_distance_meters": 0.7472,
+        "diagonal_size_inches": 30,
+        "max_luminance": 1500,
+        "contrast": 1000000,
+        "E_ambient": 10,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "standard_hdr_dark",
+      "name": "30-inch 4K HDR monitor, dark room",
+      "group": "vmlab",
+      "note": "Scores byte-identical to upstream standard_hdr_linear_dark; upstream renamed it, Vship kept this name.",
+      "display": {
+        "name": "30-inch 4K HDR monitor, dark room",
+        "colorspace": "BT.2020-PQ",
+        "resolution": [3840, 2160],
+        "viewing_distance_meters": 0.7472,
+        "diagonal_size_inches": 30,
+        "max_luminance": 1500,
+        "contrast": 1000000,
+        "E_ambient": 0,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "65inch_hdr_pq_1Knit",
+      "name": "65-inch 4K HDR TV, 1000 nits, living room",
+      "group": "vmlab",
+      "display": {
+        "name": "65-inch 4K HDR TV, 1000 nits, living room",
+        "colorspace": "BT.2020-PQ",
+        "resolution": [3840, 2160],
+        "viewing_distance_meters": 1.98,
+        "diagonal_size_inches": 65,
+        "max_luminance": 1000,
+        "contrast": 1000000,
+        "E_ambient": 5,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "65inch_hdr_pq_2Knit",
+      "name": "65-inch 4K HDR TV, 2000 nits, living room",
+      "group": "vmlab",
+      "display": {
+        "name": "65-inch 4K HDR TV, 2000 nits, living room",
+        "colorspace": "BT.2020-PQ",
+        "resolution": [3840, 2160],
+        "viewing_distance_meters": 1.98,
+        "diagonal_size_inches": 65,
+        "max_luminance": 2000,
+        "contrast": 1000000,
+        "E_ambient": 5,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "65inch_hdr_pq_4knit",
+      "name": "65-inch 4K HDR TV, 4000 nits, living room",
+      "group": "vmlab",
+      "display": {
+        "name": "65-inch 4K HDR TV, 4000 nits, living room",
+        "colorspace": "BT.2020-PQ",
+        "resolution": [3840, 2160],
+        "viewing_distance_meters": 1.98,
+        "diagonal_size_inches": 65,
+        "max_luminance": 4000,
+        "contrast": 1000000,
+        "E_ambient": 5,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "standard_phone",
+      "name": "6-inch phone",
+      "group": "vmlab",
+      "note": "Rejected as --displayModel by FFVship 5.1.1 (GPU worker init failure); scores fine via --displayConfig.",
+      "display": {
+        "name": "6-inch phone",
+        "colorspace": "SDR",
+        "resolution": [2400, 1080],
+        "viewing_distance_meters": 0.4,
+        "diagonal_size_inches": 6,
+        "max_luminance": 500,
+        "contrast": 1000,
+        "E_ambient": 250,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "standard_hdr_linear",
+      "name": "30-inch 4K HDR monitor, linear, dim room",
+      "group": "extended",
+      "note": "Embedded in FFVship 5.1.1 (absent from its docs); JSON reproduces the flag score exactly.",
+      "display": {
+        "name": "30-inch 4K HDR monitor, linear, dim room",
+        "colorspace": "BT.709-linear",
+        "resolution": [3840, 2160],
+        "viewing_distance_meters": 0.7472,
+        "diagonal_size_inches": 30,
+        "max_luminance": 1500,
+        "contrast": 1000000,
+        "E_ambient": 10,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "standard_hdr_linear_dark",
+      "name": "30-inch 4K HDR monitor, linear, dark room",
+      "group": "extended",
+      "display": {
+        "name": "30-inch 4K HDR monitor, linear, dark room",
+        "colorspace": "BT.709-linear",
+        "resolution": [3840, 2160],
+        "viewing_distance_meters": 0.7472,
+        "diagonal_size_inches": 30,
+        "max_luminance": 1500,
+        "contrast": 1000000,
+        "E_ambient": 0,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "standard_hdr_linear_zoom",
+      "name": "30-inch 4K HDR monitor, close range",
+      "group": "extended",
+      "note": "Upstream name says 4000 nits but max_luminance is 10000; 0.25 m viewing distance for spotting super-resolution artifacts.",
+      "display": {
+        "name": "30-inch 4K HDR monitor, close range",
+        "colorspace": "BT.709-linear",
+        "resolution": [3840, 2160],
+        "viewing_distance_meters": 0.25,
+        "diagonal_size_inches": 30,
+        "max_luminance": 10000,
+        "contrast": 1000000,
+        "E_ambient": 10,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "sdr_4k_30",
+      "name": "30-inch 4K monitor, office (100 nits)",
+      "group": "extended",
+      "display": {
+        "name": "30-inch 4K monitor, office (100 nits)",
+        "colorspace": "SDR",
+        "resolution": [3840, 2160],
+        "viewing_distance_meters": 0.6,
+        "diagonal_size_inches": 30,
+        "max_luminance": 100,
+        "contrast": 1000,
+        "E_ambient": 250,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "sdr_fhd_24",
+      "name": "24-inch 1080p monitor, office (100 nits)",
+      "group": "extended",
+      "display": {
+        "name": "24-inch 1080p monitor, office (100 nits)",
+        "colorspace": "SDR",
+        "resolution": [1920, 1080],
+        "viewing_distance_meters": 0.6,
+        "diagonal_size_inches": 24,
+        "max_luminance": 100,
+        "contrast": 1000,
+        "E_ambient": 250,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "standard_hmd",
+      "name": "VR headset, generic (110°)",
+      "group": "extended",
+      "note": "Upstream gives FOV instead of a diagonal; diagonal derived as same-subtended-size screen (2*3m*tan(55°) = 337.36 in).",
+      "display": {
+        "name": "VR headset, generic (110°)",
+        "colorspace": "SDR",
+        "resolution": [1440, 1600],
+        "viewing_distance_meters": 3.0,
+        "diagonal_size_inches": 337.36,
+        "max_luminance": 100,
+        "contrast": 1000,
+        "E_ambient": 0,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "htc_vive_pro",
+      "name": "HTC Vive Pro",
+      "group": "extended",
+      "note": "Diagonal derived like standard_hmd; contrast = 133.3/0.1.",
+      "display": {
+        "name": "HTC Vive Pro",
+        "colorspace": "SDR",
+        "resolution": [1440, 1600],
+        "viewing_distance_meters": 3.0,
+        "diagonal_size_inches": 337.36,
+        "max_luminance": 133.3,
+        "contrast": 1333,
+        "E_ambient": 0,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "iphone_12_pro",
+      "name": "iPhone 12 Pro",
+      "group": "extended",
+      "note": "Distance 20 in -> m; contrast = 825/0.0004.",
+      "display": {
+        "name": "iPhone 12 Pro",
+        "colorspace": "SDR",
+        "resolution": [2532, 1170],
+        "viewing_distance_meters": 0.508,
+        "diagonal_size_inches": 6.1,
+        "max_luminance": 825,
+        "contrast": 2062500,
+        "E_ambient": 250,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "iphone_14_pro",
+      "name": "iPhone 14 Pro",
+      "group": "extended",
+      "note": "Contrast = 1025/0.0004.",
+      "display": {
+        "name": "iPhone 14 Pro",
+        "colorspace": "SDR",
+        "resolution": [2532, 1170],
+        "viewing_distance_meters": 0.508,
+        "diagonal_size_inches": 6.1,
+        "max_luminance": 1025,
+        "contrast": 2562500,
+        "E_ambient": 250,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "iphone_14_pro_vert",
+      "name": "iPhone 14 Pro (vertical)",
+      "group": "extended",
+      "display": {
+        "name": "iPhone 14 Pro (vertical)",
+        "colorspace": "SDR",
+        "resolution": [1170, 2532],
+        "viewing_distance_meters": 0.508,
+        "diagonal_size_inches": 6.1,
+        "max_luminance": 1025,
+        "contrast": 2562500,
+        "E_ambient": 250,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "iphone_14_pro_hdr",
+      "name": "iPhone 14 Pro HDR",
+      "group": "extended",
+      "note": "Upstream name says 'iPhone 15 Pro HDR'; key says 14, kept key-consistent.",
+      "display": {
+        "name": "iPhone 14 Pro HDR",
+        "colorspace": "BT.2020-HLG",
+        "resolution": [2532, 1170],
+        "viewing_distance_meters": 0.508,
+        "diagonal_size_inches": 6.1,
+        "max_luminance": 1590,
+        "contrast": 3975000,
+        "E_ambient": 10,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "iphone_14_pro_hdr_vert",
+      "name": "iPhone 14 Pro HDR (vertical)",
+      "group": "extended",
+      "display": {
+        "name": "iPhone 14 Pro HDR (vertical)",
+        "colorspace": "BT.2020-HLG",
+        "resolution": [1170, 2532],
+        "viewing_distance_meters": 0.508,
+        "diagonal_size_inches": 6.1,
+        "max_luminance": 1590,
+        "contrast": 3975000,
+        "E_ambient": 10,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "ipad_pro_12_9",
+      "name": "iPad Pro 12.9\"",
+      "group": "extended",
+      "note": "Contrast = 600/0.37.",
+      "display": {
+        "name": "iPad Pro 12.9\"",
+        "colorspace": "SDR",
+        "resolution": [2732, 2048],
+        "viewing_distance_meters": 0.508,
+        "diagonal_size_inches": 12.9,
+        "max_luminance": 600,
+        "contrast": 1621.6216,
+        "E_ambient": 250,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "macbook_pro_16",
+      "name": "MacBook Pro 16\"",
+      "group": "extended",
+      "note": "Distance 25 in -> m; contrast = 500/0.37.",
+      "display": {
+        "name": "MacBook Pro 16\"",
+        "colorspace": "SDR",
+        "resolution": [3072, 1920],
+        "viewing_distance_meters": 0.635,
+        "diagonal_size_inches": 16,
+        "max_luminance": 500,
+        "contrast": 1351.3514,
+        "E_ambient": 250,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "lg_oled_2017_sdr",
+      "name": "LG OLED TV (2017), SDR",
+      "group": "extended",
+      "note": "Distance 101 in -> m; contrast = 272/0.014.",
+      "display": {
+        "name": "LG OLED TV (2017), SDR",
+        "colorspace": "SDR",
+        "resolution": [3840, 2160],
+        "viewing_distance_meters": 2.5654,
+        "diagonal_size_inches": 64.5,
+        "max_luminance": 272,
+        "contrast": 19428.5714,
+        "E_ambient": 100,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "lg_oled_2017_hdr",
+      "name": "LG OLED TV (2017), HDR",
+      "group": "extended",
+      "note": "Upstream omits colorspace; assumed BT.2020-PQ. Contrast = 754/0.038.",
+      "display": {
+        "name": "LG OLED TV (2017), HDR",
+        "colorspace": "BT.2020-PQ",
+        "resolution": [3840, 2160],
+        "viewing_distance_meters": 2.5654,
+        "diagonal_size_inches": 64.5,
+        "max_luminance": 754,
+        "contrast": 19842.1053,
+        "E_ambient": 100,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "eizo_CG3146",
+      "name": "EIZO Prominence CG3146",
+      "group": "extended",
+      "display": {
+        "name": "EIZO Prominence CG3146",
+        "colorspace": "SDR",
+        "resolution": [4096, 2160],
+        "viewing_distance_meters": 0.73406,
+        "diagonal_size_inches": 31.063,
+        "max_luminance": 300,
+        "contrast": 3000,
+        "E_ambient": 0,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    },
+    {
+      "key": "lg_oled_2026_hdr_pq",
+      "name": "LG OLED G6 TV (2026), HDR",
+      "group": "extended",
+      "note": "Distance 86.62 in -> m; contrast = 3000/0.0005.",
+      "display": {
+        "name": "LG OLED G6 TV (2026), HDR",
+        "colorspace": "BT.2020-PQ",
+        "resolution": [3840, 2160],
+        "viewing_distance_meters": 2.2001,
+        "diagonal_size_inches": 64.9,
+        "max_luminance": 3000,
+        "contrast": 6000000,
+        "E_ambient": 5,
+        "k_refl": 0.005,
+        "exposure": 1.0,
+        "source": "rfmetrics"
+      }
+    }
+  ]
+}

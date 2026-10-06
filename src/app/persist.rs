@@ -41,7 +41,8 @@ impl crate::app::config::Config {
                 threads: Some(self.vmaf.threads.clone()),
             },
             cvvdp: crate::state::CvvdpState {
-                display: Some(self.cvvdp.display.label().to_owned()),
+                display: Some(self.cvvdp.display.clone()),
+                show_all: Some(self.cvvdp.show_all),
             },
             options: crate::state::OptionsState {
                 scaling: Some(self.view.scale_method.label().to_owned()),
@@ -180,9 +181,12 @@ impl crate::app::RFMetricsApp {
             self.config.vmaf.threads = threads;
         }
         if let Some(display) = s.cvvdp.display
-            && let Some(m) = crate::metrics::ffvship::CvvdpDisplay::from_label(&display)
+            && crate::metrics::ffvship::display_named(&display).is_some()
         {
-            self.config.cvvdp.display = m;
+            self.config.cvvdp.display = display;
+        }
+        if let Some(show_all) = s.cvvdp.show_all {
+            self.config.cvvdp.show_all = show_all;
         }
         if let Some(scaling) = s.options.scaling
             && let Some(m) = ScaleMethod::from_label(&scaling)
@@ -290,7 +294,9 @@ impl crate::app::RFMetricsApp {
         {
             return true;
         }
-        if s.cvvdp.display.as_deref() != Some(self.config.cvvdp.display.label()) {
+        if s.cvvdp.display.as_deref() != Some(self.config.cvvdp.display.as_str())
+            || s.cvvdp.show_all != Some(self.config.cvvdp.show_all)
+        {
             return true;
         }
         let o = &s.options;
@@ -429,9 +435,8 @@ impl crate::app::RFMetricsApp {
                                 .flatten()
                                 .map(|c| (c.model.as_str(), c.pooling));
                             let display = (kind == MetricKind::Cvvdp)
-                                .then_some(cvvdp_display.as_ref())
-                                .flatten()
-                                .copied();
+                                .then_some(cvvdp_display.as_deref())
+                                .flatten();
                             Block {
                                 avg: Some(*avg),
                                 stats: cached.stats.as_ref(),

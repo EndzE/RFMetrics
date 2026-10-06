@@ -203,10 +203,10 @@ pub(crate) enum MetricMsg {
         /// column (FFVship has no `format=` stage and ignores it at
         /// compare time).
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt,
-        /// CVVDP display model the run used (`Some` for CVVDP jobs
+        /// CVVDP display-model key the run used (`Some` for CVVDP jobs
         /// only); stamped onto the `Done` cell so a display change
         /// recomputes just the CVVDP column.
-        cvvdp_display: Option<crate::metrics::ffvship::CvvdpDisplay>,
+        cvvdp_display: Option<String>,
     },
     /// End of the worker loop; `aborted` settles still-Running cells to
     /// Idle while keeping finished (`Done`) results on screen.
@@ -965,7 +965,7 @@ impl crate::app::RFMetricsApp {
         // CVVDP display likewise (frozen: a mid-run combo change must not
         // half-apply).
         let vmaf_cfg = self.config.vmaf.current_vmaf_cfg();
-        let cvvdp_display = self.config.cvvdp.display;
+        let cvvdp_display = self.config.cvvdp.display.clone();
         // Per metric: rows already holding a valid value sit the rerun out —
         // but only when the trim settings still match: a value computed
         // under a different skip/clip is stale and must recompute. VMAF
@@ -992,7 +992,7 @@ impl crate::app::RFMetricsApp {
                     scaler,
                     fps_mode,
                     ref_pixfmt,
-                    cvvdp_display,
+                    &cvvdp_display,
                 ) && matches!(
                     self.queue.rows[i].cell(kind),
                     crate::metrics::MetricCell::Done { .. }
@@ -1206,7 +1206,7 @@ impl crate::app::RFMetricsApp {
                     crate::metrics::ffvship::run_ffvship(
                         &job,
                         fkind,
-                        cvvdp_display,
+                        &cvvdp_display,
                         &progress,
                         &series,
                     )
@@ -1246,7 +1246,7 @@ impl crate::app::RFMetricsApp {
                         None
                     },
                     cvvdp_display: if kind == MetricKind::Cvvdp {
-                        Some(cvvdp_display)
+                        Some(cvvdp_display.clone())
                     } else {
                         None
                     },

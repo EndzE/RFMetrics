@@ -1009,7 +1009,7 @@ fn done_stale_marking_matches_recompute_rules() {
         sc,
         fm,
         pf,
-        crate::metrics::ffvship::CvvdpDisplay::default()
+        "standard_fhd"
     ));
     // Non-Done cells are never stale.
     assert!(!done_is_stale(
@@ -1021,7 +1021,7 @@ fn done_stale_marking_matches_recompute_rules() {
         sc,
         fm,
         pf,
-        crate::metrics::ffvship::CvvdpDisplay::default()
+        "standard_fhd"
     ));
     assert!(!done_is_stale(
         MetricKind::Psnr,
@@ -1034,7 +1034,7 @@ fn done_stale_marking_matches_recompute_rules() {
         sc,
         fm,
         pf,
-        crate::metrics::ffvship::CvvdpDisplay::default()
+        "standard_fhd"
     ));
     // Trim change stales every kind, including FFVship ones.
     assert!(done_is_stale(
@@ -1046,7 +1046,7 @@ fn done_stale_marking_matches_recompute_rules() {
         sc,
         fm,
         pf,
-        crate::metrics::ffvship::CvvdpDisplay::default()
+        "standard_fhd"
     ));
     assert!(done_is_stale(
         MetricKind::Ssim2,
@@ -1057,7 +1057,7 @@ fn done_stale_marking_matches_recompute_rules() {
         sc,
         fm,
         pf,
-        crate::metrics::ffvship::CvvdpDisplay::default()
+        "standard_fhd"
     ));
     // VMAF options change stales VMAF alone.
     let mut vmaf_app = RFMetricsApp::default();
@@ -1073,7 +1073,7 @@ fn done_stale_marking_matches_recompute_rules() {
         sc,
         fm,
         pf,
-        crate::metrics::ffvship::CvvdpDisplay::default()
+        "standard_fhd"
     ));
     assert!(!done_is_stale(
         MetricKind::Psnr,
@@ -1084,7 +1084,7 @@ fn done_stale_marking_matches_recompute_rules() {
         sc,
         fm,
         pf,
-        crate::metrics::ffvship::CvvdpDisplay::default()
+        "standard_fhd"
     ));
     // Scaler / fps-mode changes stale ffmpeg-backed columns only.
     let other_scaler = if sc == ScaleMethod::Bicubic {
@@ -1101,7 +1101,7 @@ fn done_stale_marking_matches_recompute_rules() {
         other_scaler,
         fm,
         pf,
-        crate::metrics::ffvship::CvvdpDisplay::default()
+        "standard_fhd"
     ));
     assert!(!done_is_stale(
         MetricKind::Ssim2,
@@ -1112,7 +1112,7 @@ fn done_stale_marking_matches_recompute_rules() {
         other_scaler,
         fm,
         pf,
-        crate::metrics::ffvship::CvvdpDisplay::default()
+        "standard_fhd"
     ));
     let other_fps = if fm == InputFpsMode::Reference {
         InputFpsMode::Off
@@ -1128,7 +1128,7 @@ fn done_stale_marking_matches_recompute_rules() {
         sc,
         other_fps,
         pf,
-        crate::metrics::ffvship::CvvdpDisplay::default()
+        "standard_fhd"
     ));
     assert!(!done_is_stale(
         MetricKind::Butter,
@@ -1139,7 +1139,7 @@ fn done_stale_marking_matches_recompute_rules() {
         sc,
         other_fps,
         pf,
-        crate::metrics::ffvship::CvvdpDisplay::default()
+        "standard_fhd"
     ));
 }
 
@@ -2739,31 +2739,35 @@ fn state_apply_validates_vmaf_options() {
     assert!(app.config.vmaf.phone);
 }
 
-/// State apply validates the CVVDP display preset: known labels restore,
-/// unknown ones keep the live value instead of poisoning the run.
+/// State apply validates the CVVDP display preset: known keys restore
+/// (with the More-models flag), unknown ones keep the live value.
 #[test]
 fn state_apply_validates_cvvdp_display() {
-    use crate::metrics::ffvship::CvvdpDisplay;
     let mut app = RFMetricsApp::default();
     let state = crate::state::AppState {
         cvvdp: crate::state::CvvdpState {
             display: Some("standard_4k".to_owned()),
+            show_all: Some(true),
         },
         ..Default::default()
     };
     app.apply_state(Some(state));
-    assert_eq!(app.config.cvvdp.display, CvvdpDisplay::Standard4k);
-    // Not a model this FFVship knows: keep the live value.
+    assert_eq!(app.config.cvvdp.display, "standard_4k");
+    assert!(app.config.cvvdp.show_all);
+    // Not a registry key: keep the live value.
     let state = crate::state::AppState {
         cvvdp: crate::state::CvvdpState {
-            display: Some("standard_phone".to_owned()),
+            display: Some("bogus_display_xyz".to_owned()),
+            show_all: None,
         },
         ..Default::default()
     };
     app.apply_state(Some(state));
-    assert_eq!(app.config.cvvdp.display, CvvdpDisplay::Standard4k);
-    // Snapshot round-trips the label verbatim.
-    assert_eq!(app.snapshot().cvvdp.display.as_deref(), Some("standard_4k"));
+    assert_eq!(app.config.cvvdp.display, "standard_4k");
+    // Snapshot round-trips both verbatim.
+    let snap = app.snapshot();
+    assert_eq!(snap.cvvdp.display.as_deref(), Some("standard_4k"));
+    assert_eq!(snap.cvvdp.show_all, Some(true));
 }
 
 /// CVVDP display change stales the CVVDP column alone; other columns
@@ -2772,7 +2776,6 @@ fn state_apply_validates_cvvdp_display() {
 fn cvvdp_display_change_stales_cvvdp_alone() {
     use crate::metrics::MetricCell;
     use crate::metrics::ffmpeg::{MetricKind, RefPixFmt};
-    use crate::metrics::ffvship::CvvdpDisplay;
     let app = RFMetricsApp::default();
     let vmaf_cfg = app.config.vmaf.current_vmaf_cfg();
     let cell = MetricCell::Done {
@@ -2785,7 +2788,7 @@ fn cvvdp_display_change_stales_cvvdp_alone() {
         scaler: ScaleMethod::Bicubic,
         fps_mode: InputFpsMode::Reference,
         ref_pixfmt: RefPixFmt::NoConversion,
-        cvvdp_display: Some(CvvdpDisplay::StandardFhd),
+        cvvdp_display: Some("standard_fhd".to_owned()),
     };
     let stale = |kind, display| {
         crate::app::queue::done_is_stale(
@@ -2800,10 +2803,10 @@ fn cvvdp_display_change_stales_cvvdp_alone() {
             display,
         )
     };
-    assert!(!stale(MetricKind::Cvvdp, CvvdpDisplay::StandardFhd));
-    assert!(stale(MetricKind::Cvvdp, CvvdpDisplay::Standard4k));
-    assert!(!stale(MetricKind::Butter, CvvdpDisplay::Standard4k));
-    assert!(!stale(MetricKind::Vmaf, CvvdpDisplay::Standard4k));
+    assert!(!stale(MetricKind::Cvvdp, "standard_fhd"));
+    assert!(stale(MetricKind::Cvvdp, "standard_4k"));
+    assert!(!stale(MetricKind::Butter, "standard_4k"));
+    assert!(!stale(MetricKind::Vmaf, "standard_4k"));
 }
 
 /// Issue #7: restored ticks for filters this ffmpeg build lacks are

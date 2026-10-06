@@ -59,49 +59,153 @@ impl FfvshipKind {
     }
 }
 
-/// CVVDP display model (`--displayModel`): the screen CVVDP predicts
-/// visibility on. Built-in presets verbatim from the FFVship docs
-/// (`display_models.hpp` list); user-saved models (`--displayConfig`)
-/// are out of scope. The default is the binary's own default, so it is
-/// omitted from argv (byte-identical runs to before).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CvvdpDisplay {
-    #[default]
-    StandardFhd,
-    Standard4k,
-    StandardHdrPq,
-    StandardHdrHlg,
-    StandardHdrDark,
-    StandardHdrLinearZoom,
+/// CVVDP display-model registry (`cvvdp-displays.json`, normalized from
+/// upstream `display_models.json`; every entry verified live against
+/// FFVship 5.1.1). File-driven, not an enum: 26 entries would duplicate
+/// the file key-for-key. The default is the binary's own default, so it
+/// is omitted from argv (byte-identical runs to before).
+#[derive(Debug, Clone)]
+pub struct DisplayModel {
+    /// `--displayModel` value and state-file key.
+    pub key: String,
+    /// Combo text (VideoMetricsLab's short names for its 8, same style
+    /// for the rest).
+    pub name: String,
+    /// In the VideoMetricsLab friendly list (the "More models" checkbox
+    /// gates the rest).
+    pub vmlab: bool,
+    /// Normalized display object, written verbatim into the per-run
+    /// `--displayConfig` file.
+    pub display: serde_json::Map<String, serde_json::Value>,
 }
 
-impl CvvdpDisplay {
-    /// Combo order: the default first, then SDR, then HDR.
-    pub const ALL: [CvvdpDisplay; 6] = [
-        CvvdpDisplay::StandardFhd,
-        CvvdpDisplay::Standard4k,
-        CvvdpDisplay::StandardHdrPq,
-        CvvdpDisplay::StandardHdrHlg,
-        CvvdpDisplay::StandardHdrDark,
-        CvvdpDisplay::StandardHdrLinearZoom,
-    ];
+/// The default display: the binary's own when no flags are passed.
+pub const DEFAULT_DISPLAY_KEY: &str = "standard_fhd";
 
-    /// `--displayModel` value and combo text (one and the same: the
-    /// official model keys, verified live against FFVship 5.1.1).
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::StandardFhd => "standard_fhd",
-            Self::Standard4k => "standard_4k",
-            Self::StandardHdrPq => "standard_hdr_pq",
-            Self::StandardHdrHlg => "standard_hdr_hlg",
-            Self::StandardHdrDark => "standard_hdr_dark",
-            Self::StandardHdrLinearZoom => "standard_hdr_linear_zoom",
+/// Display fields FFVship requires (`Display Missing …` errors); entries
+/// lacking any are skipped at load so one bad entry can't poison the file.
+const REQUIRED_DISPLAY_FIELDS: &[&str] = &[
+    "colorspace",
+    "contrast",
+    "diagonal_size_inches",
+    "E_ambient",
+    "max_luminance",
+    "resolution",
+    "viewing_distance_meters",
+];
+
+fn load_registry() -> Vec<DisplayModel> {
+    let raw: serde_json::Value = serde_json::from_str(include_str!("cvvdp-displays.json"))
+        .unwrap_or(serde_json::Value::Null);
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for entry in raw
+        .get("models")
+        .and_then(|m| m.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    {
+        let Some(key) = entry.get("key").and_then(|k| k.as_str()) else {
+            log::warn!(target: "rfmetrics::metric", "skipping CVVDP display entry without a key");
+            continue;
+        };
+        let Some(name) = entry.get("name").and_then(|n| n.as_str()) else {
+            log::warn!(target: "rfmetrics::metric", "skipping CVVDP display {key:?} without a name");
+            continue;
+        };
+        let group = entry
+            .get("group")
+            .and_then(|g| g.as_str())
+            .unwrap_or("extended");
+        let Some(display) = entry.get("display").and_then(|d| d.as_object()) else {
+            log::warn!(target: "rfmetrics::metric", "skipping CVVDP display {key:?} without a display object");
+            continue;
+        };
+        if !seen.insert(key.to_owned())
+            || REQUIRED_DISPLAY_FIELDS
+                .iter()
+                .any(|f| display.get(*f).is_none())
+        {
+            log::warn!(target: "rfmetrics::metric", "skipping CVVDP display {key:?}: duplicate or incomplete");
+            continue;
         }
+        out.push(DisplayModel {
+            key: key.to_owned(),
+            name: name.to_owned(),
+            vmlab: group == "vmlab",
+            display: display.clone(),
+        });
+    }
+    out
+}
+
+/// Parsed-once display registry (the file is embedded, so this only ever
+/// fails closed: empty list, everything falls back to the binary default).
+pub fn display_registry() -> &'static [DisplayModel] {
+    static REGISTRY: std::sync::OnceLock<Vec<DisplayModel>> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(load_registry)
+}
+
+/// Registry lookup by `--displayModel` key (also the state-file value).
+pub fn display_named(key: &str) -> Option<&'static DisplayModel> {
+    display_registry().iter().find(|m| m.key == key)
+}
+
+/// Per-run `--displayConfig` file (`{key: display}` — the shape FFVship
+/// parses; a bare object crashes its parser). Unique per call so
+/// concurrent runs never share; the caller deletes it (see
+/// [`DisplayConfigGuard`]).
+fn write_display_config(model: &DisplayModel) -> std::io::Result<std::path::PathBuf> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!(
+        "rfmetrics-cvvdp-{}-{n}-{}.json",
+        std::process::id(),
+        model.key
+    ));
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        model.key.clone(),
+        serde_json::Value::Object(model.display.clone()),
+    );
+    std::fs::write(&path, serde_json::to_string(&obj).unwrap_or_default())?;
+    Ok(path)
+}
+
+/// Owns a per-run `--displayConfig` file; deleted on drop so aborts and
+/// early returns can't leak it (hard-kill residue is KBs in tempdir).
+pub struct DisplayConfig {
+    key: String,
+    path: std::path::PathBuf,
+}
+
+impl DisplayConfig {
+    /// `Ok(None)` = default display: no file, no flags (binary default).
+    /// Unknown keys also fall back to the default (logged): a run must
+    /// never fail on a display lookup.
+    pub fn new(key: &str) -> std::io::Result<Option<Self>> {
+        if key == DEFAULT_DISPLAY_KEY {
+            return Ok(None);
+        }
+        let Some(model) = display_named(key) else {
+            log::warn!(target: "rfmetrics::metric", "unknown CVVDP display {key:?}, using binary default");
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            key: model.key.clone(),
+            path: write_display_config(model)?,
+        }))
     }
 
-    /// State-file validation (unknown labels keep the live default).
-    pub fn from_label(s: &str) -> Option<CvvdpDisplay> {
-        Self::ALL.into_iter().find(|m| m.label() == s)
+    /// `(key, path)` argv pair.
+    pub fn argv(&self) -> (&str, &std::path::Path) {
+        (&self.key, &self.path)
+    }
+}
+
+impl Drop for DisplayConfig {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -218,14 +322,15 @@ fn pooled_avg(values: &[f64], kind: FfvshipKind) -> Option<f64> {
 }
 
 /// Full FFVship argv (minus the exe) for one metric run. `display` only
-/// affects CVVDP, and only off-default: the default is the binary's own,
-/// so omitting it keeps default runs byte-identical to before.
+/// affects CVVDP: `Some((key, config path))` appends `--displayConfig`
+/// and `--displayModel`; `None` (the default display) omits both, keeping
+/// default runs byte-identical to before.
 pub fn build_args(
     kind: FfvshipKind,
     ref_path: &str,
     dist_path: &str,
     window: &[String],
-    display: CvvdpDisplay,
+    display: Option<(&str, &std::path::Path)>,
 ) -> Vec<String> {
     let mut args = vec![
         "-s".to_owned(),
@@ -237,9 +342,13 @@ pub fn build_args(
         "--live-score-output".to_owned(),
     ];
     args.extend(window.iter().cloned());
-    if kind == FfvshipKind::Cvvdp && display != CvvdpDisplay::default() {
+    if kind == FfvshipKind::Cvvdp
+        && let Some((key, path)) = display
+    {
+        args.push("--displayConfig".to_owned());
+        args.push(path.display().to_string());
         args.push("--displayModel".to_owned());
-        args.push(display.label().to_owned());
+        args.push(key.to_owned());
     }
     args
 }
@@ -250,7 +359,7 @@ pub fn build_args(
 pub fn run_ffvship(
     job: &RunInputs,
     kind: FfvshipKind,
-    display: CvvdpDisplay,
+    display_key: &str,
     on_progress: &(dyn Fn(u64) + Sync),
     on_series: &(dyn Fn(&[f64]) + Sync),
 ) -> RunOutcome {
@@ -276,7 +385,18 @@ pub fn run_ffvship(
             return fail(e);
         }
     };
-    let args = build_args(kind, ref_path, dist_path, &window, display);
+    // Per-run display file (guard deletes it on every exit path,
+    // including abort). Temp-dir write failure fails the run loudly
+    // instead of silently scoring the wrong display.
+    let display_cfg = match DisplayConfig::new(display_key) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            log::warn!(target: "rfmetrics::metric", "{name} display file: {e}");
+            return fail(format!("display file: {e}"));
+        }
+    };
+    let display_argv = display_cfg.as_ref().map(|c| c.argv());
+    let args = build_args(kind, ref_path, dist_path, &window, display_argv);
     // `info`: the exact repro command is the core artifact of an issue
     // report (FFMetrics.log parity) — one line per metric job.
     log::info!(target: "rfmetrics::metric", "run: \"{}\" {}", exe.display(), args.join(" "));

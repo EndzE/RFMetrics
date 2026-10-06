@@ -93,6 +93,7 @@ pub struct VmafState {
 #[serde(default)]
 pub struct CvvdpState {
     pub display: Option<String>,
+    pub show_all: Option<bool>,
 }
 
 /// Global options; `None` = key absent, keep the live default.

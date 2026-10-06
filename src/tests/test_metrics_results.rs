@@ -143,7 +143,6 @@ fn value_rounds_noise_keeps_summaries() {
 
 #[test]
 fn options_shapes() {
-    use crate::metrics::ffvship::CvvdpDisplay;
     assert_eq!(
         options_for(MetricKind::Psnr, None, Some(5.0), None, None),
         "Duration=5"
@@ -164,13 +163,7 @@ fn options_shapes() {
         "Duration=5, Model=vmaf_v0.6.1.json, Pool=mean"
     );
     assert_eq!(
-        options_for(
-            MetricKind::Cvvdp,
-            None,
-            None,
-            None,
-            Some(CvvdpDisplay::Standard4k)
-        ),
+        options_for(MetricKind::Cvvdp, None, None, None, Some("standard_4k")),
         "Display=standard_4k"
     );
     assert_eq!(trim_num(5.0), "5");

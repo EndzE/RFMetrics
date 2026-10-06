@@ -46,10 +46,14 @@ pub(crate) struct VmafOpts {
 
 /// CVVDP options (Options panel, own box after VMAF options).
 pub(crate) struct CvvdpOpts {
-    /// Display model CVVDP scores for (`--displayModel`, default the
-    /// binary's own `standard_fhd`). Run input: locked mid-run,
-    /// stamped onto CVVDP `Done` cells like `vmaf_cfg` is for VMAF.
-    pub(crate) display: crate::metrics::ffvship::CvvdpDisplay,
+    /// Display-model key CVVDP scores for (`--displayModel`, default the
+    /// binary's own `standard_fhd`; validated against the registry).
+    /// Run input: locked mid-run, stamped onto CVVDP `Done` cells like
+    /// `vmaf_cfg` is for VMAF.
+    pub(crate) display: String,
+    /// "More models" checkbox: the combo lists the VideoMetricsLab 8 by
+    /// default, all registry entries when set.
+    pub(crate) show_all: bool,
 }
 
 /// Display/run-shape options (Options panel).

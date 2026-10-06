@@ -28,6 +28,7 @@ fn round_trip() {
         },
         cvvdp: CvvdpState {
             display: Some("standard_4k".to_owned()),
+            show_all: Some(true),
         },
         options: OptionsState {
             scaling: Some("Bicubic".to_owned()),

@@ -476,7 +476,7 @@ pub(crate) fn done_is_stale(
     scaler: ScaleMethod,
     fps_mode: crate::metrics::ffmpeg::InputFpsMode,
     ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt,
-    cvvdp_display: crate::metrics::ffvship::CvvdpDisplay,
+    cvvdp_display: &str,
 ) -> bool {
     if let crate::metrics::MetricCell::Done {
         skip: s,
@@ -495,7 +495,7 @@ pub(crate) fn done_is_stale(
             && (kind.is_ffvship() || *sc == scaler)
             && (kind.is_ffvship() || *fm == fps_mode)
             && (kind.is_ffvship() || *pf == ref_pixfmt)
-            && (kind != MetricKind::Cvvdp || cd.as_ref() == Some(&cvvdp_display)))
+            && (kind != MetricKind::Cvvdp || cd.as_deref() == Some(cvvdp_display)))
     } else {
         false
     }

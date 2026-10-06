@@ -336,16 +336,26 @@ impl crate::app::RFMetricsApp {
                                     [70.0, 18.0],
                                     egui::Label::new("Display").selectable(false),
                                 );
+                                let registry =
+                                    crate::metrics::ffvship::display_registry();
+                                let show_all = self.config.cvvdp.show_all;
+                                let current = self.config.cvvdp.display.clone();
+                                let selected = registry
+                                    .iter()
+                                    .find(|m| m.key == current)
+                                    .map(|m| m.name.clone())
+                                    .unwrap_or(current);
                                 let _ = egui::ComboBox::from_id_salt("cvvdp_display")
                                     .width(220.0)
-                                    .selected_text(self.config.cvvdp.display.label())
+                                    .selected_text(selected)
                                     .show_ui(ui, |ui| {
-                                        use crate::metrics::ffvship::CvvdpDisplay;
-                                        for d in CvvdpDisplay::ALL {
+                                        for m in
+                                            registry.iter().filter(|m| show_all || m.vmlab)
+                                        {
                                             let _ = ui.selectable_value(
                                                 &mut self.config.cvvdp.display,
-                                                d,
-                                                d.label(),
+                                                m.key.clone(),
+                                                m.name.as_str(),
                                             );
                                         }
                                     })
@@ -354,6 +364,14 @@ impl crate::app::RFMetricsApp {
                                         "Display CVVDP models (FFVship --displayModel; \
                                          default standard_fhd). A change recomputes \
                                          just the CVVDP column",
+                                    );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add_sized([70.0, 18.0], egui::Label::new(""));
+                                ui.checkbox(&mut self.config.cvvdp.show_all, "More models")
+                                    .on_hover_text(
+                                        "List every verified display model, not just \
+                                         the VideoMetricsLab 8",
                                     );
                             });
                         });
@@ -751,7 +769,7 @@ impl crate::app::RFMetricsApp {
                             self.config.view.scale_method,
                             self.config.view.fps_mode,
                             self.config.reference.pixfmt,
-                            self.config.cvvdp.display,
+                            self.config.cvvdp.display.clone(),
                         )),
                         _ => None,
                     };
@@ -1058,7 +1076,7 @@ impl crate::app::RFMetricsApp {
                                             Some((s, c, vmaf, scaler, fps, pf, cd)) => {
                                                 done_is_stale(
                                                     kind, cell, *s, *c, vmaf, *scaler, *fps,
-                                                    *pf, *cd,
+                                                    *pf, cd,
                                                 )
                                             }
                                             None => false,
