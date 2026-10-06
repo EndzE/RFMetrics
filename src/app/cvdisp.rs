@@ -156,6 +156,9 @@ pub(crate) struct CvdispEditor {
     pub open: bool,
     pub confirm_delete: bool,
     adding: bool,
+    /// Center over the main window on the next shown frame (one-shot, so
+    /// the user can move it freely afterwards).
+    center_once: bool,
     own: Option<String>,
     draft: DisplayDraft,
     original: DisplayMap,
@@ -182,6 +185,7 @@ impl CvdispEditor {
         self.adding = adding;
         self.warning.clear();
         self.open = true;
+        self.center_once = true;
     }
 
     /// Canonical map for the current draft, preserving untouched
@@ -352,9 +356,19 @@ impl crate::app::RFMetricsApp {
             "Display"
         };
         let id = egui::ViewportId::from_hash_of("cvvdp_editor");
-        let builder = egui::ViewportBuilder::default()
+        const SIZE: [f32; 2] = [400.0, 430.0];
+        let mut builder = egui::ViewportBuilder::default()
             .with_title(title)
-            .with_inner_size([400.0, 430.0]);
+            .with_inner_size(SIZE);
+        // Center over the main window once on open — never every frame,
+        // or the user could not move it. A missing rect retries.
+        if self.cvdisp.center_once
+            && let Some(r) = ctx.input(|i| i.viewport().outer_rect)
+        {
+            let c = r.center();
+            builder = builder.with_position(egui::pos2(c.x - SIZE[0] / 2.0, c.y - SIZE[1] / 2.0));
+            self.cvdisp.center_once = false;
+        }
         let mut open = true;
         let mut close = false;
         ctx.show_viewport_immediate(id, builder, |ui, _class| {
