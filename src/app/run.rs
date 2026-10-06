@@ -1138,6 +1138,10 @@ impl crate::app::RFMetricsApp {
         // Fresh run: tab-follow restarts from the first live job.
         self.run.live_kind = None;
         self.run.live_key = None;
+        // A run snapshots settings up front: an open preset editor would
+        // edit a stale world, so it closes (its presets already saved).
+        self.cvdisp.open = false;
+        self.cvdisp.confirm_delete = false;
         if self.config.view.plot_at_start {
             self.plots.open = true;
         }

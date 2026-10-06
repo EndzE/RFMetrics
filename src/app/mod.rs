@@ -1,5 +1,6 @@
 pub(crate) mod badframes;
 pub(crate) mod config;
+pub(crate) mod cvdisp;
 pub(crate) mod panels;
 pub(crate) mod persist;
 pub(crate) mod plots;
@@ -83,6 +84,8 @@ pub struct RFMetricsApp {
     pub(crate) plots: plots::PlotRuntime,
     /// Bad-frames extract + viewer state.
     pub(crate) badframes: badframes::BadframesRuntime,
+    /// CVVDP display-preset editor dialog state.
+    pub(crate) cvdisp: cvdisp::CvdispEditor,
     /// Toast + state-file bookkeeping.
     pub(crate) ui: UiState,
 }
@@ -266,6 +269,7 @@ impl Default for RFMetricsApp {
                 files: Vec::new(),
                 export_pending: None,
             },
+            cvdisp: cvdisp::CvdispEditor::default(),
             ui: UiState {
                 toast: None,
                 saved_snapshot: crate::state::AppState::default(),

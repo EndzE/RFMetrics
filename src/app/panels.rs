@@ -398,6 +398,7 @@ impl crate::app::RFMetricsApp {
                                          the VideoMetricsLab 8",
                                     );
                             });
+                            self.cvdisp_buttons(ui);
                         });
                     });
                 });
@@ -668,6 +669,8 @@ impl crate::app::RFMetricsApp {
                 });
             });
         });
+        // Preset editor window + delete confirm, if armed (no-ops else).
+        self.show_cvdisp_editor(ui);
     }
 
     /// File queue (center, expanding): Add/Remove buttons plus the sortable
