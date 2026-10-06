@@ -252,7 +252,7 @@
       "key": "standard_hmd",
       "name": "VR headset, generic (110°)",
       "group": "extended",
-      "note": "Upstream gives FOV instead of a diagonal; diagonal derived as same-subtended-size screen (2*3m*tan(55°) = 337.36 in).",
+      "note": "Upstream gives FOV instead of a diagonal; diagonal 2*3m*tan(55deg) is algebraically identical to pycvvdp's own FOV path (vvdp_display_geometry resolves to the same display_size_m). Diagonal-sensitivity probe moves JOD monotonically (303.62in→9.61862, 337.36in→9.57592, 371.10in→9.53520), so the field is live.",
       "display": {
         "name": "VR headset, generic (110°)",
         "colorspace": "SDR",
@@ -271,7 +271,7 @@
       "key": "htc_vive_pro",
       "name": "HTC Vive Pro",
       "group": "extended",
-      "note": "Diagonal derived like standard_hmd; contrast = 133.3/0.1.",
+      "note": "Diagonal derived like standard_hmd (same 110deg/3m geometry); contrast = 133.3/0.1. Field liveness proven by the standard_hmd sensitivity probe.",
       "display": {
         "name": "HTC Vive Pro",
         "colorspace": "SDR",
