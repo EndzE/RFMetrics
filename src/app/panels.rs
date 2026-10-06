@@ -331,20 +331,25 @@ impl crate::app::RFMetricsApp {
                     let cvvdp_enabled = !run_locked && self.config.metrics.cvvdp;
                     ui.add_enabled_ui(cvvdp_enabled, |ui| {
                         egui::Frame::group(ui.style()).show(ui, |ui| {
+                            let registry =
+                                crate::metrics::ffvship::display_registry();
+                            let show_all = self.config.cvvdp.show_all;
+                            let current = self.config.cvvdp.display.clone();
+                            let selected = registry
+                                .iter()
+                                .find(|m| m.key == current)
+                                .map(|m| m.name.clone())
+                                .unwrap_or(current);
+                            let detail = registry
+                                .iter()
+                                .find(|m| m.key == self.config.cvvdp.display)
+                                .map(|m| m.describe())
+                                .unwrap_or_else(|| self.config.cvvdp.display.clone());
                             ui.horizontal(|ui| {
                                 ui.add_sized(
                                     [70.0, 18.0],
                                     egui::Label::new("Display").selectable(false),
                                 );
-                                let registry =
-                                    crate::metrics::ffvship::display_registry();
-                                let show_all = self.config.cvvdp.show_all;
-                                let current = self.config.cvvdp.display.clone();
-                                let selected = registry
-                                    .iter()
-                                    .find(|m| m.key == current)
-                                    .map(|m| m.name.clone())
-                                    .unwrap_or(current);
                                 let _ = egui::ComboBox::from_id_salt("cvvdp_display")
                                     .width(220.0)
                                     .selected_text(selected)
@@ -365,6 +370,10 @@ impl crate::app::RFMetricsApp {
                                          default standard_fhd). A change recomputes \
                                          just the CVVDP column",
                                     );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add_sized([70.0, 18.0], egui::Label::new(""));
+                                ui.label(egui::RichText::new(detail).small().weak());
                             });
                             ui.horizontal(|ui| {
                                 ui.add_sized([70.0, 18.0], egui::Label::new(""));

@@ -177,6 +177,28 @@ fn display_flags_only_off_default() {
 }
 
 #[test]
+fn describe_matches_reference_format() {
+    assert_eq!(
+        display_named("standard_fhd")
+            .map(|m| m.describe())
+            .as_deref(),
+        Some("24\" 1920x1080 SDR, 200 nits, 250 lux, 0.60 m (2.0 x screen height)")
+    );
+    assert_eq!(
+        display_named("standard_hdr_pq")
+            .map(|m| m.describe())
+            .as_deref(),
+        Some("30\" 3840x2160 HDR, 1500 nits, 10 lux, 0.75 m (2.0 x screen height)")
+    );
+    assert_eq!(
+        display_named("iphone_14_pro")
+            .map(|m| m.describe())
+            .as_deref(),
+        Some("6.1\" 2532x1170 SDR, 1025 nits, 250 lux, 0.51 m (7.8 x screen height)")
+    );
+}
+
+#[test]
 fn registry_holds_all_models_split_by_group() {
     let reg = display_registry();
     assert_eq!(reg.len(), 26);

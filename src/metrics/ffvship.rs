@@ -151,6 +151,43 @@ pub fn display_named(key: &str) -> Option<&'static DisplayModel> {
     display_registry().iter().find(|m| m.key == key)
 }
 
+impl DisplayModel {
+    /// One-line summary for the options panel (VideoMetricsLab `describe`
+    /// parity): `30" 3840x2160 SDR, 200 nits, 250 lux, 0.75 m (2.0 x
+    /// screen height)`. Falls back to the key on degenerate geometry
+    /// (unreachable through the validated registry).
+    pub fn describe(&self) -> String {
+        let num = |f: &str| self.display.get(f).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let (w, h) = match self.display.get("resolution").and_then(|r| r.as_array()) {
+            Some(r) => (
+                r.first().and_then(|v| v.as_f64()).unwrap_or(0.0),
+                r.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0),
+            ),
+            None => (0.0, 0.0),
+        };
+        if w <= 0.0 || h <= 0.0 {
+            return self.key.clone();
+        }
+        let ar = w / h;
+        let height_m = num("diagonal_size_inches") * 0.0254 / (1.0 + ar * ar).sqrt();
+        if height_m <= 0.0 {
+            return self.key.clone();
+        }
+        let sdr = self.display.get("colorspace").and_then(|c| c.as_str()) == Some("SDR");
+        format!(
+            "{}\" {}x{} {}, {} nits, {} lux, {:.2} m ({:.1} x screen height)",
+            num("diagonal_size_inches"),
+            w,
+            h,
+            if sdr { "SDR" } else { "HDR" },
+            num("max_luminance"),
+            num("E_ambient"),
+            num("viewing_distance_meters"),
+            num("viewing_distance_meters") / height_m,
+        )
+    }
+}
+
 /// Per-run `--displayConfig` file (`{key: display}` — the shape FFVship
 /// parses; a bare object crashes its parser). Unique per call so
 /// concurrent runs never share; the caller deletes it (see
