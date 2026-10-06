@@ -6,6 +6,11 @@
 
 use crate::metrics::ffvship::CustomDisplay;
 
+/// Editor window size: snug around the 10-row form + buttons (a taller
+/// window leaves a black void; content wider clips, so this errs exact
+/// — the window stays user-resizable either way).
+const EDITOR_SIZE: [f32; 2] = [370.0, 315.0];
+
 /// Draft display values as edited (floats throughout, like the boxes;
 /// resolution rounds to ints and reflectivity edits as percent at save).
 #[derive(Debug, Clone, Default)]
@@ -356,29 +361,35 @@ impl crate::app::RFMetricsApp {
             "Display"
         };
         let id = egui::ViewportId::from_hash_of("cvvdp_editor");
-        const SIZE: [f32; 2] = [400.0, 430.0];
         let mut builder = egui::ViewportBuilder::default()
             .with_title(title)
-            .with_inner_size(SIZE);
+            .with_inner_size(EDITOR_SIZE);
         // Center over the main window once on open — never every frame,
         // or the user could not move it. A missing rect retries.
         if self.cvdisp.center_once
             && let Some(r) = ctx.input(|i| i.viewport().outer_rect)
         {
             let c = r.center();
-            builder = builder.with_position(egui::pos2(c.x - SIZE[0] / 2.0, c.y - SIZE[1] / 2.0));
+            builder = builder.with_position(egui::pos2(
+                c.x - EDITOR_SIZE[0] / 2.0,
+                c.y - EDITOR_SIZE[1] / 2.0,
+            ));
             self.cvdisp.center_once = false;
         }
         let mut open = true;
         let mut close = false;
-        ctx.show_viewport_immediate(id, builder, |ui, _class| {
+        ctx.show_viewport_immediate(id, builder, |vui, _class| {
             // Window-manager close withdraws; the buttons below use the
             // `close` flag instead (same writeback).
-            if ui.input(|i| i.viewport().close_requested()) {
+            if vui.input(|i| i.viewport().close_requested()) {
                 open = false;
                 return;
             }
-            self.cvdisp_form(ui, &mut close);
+            // CentralPanel: main-window background + margins (a bare
+            // viewport Ui starts at the raw origin on flat black).
+            egui::CentralPanel::default().show(vui, |ui| {
+                self.cvdisp_form(ui, &mut close);
+            });
         });
         self.cvdisp.open = open && !close;
     }
