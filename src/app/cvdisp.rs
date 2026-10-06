@@ -339,29 +339,37 @@ impl crate::app::RFMetricsApp {
             return;
         }
         let mut open = self.cvdisp.open;
+        let mut close = false;
         let title = if self.cvdisp.adding {
-            "New CVVDP preset"
+            "New preset"
         } else {
-            "CVVDP display"
+            "Display"
         };
         egui::Window::new(title)
+            .id(egui::Id::new("cvdisp_editor"))
             .collapsible(false)
             .resizable(false)
+            .title_bar(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .open(&mut open)
             .show(ui.ctx(), |ui| {
-                self.cvdisp_form(ui);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(title).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("×").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.separator();
+                self.cvdisp_form(ui, &mut close);
             });
-        self.cvdisp.open = open;
+        self.cvdisp.open = open && !close;
     }
 
     /// The editor form (VideoMetricsLab `CvvdpDisplayDialog` parity:
     /// fields, ranges, units, and the live screen-height note).
-    fn cvdisp_form(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            "CVVDP predicts visibility on this display. Every value changes \
-             the score — compare videos scored for the same display.",
-        );
-        ui.add_space(4.0);
+    fn cvdisp_form(&mut self, ui: &mut egui::Ui, close: &mut bool) {
         egui::Grid::new("cvdisp_form")
             .num_columns(2)
             .spacing([8.0, 4.0])
@@ -499,9 +507,16 @@ impl crate::app::RFMetricsApp {
                                 &mut self.cvdisp.draft.colorspace,
                                 (*c).to_owned(),
                                 *c,
-                            );
+                            )
+                            .on_hover_text(colorspace_tip(c));
                         }
-                    });
+                    })
+                    .response
+                    .on_hover_text(
+                        "Transfer function of the content: SDR for regular videos, \
+                         the HDR one matching the footage, linear for absolute \
+                         linear-light frames.",
+                    );
                 ui.end_row();
             });
         if !self.cvdisp.warning.is_empty() {
@@ -511,13 +526,13 @@ impl crate::app::RFMetricsApp {
             let now = ui.input(|i| i.time);
             let can_save = self.cvdisp.own.is_some() && !self.cvdisp.adding;
             if can_save && ui.button("Save preset").clicked() {
-                self.cvdisp_save(now, false);
+                self.cvdisp_save(now, false, close);
             }
             if ui.button("Save as new preset").clicked() {
-                self.cvdisp_save(now, true);
+                self.cvdisp_save(now, true, close);
             }
             if ui.button("Cancel").clicked() {
-                self.cvdisp.open = false;
+                *close = true;
             }
         });
     }
@@ -525,7 +540,7 @@ impl crate::app::RFMetricsApp {
     /// Run one save flow: build + preserve + validate, then store, select
     /// (except Add, which never touches the selection), toast, and close.
     /// `as_new`: Save-as-new button (else the Save-preset button).
-    fn cvdisp_save(&mut self, now: f64, as_new: bool) {
+    fn cvdisp_save(&mut self, now: f64, as_new: bool, close: &mut bool) {
         let replacing = if as_new {
             None
         } else {
@@ -558,10 +573,23 @@ impl crate::app::RFMetricsApp {
                     },
                     crate::app::ToastKind::Info,
                 );
-                self.cvdisp.open = false;
+                *close = true;
             }
             Err(e) => self.cvdisp.warning = e,
         }
+    }
+}
+
+/// What each colorspace choice means, in HDR/SDR terms (pycvvdp guidance:
+/// the transfer must match the content).
+fn colorspace_tip(c: &str) -> &'static str {
+    match c {
+        "BT.2020-PQ" => "HDR10 content with the PQ (ST 2084) transfer — HDR monitors and TVs.",
+        "BT.2020-HLG" => {
+            "HLG broadcast content (cameras, phones) — same display, different transfer."
+        }
+        "BT.709-linear" => "Absolute linear-light frames (OpenEXR); values are scene nits.",
+        _ => "Standard content: office monitors, phones, SDR TVs.",
     }
 }
 
