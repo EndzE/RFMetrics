@@ -177,7 +177,7 @@ impl CvdispEditor {
         self.open_editor(display, "", None, true);
     }
 
-    /// "Edit display…" from the given display: `own` is the custom preset
+    /// "Edit preset…" from the given display: `own` is the custom preset
     /// it came from, if any (built-ins offer save-as-new only).
     pub(crate) fn open_edit(&mut self, display: &DisplayMap, own: Option<String>) {
         let name = own.clone().unwrap_or_default();
@@ -276,7 +276,7 @@ impl crate::app::RFMetricsApp {
                 let map = self.current_display_map();
                 self.cvdisp.open_add(&map);
             }
-            if ui.button("Edit display…").clicked() {
+            if ui.button("Edit preset…").clicked() {
                 let display = self.config.cvvdp.display.clone();
                 let own = self
                     .config
