@@ -670,7 +670,8 @@ impl crate::app::RFMetricsApp {
             });
         });
         // Preset editor window + delete confirm, if armed (no-ops else).
-        self.show_cvdisp_editor(ui);
+        self.cvdisp_delete_modal(ui);
+        self.show_cvdisp_editor(ui.ctx());
     }
 
     /// File queue (center, expanding): Add/Remove buttons plus the sortable

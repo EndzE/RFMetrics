@@ -305,65 +305,67 @@ impl crate::app::RFMetricsApp {
         .unwrap_or_default()
     }
 
-    /// Editor window + delete confirm, if armed (call unconditionally;
-    /// cheap no-ops otherwise).
-    pub(crate) fn show_cvdisp_editor(&mut self, ui: &mut egui::Ui) {
-        if self.cvdisp.confirm_delete {
-            let name = self.config.cvvdp.display.clone();
-            let r = egui::Modal::new(egui::Id::new("cvvdp_delete")).show(ui.ctx(), |ui| {
-                ui.label(format!(
-                    "Delete your preset \"{name}\"?\n\nThe display resets to standard_fhd."
-                ));
-                ui.horizontal(|ui| {
-                    let yes = ui.button("Delete").clicked();
-                    let no = ui.button("Cancel").clicked();
-                    (yes, no)
-                })
-                .inner
-            });
-            if r.inner.0 {
-                delete_custom(&mut self.config.cvvdp.custom, &name);
-                self.config.cvvdp.display = crate::metrics::ffvship::DEFAULT_DISPLAY_KEY.to_owned();
-                let now = ui.input(|i| i.time);
-                self.ui.toast(
-                    now,
-                    format!("Deleted the CVVDP preset \"{name}\"."),
-                    crate::app::ToastKind::Info,
-                );
-                self.cvdisp.confirm_delete = false;
-            } else if r.inner.1 || r.should_close() {
-                self.cvdisp.confirm_delete = false;
-            }
+    /// Delete-preset confirm on the main window (modals don't cross
+    /// into the editor viewport). Call unconditionally; no-op unless
+    /// armed.
+    pub(crate) fn cvdisp_delete_modal(&mut self, ui: &mut egui::Ui) {
+        if !self.cvdisp.confirm_delete {
+            return;
         }
+        let name = self.config.cvvdp.display.clone();
+        let r = egui::Modal::new(egui::Id::new("cvvdp_delete")).show(ui.ctx(), |ui| {
+            ui.label(format!(
+                "Delete your preset \"{name}\"?\n\nThe display resets to standard_fhd."
+            ));
+            ui.horizontal(|ui| {
+                let yes = ui.button("Delete").clicked();
+                let no = ui.button("Cancel").clicked();
+                (yes, no)
+            })
+            .inner
+        });
+        if r.inner.0 {
+            delete_custom(&mut self.config.cvvdp.custom, &name);
+            self.config.cvvdp.display = crate::metrics::ffvship::DEFAULT_DISPLAY_KEY.to_owned();
+            let now = ui.input(|i| i.time);
+            self.ui.toast(
+                now,
+                format!("Deleted the CVVDP preset \"{name}\"."),
+                crate::app::ToastKind::Info,
+            );
+            self.cvdisp.confirm_delete = false;
+        } else if r.inner.1 || r.should_close() {
+            self.cvdisp.confirm_delete = false;
+        }
+    }
+
+    /// Preset editor in its own OS window (plot-window pattern: native
+    /// drag + close; the frameless inline window couldn't be dragged).
+    /// Call every frame; no-op unless open.
+    pub(crate) fn show_cvdisp_editor(&mut self, ctx: &egui::Context) {
         if !self.cvdisp.open {
             return;
         }
-        let mut open = self.cvdisp.open;
-        let mut close = false;
         let title = if self.cvdisp.adding {
             "New preset"
         } else {
             "Display"
         };
-        egui::Window::new(title)
-            .id(egui::Id::new("cvdisp_editor"))
-            .collapsible(false)
-            .resizable(false)
-            .title_bar(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .open(&mut open)
-            .show(ui.ctx(), |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(title).strong());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("×").clicked() {
-                            close = true;
-                        }
-                    });
-                });
-                ui.separator();
-                self.cvdisp_form(ui, &mut close);
-            });
+        let id = egui::ViewportId::from_hash_of("cvvdp_editor");
+        let builder = egui::ViewportBuilder::default()
+            .with_title(title)
+            .with_inner_size([400.0, 430.0]);
+        let mut open = true;
+        let mut close = false;
+        ctx.show_viewport_immediate(id, builder, |ui, _class| {
+            // Window-manager close withdraws; the buttons below use the
+            // `close` flag instead (same writeback).
+            if ui.input(|i| i.viewport().close_requested()) {
+                open = false;
+                return;
+            }
+            self.cvdisp_form(ui, &mut close);
+        });
         self.cvdisp.open = open && !close;
     }
 
