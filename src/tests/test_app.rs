@@ -2748,6 +2748,7 @@ fn state_apply_validates_cvvdp_display() {
         cvvdp: crate::state::CvvdpState {
             display: Some("standard_4k".to_owned()),
             show_all: Some(true),
+            custom: None,
         },
         ..Default::default()
     };
@@ -2759,6 +2760,7 @@ fn state_apply_validates_cvvdp_display() {
         cvvdp: crate::state::CvvdpState {
             display: Some("bogus_display_xyz".to_owned()),
             show_all: None,
+            custom: None,
         },
         ..Default::default()
     };
@@ -2768,6 +2770,59 @@ fn state_apply_validates_cvvdp_display() {
     let snap = app.snapshot();
     assert_eq!(snap.cvvdp.display.as_deref(), Some("standard_4k"));
     assert_eq!(snap.cvvdp.show_all, Some(true));
+}
+
+/// State apply keeps well-formed custom displays and drops the rest
+/// (bad values, empty names, registry-key collisions).
+#[test]
+fn state_apply_filters_custom_displays() {
+    use crate::metrics::ffvship::CustomDisplay;
+    let good = serde_json::json!({
+        "colorspace": "SDR", "resolution": [1920, 1080],
+        "viewing_distance_meters": 0.6, "diagonal_size_inches": 24,
+        "max_luminance": 200, "contrast": 1000, "E_ambient": 250,
+        "k_refl": 0.005, "exposure": 1.0
+    });
+    let mut bad = good.clone();
+    bad["contrast"] = serde_json::Value::from(0);
+    let state = crate::state::AppState {
+        cvvdp: crate::state::CvvdpState {
+            display: None,
+            show_all: None,
+            custom: Some(vec![
+                CustomDisplay {
+                    name: "Mine".to_owned(),
+                    display: good.as_object().unwrap().clone(),
+                },
+                CustomDisplay {
+                    name: "Broken".to_owned(),
+                    display: bad.as_object().unwrap().clone(),
+                },
+                CustomDisplay {
+                    name: "standard_fhd".to_owned(),
+                    display: good.as_object().unwrap().clone(),
+                },
+                CustomDisplay {
+                    name: "Mine".to_owned(),
+                    display: good.as_object().unwrap().clone(),
+                },
+            ]),
+        },
+        ..Default::default()
+    };
+    let mut app = RFMetricsApp::default();
+    app.apply_state(Some(state));
+    // Only the well-formed, uniquely-named, non-built-in entry survives.
+    assert_eq!(
+        app.config
+            .cvvdp
+            .custom
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Mine"]
+    );
+    assert_eq!(app.snapshot().cvvdp.custom.unwrap().len(), 1);
 }
 
 /// CVVDP display change stales the CVVDP column alone; other columns

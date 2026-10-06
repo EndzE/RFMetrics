@@ -89,11 +89,13 @@ pub struct VmafState {
 }
 
 /// CVVDP options; `None` = key absent, keep the live default.
-#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+/// No `Eq`: custom displays hold floats (`serde_json` numbers).
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct CvvdpState {
     pub display: Option<String>,
     pub show_all: Option<bool>,
+    pub custom: Option<Vec<crate::metrics::ffvship::CustomDisplay>>,
 }
 
 /// Global options; `None` = key absent, keep the live default.
@@ -117,8 +119,9 @@ pub struct OptionsState {
 }
 
 /// The whole persisted snapshot: verbatim boxes, optional queue, and
-/// optional per-key overrides.
-#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+/// optional per-key overrides. No `Eq` (transitively: custom displays
+/// hold floats).
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct AppState {
     pub ref_path: String,

@@ -966,6 +966,7 @@ impl crate::app::RFMetricsApp {
         // half-apply).
         let vmaf_cfg = self.config.vmaf.current_vmaf_cfg();
         let cvvdp_display = self.config.cvvdp.display.clone();
+        let cvvdp_custom = self.config.cvvdp.custom.clone();
         // Per metric: rows already holding a valid value sit the rerun out —
         // but only when the trim settings still match: a value computed
         // under a different skip/clip is stale and must recompute. VMAF
@@ -1207,6 +1208,7 @@ impl crate::app::RFMetricsApp {
                         &job,
                         fkind,
                         &cvvdp_display,
+                        &cvvdp_custom,
                         &progress,
                         &series,
                     )

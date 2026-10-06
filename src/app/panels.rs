@@ -331,20 +331,26 @@ impl crate::app::RFMetricsApp {
                     let cvvdp_enabled = !run_locked && self.config.metrics.cvvdp;
                     ui.add_enabled_ui(cvvdp_enabled, |ui| {
                         egui::Frame::group(ui.style()).show(ui, |ui| {
-                            let registry =
-                                crate::metrics::ffvship::display_registry();
-                            let show_all = self.config.cvvdp.show_all;
-                            let current = self.config.cvvdp.display.clone();
-                            let selected = registry
-                                .iter()
-                                .find(|m| m.key == current)
-                                .map(|m| m.name.clone())
-                                .unwrap_or(current);
-                            let detail = registry
-                                .iter()
-                                .find(|m| m.key == self.config.cvvdp.display)
-                                .map(|m| m.describe())
-                                .unwrap_or_else(|| self.config.cvvdp.display.clone());
+                                let registry =
+                                    crate::metrics::ffvship::display_registry();
+                                let show_all = self.config.cvvdp.show_all;
+                                // Cloned: the popup closure below mutably
+                                // borrows the display string (same precedent
+                                // as the VMAF model list above).
+                                let customs = self.config.cvvdp.custom.clone();
+                                let current = self.config.cvvdp.display.clone();
+                                let (selected, detail) =
+                                    match crate::metrics::ffvship::lookup_display(
+                                        &current, &customs,
+                                    ) {
+                                        Some((name, display)) => (
+                                            name.to_owned(),
+                                            crate::metrics::ffvship::describe_display(
+                                                &current, display,
+                                            ),
+                                        ),
+                                        None => (current.clone(), current.clone()),
+                                    };
                             ui.horizontal(|ui| {
                                 ui.add_sized(
                                     [70.0, 18.0],
@@ -361,6 +367,15 @@ impl crate::app::RFMetricsApp {
                                                 &mut self.config.cvvdp.display,
                                                 m.key.clone(),
                                                 m.name.as_str(),
+                                            );
+                                        }
+                                        // Customs always list (they are the
+                                        // user's own, like VideoMetricsLab).
+                                        for c in &customs {
+                                            let _ = ui.selectable_value(
+                                                &mut self.config.cvvdp.display,
+                                                c.name.clone(),
+                                                c.name.as_str(),
                                             );
                                         }
                                     })

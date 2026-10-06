@@ -178,23 +178,21 @@ fn display_flags_only_off_default() {
 
 #[test]
 fn describe_matches_reference_format() {
+    let show = |key: &str| {
+        let m = display_named(key).unwrap();
+        describe_display(&m.key, &m.display)
+    };
     assert_eq!(
-        display_named("standard_fhd")
-            .map(|m| m.describe())
-            .as_deref(),
-        Some("24\" 1920x1080 SDR, 200 nits, 250 lux, 0.60 m (2.0 x screen height)")
+        show("standard_fhd"),
+        "24\" 1920x1080 SDR, 200 nits, 250 lux, 0.60 m (2.0 x screen height)"
     );
     assert_eq!(
-        display_named("standard_hdr_pq")
-            .map(|m| m.describe())
-            .as_deref(),
-        Some("30\" 3840x2160 HDR, 1500 nits, 10 lux, 0.75 m (2.0 x screen height)")
+        show("standard_hdr_pq"),
+        "30\" 3840x2160 HDR, 1500 nits, 10 lux, 0.75 m (2.0 x screen height)"
     );
     assert_eq!(
-        display_named("iphone_14_pro")
-            .map(|m| m.describe())
-            .as_deref(),
-        Some("6.1\" 2532x1170 SDR, 1025 nits, 250 lux, 0.51 m (7.8 x screen height)")
+        show("iphone_14_pro"),
+        "6.1\" 2532x1170 SDR, 1025 nits, 250 lux, 0.51 m (7.8 x screen height)"
     );
 }
 
@@ -235,6 +233,114 @@ fn registry_holds_all_models_split_by_group() {
         Some("iPhone 14 Pro")
     );
     assert!(display_named("bogus_display_xyz").is_none());
+}
+
+/// Valid display object for validation tests (mirrors a registry entry).
+fn valid_display() -> serde_json::Map<String, serde_json::Value> {
+    serde_json::from_str(
+        r#"{"colorspace":"SDR","resolution":[1920,1080],"viewing_distance_meters":0.6,
+            "diagonal_size_inches":24,"max_luminance":200,"contrast":1000,
+            "E_ambient":250,"k_refl":0.005,"exposure":1.0}"#,
+    )
+    .unwrap()
+}
+
+#[test]
+fn custom_validation_accepts_good_rejects_bad() {
+    let good = valid_display();
+    let customs: Vec<CustomDisplay> = Vec::new();
+    assert!(validate_custom_display("Mine", &good, None, &customs).is_ok());
+    // Rename-own exception: keeping the name while overwriting passes.
+    let customs = vec![CustomDisplay {
+        name: "Mine".to_owned(),
+        display: good.clone(),
+    }];
+    assert!(validate_custom_display("Mine", &good, Some("Mine"), &customs).is_ok());
+    // Empty name, built-in collision, custom collision.
+    assert!(validate_custom_display("", &good, None, &customs).is_err());
+    assert!(validate_custom_display("standard_fhd", &good, None, &customs).is_err());
+    assert!(validate_custom_display("Mine", &good, None, &customs).is_err());
+    // Missing field, bad colorspace, out-of-range values.
+    let mut bad = good.clone();
+    bad.remove("contrast");
+    assert!(validate_custom_display("Other", &bad, None, &customs).is_err());
+    let mut bad = good.clone();
+    bad.insert("colorspace".to_owned(), serde_json::Value::from("sRGB"));
+    assert!(validate_custom_display("Other", &bad, None, &customs).is_err());
+    for (field, value) in [
+        ("diagonal_size_inches", 0.0),
+        ("viewing_distance_meters", 0.0),
+        ("max_luminance", 0.0),
+        ("contrast", 0.0),
+        ("E_ambient", -1.0),
+        ("k_refl", 1.0),
+        ("exposure", 0.0),
+    ] {
+        let mut bad = good.clone();
+        bad.insert(field.to_owned(), serde_json::Value::from(value));
+        assert!(
+            validate_custom_display("Other", &bad, None, &customs).is_err(),
+            "{field}={value} accepted"
+        );
+    }
+    // reflectivity is a fraction (UI shows percent); resolution bounds.
+    let mut bad = good.clone();
+    bad.insert("resolution".to_owned(), serde_json::json!([1920]));
+    assert!(validate_custom_display("Other", &bad, None, &customs).is_err());
+    let mut bad = good.clone();
+    bad.insert("resolution".to_owned(), serde_json::json!([8, 1080]));
+    assert!(validate_custom_display("Other", &bad, None, &customs).is_err());
+}
+
+#[test]
+fn lookup_prefers_customs_then_registry() {
+    let customs = vec![CustomDisplay {
+        name: "Mine".to_owned(),
+        display: valid_display(),
+    }];
+    // Custom hit (name is the key).
+    let (name, _) = lookup_display("Mine", &customs).unwrap();
+    assert_eq!(name, "Mine");
+    // Registry hit.
+    let (name, _) = lookup_display("standard_4k", &customs).unwrap();
+    assert_eq!(name, "30-inch 4K monitor, office");
+    // Miss.
+    assert!(lookup_display("bogus_display_xyz", &customs).is_none());
+}
+
+#[test]
+fn heights_ratio_matches_reference() {
+    // 30" 4K at 0.7472 m: the classic 2.0 x screen height.
+    let r = heights_ratio(3840.0, 2160.0, 30.0, 0.7472);
+    assert!((r - 2.0).abs() < 0.01, "{r}");
+}
+
+#[test]
+fn display_config_guard_writes_and_cleans() {
+    let customs = vec![CustomDisplay {
+        name: "Mine".to_owned(),
+        display: valid_display(),
+    }];
+    // Default and unknown keys: no file, no flags.
+    assert!(
+        DisplayConfig::new("standard_fhd", &customs)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        DisplayConfig::new("bogus_display_xyz", &customs)
+            .unwrap()
+            .is_none()
+    );
+    // Custom key: temp file lives while the guard does, gone after.
+    let path = {
+        let guard = DisplayConfig::new("Mine", &customs).unwrap().unwrap();
+        let (key, path) = guard.argv();
+        assert_eq!(key, "Mine");
+        assert!(path.is_file());
+        path.to_path_buf()
+    };
+    assert!(!path.exists());
 }
 
 #[test]

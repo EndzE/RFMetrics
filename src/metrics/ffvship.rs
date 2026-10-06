@@ -151,60 +151,177 @@ pub fn display_named(key: &str) -> Option<&'static DisplayModel> {
     display_registry().iter().find(|m| m.key == key)
 }
 
-impl DisplayModel {
-    /// One-line summary for the options panel (VideoMetricsLab `describe`
-    /// parity): `30" 3840x2160 SDR, 200 nits, 250 lux, 0.75 m (2.0 x
-    /// screen height)`. Falls back to the key on degenerate geometry
-    /// (unreachable through the validated registry).
-    pub fn describe(&self) -> String {
-        let num = |f: &str| self.display.get(f).and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let (w, h) = match self.display.get("resolution").and_then(|r| r.as_array()) {
-            Some(r) => (
-                r.first().and_then(|v| v.as_f64()).unwrap_or(0.0),
-                r.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0),
-            ),
-            None => (0.0, 0.0),
-        };
-        if w <= 0.0 || h <= 0.0 {
-            return self.key.clone();
-        }
-        let ar = w / h;
-        let height_m = num("diagonal_size_inches") * 0.0254 / (1.0 + ar * ar).sqrt();
-        if height_m <= 0.0 {
-            return self.key.clone();
-        }
-        let sdr = self.display.get("colorspace").and_then(|c| c.as_str()) == Some("SDR");
-        format!(
-            "{}\" {}x{} {}, {} nits, {} lux, {:.2} m ({:.1} x screen height)",
-            num("diagonal_size_inches"),
-            w,
-            h,
-            if sdr { "SDR" } else { "HDR" },
-            num("max_luminance"),
-            num("E_ambient"),
-            num("viewing_distance_meters"),
-            num("viewing_distance_meters") / height_m,
-        )
-    }
+/// User-saved display preset (state file): a name plus a normalized
+/// display object in registry shape. Saved through the display editor,
+/// which validates values before they can land here.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CustomDisplay {
+    pub name: String,
+    pub display: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Registry + customs lookup by key, customs first (a custom saved from
+/// a built-in shows under the user's name). Built-in keys can't be
+/// shadowed — the editor refuses them — so order rarely matters.
+pub fn lookup_display<'a>(
+    key: &str,
+    customs: &'a [CustomDisplay],
+) -> Option<(&'a str, &'a serde_json::Map<String, serde_json::Value>)> {
+    if let Some(c) = customs.iter().find(|c| c.name == key) {
+        return Some((c.name.as_str(), &c.display));
+    }
+    display_named(key).map(|m| (m.name.as_str(), &m.display))
+}
+
+/// Colorspaces `--displayConfig` accepts (verified live; anything else
+/// fails the run, so the editor offers exactly these).
+pub const DISPLAY_COLORSPACES: &[&str] = &["SDR", "BT.2020-PQ", "BT.2020-HLG", "BT.709-linear"];
+
+/// Largest display resolution the editor accepts (8K — VideoMetricsLab
+/// parity: at 8K a CVVDP run alone can exceed most GPUs' VRAM).
+pub const MAX_DISPLAY_PIXELS: i64 = 8192;
+
+/// Viewing distance as a multiple of screen height (VideoMetricsLab
+/// `distance_in_heights` parity): the editor's live note and
+/// `DisplayModel::describe` share it.
+pub fn heights_ratio(width: f64, height: f64, diagonal_inches: f64, distance_m: f64) -> f64 {
+    let ar = width / height;
+    let height_m = diagonal_inches * 0.0254 / (1.0 + ar * ar).sqrt();
+    distance_m / height_m
+}
+
+/// Validate a custom display before it can be saved (VideoMetricsLab
+/// `CvvdpDisplayDialog` + `validated()` parity): name rules plus value
+/// ranges. `replacing` is the own preset being overwritten/renamed, if
+/// any. `Err` carries the dialog warning text.
+pub fn validate_custom_display(
+    name: &str,
+    display: &serde_json::Map<String, serde_json::Value>,
+    replacing: Option<&str>,
+    customs: &[CustomDisplay],
+) -> Result<(), String> {
+    let num = |f: &str| display.get(f).and_then(|v| v.as_f64());
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Type a name for the preset.".to_owned());
+    }
+    let renaming_own = replacing.is_some_and(|own| own == name);
+    if !renaming_own && (display_named(name).is_some() || customs.iter().any(|c| c.name == name)) {
+        return Err(format!(
+            "There is already a preset called \"{name}\". Choose another name."
+        ));
+    }
+    let float_in =
+        |f: &str, lo: f64, hi: f64| num(f).is_some_and(|v| v.is_finite() && (lo..=hi).contains(&v));
+    let res_ok = display
+        .get("resolution")
+        .and_then(|r| r.as_array())
+        .is_some_and(|r| {
+            r.len() == 2
+                && r.iter().all(|v| {
+                    v.as_i64()
+                        .is_some_and(|n| (16..=MAX_DISPLAY_PIXELS).contains(&n))
+                })
+        });
+    let colorspace_ok = display
+        .get("colorspace")
+        .and_then(|c| c.as_str())
+        .is_some_and(|c| DISPLAY_COLORSPACES.contains(&c));
+    if !res_ok {
+        return Err("The display resolution must be 16 to 8192 pixels per side.".to_owned());
+    }
+    if !colorspace_ok {
+        return Err("Pick a colorspace from the list.".to_owned());
+    }
+    // Field names are the file format's (`max_luminance`, `k_refl`),
+    // not the dataclass's: this validates what the binary will read.
+    for (field, label, lo, hi) in [
+        ("diagonal_size_inches", "screen size", 1.0, 1000.0),
+        ("viewing_distance_meters", "viewing distance", 0.05, 50.0),
+        ("max_luminance", "peak brightness", 1.0, 10000.0),
+        ("contrast", "contrast", 1.0, 10_000_000.0),
+        ("exposure", "exposure", 0.01, 100.0),
+    ] {
+        if !float_in(field, lo, hi) {
+            return Err(format!("The display's {label} is out of range."));
+        }
+    }
+    if !num("E_ambient").is_some_and(|v| v.is_finite() && v >= 0.0) {
+        return Err("Ambient light cannot be negative.".to_owned());
+    }
+    // Stored as `k_refl` (the file format's name, like VideoMetricsLab
+    // serializes it); the dialog shows percent.
+    if !num("k_refl").is_some_and(|v| v.is_finite() && (0.0..1.0).contains(&v)) {
+        return Err("Reflectivity must be between 0 and 1.".to_owned());
+    }
+    Ok(())
+}
+
+/// One-line display summary for the options panel (VideoMetricsLab
+/// `describe` parity): `30" 3840x2160 SDR, 200 nits, 250 lux, 0.75 m
+/// (2.0 x screen height)`. Works over a bare key + display object so
+/// custom presets (not registry members) render identically. Falls back
+/// to the key on degenerate geometry (unreachable through validation).
+pub fn describe_display(key: &str, display: &serde_json::Map<String, serde_json::Value>) -> String {
+    let num = |f: &str| display.get(f).and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let (w, h) = match display.get("resolution").and_then(|r| r.as_array()) {
+        Some(r) => (
+            r.first().and_then(|v| v.as_f64()).unwrap_or(0.0),
+            r.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0),
+        ),
+        None => (0.0, 0.0),
+    };
+    if w <= 0.0 || h <= 0.0 {
+        return key.to_owned();
+    }
+    let heights = heights_ratio(
+        w,
+        h,
+        num("diagonal_size_inches"),
+        num("viewing_distance_meters"),
+    );
+    if !heights.is_finite() {
+        return key.to_owned();
+    }
+    let sdr = display.get("colorspace").and_then(|c| c.as_str()) == Some("SDR");
+    format!(
+        "{}\" {}x{} {}, {} nits, {} lux, {:.2} m ({:.1} x screen height)",
+        num("diagonal_size_inches"),
+        w,
+        h,
+        if sdr { "SDR" } else { "HDR" },
+        num("max_luminance"),
+        num("E_ambient"),
+        num("viewing_distance_meters"),
+        heights,
+    )
+}
 /// Per-run `--displayConfig` file (`{key: display}` — the shape FFVship
 /// parses; a bare object crashes its parser). Unique per call so
 /// concurrent runs never share; the caller deletes it (see
-/// [`DisplayConfigGuard`]).
-fn write_display_config(model: &DisplayModel) -> std::io::Result<std::path::PathBuf> {
+/// [`DisplayConfig`]).
+fn write_display_config(
+    key: &str,
+    display: &serde_json::Map<String, serde_json::Value>,
+) -> std::io::Result<std::path::PathBuf> {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let safe_key: String = key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
     let path = std::env::temp_dir().join(format!(
-        "rfmetrics-cvvdp-{}-{n}-{}.json",
+        "rfmetrics-cvvdp-{}-{n}-{safe_key}.json",
         std::process::id(),
-        model.key
     ));
     let mut obj = serde_json::Map::new();
-    obj.insert(
-        model.key.clone(),
-        serde_json::Value::Object(model.display.clone()),
-    );
+    obj.insert(key.to_owned(), serde_json::Value::Object(display.clone()));
     std::fs::write(&path, serde_json::to_string(&obj).unwrap_or_default())?;
     Ok(path)
 }
@@ -220,17 +337,18 @@ impl DisplayConfig {
     /// `Ok(None)` = default display: no file, no flags (binary default).
     /// Unknown keys also fall back to the default (logged): a run must
     /// never fail on a display lookup.
-    pub fn new(key: &str) -> std::io::Result<Option<Self>> {
+    pub fn new(key: &str, customs: &[CustomDisplay]) -> std::io::Result<Option<Self>> {
         if key == DEFAULT_DISPLAY_KEY {
             return Ok(None);
         }
-        let Some(model) = display_named(key) else {
+        let Some((_, display)) = lookup_display(key, customs) else {
             log::warn!(target: "rfmetrics::metric", "unknown CVVDP display {key:?}, using binary default");
             return Ok(None);
         };
+        let path = write_display_config(key, display)?;
         Ok(Some(Self {
-            key: model.key.clone(),
-            path: write_display_config(model)?,
+            key: key.to_owned(),
+            path,
         }))
     }
 
@@ -397,6 +515,7 @@ pub fn run_ffvship(
     job: &RunInputs,
     kind: FfvshipKind,
     display_key: &str,
+    customs: &[CustomDisplay],
     on_progress: &(dyn Fn(u64) + Sync),
     on_series: &(dyn Fn(&[f64]) + Sync),
 ) -> RunOutcome {
@@ -425,7 +544,7 @@ pub fn run_ffvship(
     // Per-run display file (guard deletes it on every exit path,
     // including abort). Temp-dir write failure fails the run loudly
     // instead of silently scoring the wrong display.
-    let display_cfg = match DisplayConfig::new(display_key) {
+    let display_cfg = match DisplayConfig::new(display_key, customs) {
         Ok(cfg) => cfg,
         Err(e) => {
             log::warn!(target: "rfmetrics::metric", "{name} display file: {e}");

@@ -150,6 +150,7 @@ impl Default for RFMetricsApp {
                 cvvdp: config::CvvdpOpts {
                     display: crate::metrics::ffvship::DEFAULT_DISPLAY_KEY.to_owned(),
                     show_all: false,
+                    custom: Vec::new(),
                 },
                 view: config::ViewOpts {
                     scale_method: ScaleMethod::default(),

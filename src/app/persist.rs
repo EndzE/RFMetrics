@@ -43,6 +43,7 @@ impl crate::app::config::Config {
             cvvdp: crate::state::CvvdpState {
                 display: Some(self.cvvdp.display.clone()),
                 show_all: Some(self.cvvdp.show_all),
+                custom: Some(self.cvvdp.custom.clone()),
             },
             options: crate::state::OptionsState {
                 scaling: Some(self.view.scale_method.label().to_owned()),
@@ -188,6 +189,24 @@ impl crate::app::RFMetricsApp {
         if let Some(show_all) = s.cvvdp.show_all {
             self.config.cvvdp.show_all = show_all;
         }
+        if let Some(custom) = s.cvvdp.custom {
+            // Malformed entries are skipped, never fatal (same rule as
+            // the registry file itself); duplicates collapse onto the
+            // first keeper so one bad entry can't shadow the rest.
+            let mut kept = Vec::new();
+            for c in custom {
+                if crate::metrics::ffvship::validate_custom_display(
+                    &c.name, &c.display, None, &kept,
+                )
+                .is_ok()
+                {
+                    kept.push(c);
+                } else {
+                    log::warn!(target: "rfmetrics::state", "ignoring bad custom CVVDP display {:?}", c.name);
+                }
+            }
+            self.config.cvvdp.custom = kept;
+        }
         if let Some(scaling) = s.options.scaling
             && let Some(m) = ScaleMethod::from_label(&scaling)
         {
@@ -296,6 +315,7 @@ impl crate::app::RFMetricsApp {
         }
         if s.cvvdp.display.as_deref() != Some(self.config.cvvdp.display.as_str())
             || s.cvvdp.show_all != Some(self.config.cvvdp.show_all)
+            || s.cvvdp.custom != Some(self.config.cvvdp.custom.clone())
         {
             return true;
         }

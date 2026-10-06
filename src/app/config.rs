@@ -54,6 +54,10 @@ pub(crate) struct CvvdpOpts {
     /// "More models" checkbox: the combo lists the VideoMetricsLab 8 by
     /// default, all registry entries when set.
     pub(crate) show_all: bool,
+    /// User-saved display presets (state file); merged after the
+    /// registry at lookup, so they shadow nothing (built-in keys are
+    /// refused at save time).
+    pub(crate) custom: Vec<crate::metrics::ffvship::CustomDisplay>,
 }
 
 /// Display/run-shape options (Options panel).
