@@ -143,13 +143,14 @@ fn value_rounds_noise_keeps_summaries() {
 
 #[test]
 fn options_shapes() {
+    use crate::metrics::ffvship::CvvdpDisplay;
     assert_eq!(
-        options_for(MetricKind::Psnr, None, Some(5.0), None),
+        options_for(MetricKind::Psnr, None, Some(5.0), None, None),
         "Duration=5"
     );
-    assert_eq!(options_for(MetricKind::Psnr, None, None, None), "");
+    assert_eq!(options_for(MetricKind::Psnr, None, None, None, None), "");
     assert_eq!(
-        options_for(MetricKind::Psnr, Some(2.5), Some(12.5), None),
+        options_for(MetricKind::Psnr, Some(2.5), Some(12.5), None, None),
         "Skip=2.5, Duration=12.5"
     );
     assert_eq!(
@@ -157,9 +158,20 @@ fn options_shapes() {
             MetricKind::Vmaf,
             None,
             Some(5.0),
-            Some(("vmaf_v0.6.1.json", Pooling::Mean))
+            Some(("vmaf_v0.6.1.json", Pooling::Mean)),
+            None
         ),
         "Duration=5, Model=vmaf_v0.6.1.json, Pool=mean"
+    );
+    assert_eq!(
+        options_for(
+            MetricKind::Cvvdp,
+            None,
+            None,
+            None,
+            Some(CvvdpDisplay::Standard4k)
+        ),
+        "Display=standard_4k"
     );
     assert_eq!(trim_num(5.0), "5");
     assert_eq!(trim_num(12.5), "12.5");

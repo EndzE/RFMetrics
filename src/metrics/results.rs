@@ -74,13 +74,15 @@ pub fn trim_num(v: f64) -> String {
     }
 }
 
-/// `-Options` string (`Duration=5`; VMAF appends `Model=…`, `Pool=…`).
-/// Empty pieces are skipped, so a full-video run shows no `Duration`.
+/// `-Options` string (`Duration=5`; VMAF appends `Model=…`, `Pool=…`;
+/// CVVDP appends `Display=…`). Empty pieces are skipped, so a
+/// full-video run shows no `Duration`.
 pub fn options_for(
     kind: MetricKind,
     skip: Option<f64>,
     clip_dur: Option<f64>,
     vmaf_cfg: Option<(&str, Pooling)>,
+    cvvdp_display: Option<crate::metrics::ffvship::CvvdpDisplay>,
 ) -> String {
     let _ = kind;
     let mut parts = Vec::new();
@@ -93,6 +95,9 @@ pub fn options_for(
     if let Some((model, pooling)) = vmaf_cfg {
         parts.push(format!("Model={model}"));
         parts.push(format!("Pool={}", pooling.as_filter_str()));
+    }
+    if let Some(display) = cvvdp_display {
+        parts.push(format!("Display={}", display.label()));
     }
     parts.join(", ")
 }

@@ -126,6 +126,7 @@ fn args_shape() {
         "ref.mp4",
         "dist.mp4",
         &["--start".to_owned(), "100".to_owned()],
+        CvvdpDisplay::default(),
     );
     assert_eq!(
         a,
@@ -141,6 +142,35 @@ fn args_shape() {
             "100"
         ]
     );
+}
+
+#[test]
+fn display_model_flag_only_off_default() {
+    use FfvshipKind::Cvvdp;
+    // Default display is the binary's own: omitted (argv parity).
+    let a = build_args(Cvvdp, "r.mp4", "d.mp4", &[], CvvdpDisplay::default());
+    assert!(!a.iter().any(|s| s == "--displayModel"));
+    // Any other preset rides `--displayModel`.
+    let a = build_args(Cvvdp, "r.mp4", "d.mp4", &[], CvvdpDisplay::Standard4k);
+    assert_eq!(a[a.len() - 2..], ["--displayModel", "standard_4k"]);
+    // Non-CVVDP metrics never take the flag, even off-default.
+    let a = build_args(
+        FfvshipKind::Ssimulacra2,
+        "r.mp4",
+        "d.mp4",
+        &[],
+        CvvdpDisplay::Standard4k,
+    );
+    assert!(!a.iter().any(|s| s == "--displayModel"));
+}
+
+#[test]
+fn display_labels_round_trip() {
+    for d in CvvdpDisplay::ALL {
+        assert_eq!(CvvdpDisplay::from_label(d.label()), Some(d));
+    }
+    assert_eq!(CvvdpDisplay::from_label("standard_phone"), None);
+    assert_eq!(CvvdpDisplay::default().label(), "standard_fhd");
 }
 
 #[test]

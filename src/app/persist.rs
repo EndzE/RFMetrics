@@ -40,6 +40,9 @@ impl crate::app::config::Config {
                 subsample: Some(self.vmaf.subsample.clone()),
                 threads: Some(self.vmaf.threads.clone()),
             },
+            cvvdp: crate::state::CvvdpState {
+                display: Some(self.cvvdp.display.label().to_owned()),
+            },
             options: crate::state::OptionsState {
                 scaling: Some(self.view.scale_method.label().to_owned()),
                 fps_mode: Some(self.view.fps_mode.label().to_owned()),
@@ -176,6 +179,11 @@ impl crate::app::RFMetricsApp {
         if let Some(threads) = v.threads {
             self.config.vmaf.threads = threads;
         }
+        if let Some(display) = s.cvvdp.display
+            && let Some(m) = crate::metrics::ffvship::CvvdpDisplay::from_label(&display)
+        {
+            self.config.cvvdp.display = m;
+        }
         if let Some(scaling) = s.options.scaling
             && let Some(m) = ScaleMethod::from_label(&scaling)
         {
@@ -280,6 +288,9 @@ impl crate::app::RFMetricsApp {
             || v.subsample.as_deref() != Some(self.config.vmaf.subsample.as_str())
             || v.threads.as_deref() != Some(self.config.vmaf.threads.as_str())
         {
+            return true;
+        }
+        if s.cvvdp.display.as_deref() != Some(self.config.cvvdp.display.label()) {
             return true;
         }
         let o = &s.options;
@@ -409,6 +420,7 @@ impl crate::app::RFMetricsApp {
                             skip,
                             clip_dur,
                             vmaf_cfg,
+                            cvvdp_display,
                             ..
                         } => {
                             let cached = r.cached(kind);
@@ -416,12 +428,16 @@ impl crate::app::RFMetricsApp {
                                 .then_some(vmaf_cfg.as_ref())
                                 .flatten()
                                 .map(|c| (c.model.as_str(), c.pooling));
+                            let display = (kind == MetricKind::Cvvdp)
+                                .then_some(cvvdp_display.as_ref())
+                                .flatten()
+                                .copied();
                             Block {
                                 avg: Some(*avg),
                                 stats: cached.stats.as_ref(),
                                 finished: cached.finished.as_deref(),
                                 options: crate::metrics::results::options_for(
-                                    kind, *skip, *clip_dur, vmaf,
+                                    kind, *skip, *clip_dur, vmaf, display,
                                 ),
                             }
                         }

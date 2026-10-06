@@ -26,7 +26,6 @@ impl FfvshipKind {
             Self::Cvvdp => "CVVDP",
         }
     }
-
     /// Scores per live-output line (Butteraugli emits 3; the first is used).
     fn n_scores(self) -> usize {
         match self {
@@ -57,6 +56,52 @@ impl FfvshipKind {
             .collect(),
             Self::Cvvdp => vec!["cvvdp".to_owned()],
         }
+    }
+}
+
+/// CVVDP display model (`--displayModel`): the screen CVVDP predicts
+/// visibility on. Built-in presets verbatim from the FFVship docs
+/// (`display_models.hpp` list); user-saved models (`--displayConfig`)
+/// are out of scope. The default is the binary's own default, so it is
+/// omitted from argv (byte-identical runs to before).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CvvdpDisplay {
+    #[default]
+    StandardFhd,
+    Standard4k,
+    StandardHdrPq,
+    StandardHdrHlg,
+    StandardHdrDark,
+    StandardHdrLinearZoom,
+}
+
+impl CvvdpDisplay {
+    /// Combo order: the default first, then SDR, then HDR.
+    pub const ALL: [CvvdpDisplay; 6] = [
+        CvvdpDisplay::StandardFhd,
+        CvvdpDisplay::Standard4k,
+        CvvdpDisplay::StandardHdrPq,
+        CvvdpDisplay::StandardHdrHlg,
+        CvvdpDisplay::StandardHdrDark,
+        CvvdpDisplay::StandardHdrLinearZoom,
+    ];
+
+    /// `--displayModel` value and combo text (one and the same: the
+    /// official model keys, verified live against FFVship 5.1.1).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::StandardFhd => "standard_fhd",
+            Self::Standard4k => "standard_4k",
+            Self::StandardHdrPq => "standard_hdr_pq",
+            Self::StandardHdrHlg => "standard_hdr_hlg",
+            Self::StandardHdrDark => "standard_hdr_dark",
+            Self::StandardHdrLinearZoom => "standard_hdr_linear_zoom",
+        }
+    }
+
+    /// State-file validation (unknown labels keep the live default).
+    pub fn from_label(s: &str) -> Option<CvvdpDisplay> {
+        Self::ALL.into_iter().find(|m| m.label() == s)
     }
 }
 
@@ -172,12 +217,15 @@ fn pooled_avg(values: &[f64], kind: FfvshipKind) -> Option<f64> {
     })
 }
 
-/// Full FFVship argv (minus the exe) for one metric run.
+/// Full FFVship argv (minus the exe) for one metric run. `display` only
+/// affects CVVDP, and only off-default: the default is the binary's own,
+/// so omitting it keeps default runs byte-identical to before.
 pub fn build_args(
     kind: FfvshipKind,
     ref_path: &str,
     dist_path: &str,
     window: &[String],
+    display: CvvdpDisplay,
 ) -> Vec<String> {
     let mut args = vec![
         "-s".to_owned(),
@@ -189,6 +237,10 @@ pub fn build_args(
         "--live-score-output".to_owned(),
     ];
     args.extend(window.iter().cloned());
+    if kind == FfvshipKind::Cvvdp && display != CvvdpDisplay::default() {
+        args.push("--displayModel".to_owned());
+        args.push(display.label().to_owned());
+    }
     args
 }
 
@@ -198,6 +250,7 @@ pub fn build_args(
 pub fn run_ffvship(
     job: &RunInputs,
     kind: FfvshipKind,
+    display: CvvdpDisplay,
     on_progress: &(dyn Fn(u64) + Sync),
     on_series: &(dyn Fn(&[f64]) + Sync),
 ) -> RunOutcome {
@@ -223,7 +276,7 @@ pub fn run_ffvship(
             return fail(e);
         }
     };
-    let args = build_args(kind, ref_path, dist_path, &window);
+    let args = build_args(kind, ref_path, dist_path, &window, display);
     // `info`: the exact repro command is the core artifact of an issue
     // report (FFMetrics.log parity) — one line per metric job.
     log::info!(target: "rfmetrics::metric", "run: \"{}\" {}", exe.display(), args.join(" "));

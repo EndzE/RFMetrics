@@ -88,6 +88,13 @@ pub struct VmafState {
     pub threads: Option<String>,
 }
 
+/// CVVDP options; `None` = key absent, keep the live default.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct CvvdpState {
+    pub display: Option<String>,
+}
+
 /// Global options; `None` = key absent, keep the live default.
 /// `scaling`/`plot_size` are rfmetrics-only UI labels (no Python keys).
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -120,6 +127,7 @@ pub struct AppState {
     pub files: Option<Vec<FileEntry>>,
     pub metrics: MetricsState,
     pub vmaf: VmafState,
+    pub cvvdp: CvvdpState,
     pub options: OptionsState,
 }
 
@@ -175,6 +183,7 @@ fn salvage(text: &str) -> Option<AppState> {
         files,
         metrics: section(obj, "metrics"),
         vmaf: section(obj, "vmaf"),
+        cvvdp: section(obj, "cvvdp"),
         options: section(obj, "options"),
     })
 }

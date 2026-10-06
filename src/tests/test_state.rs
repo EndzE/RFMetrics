@@ -26,6 +26,9 @@ fn round_trip() {
             threads: Some("auto".to_owned()),
             ..Default::default()
         },
+        cvvdp: CvvdpState {
+            display: Some("standard_4k".to_owned()),
+        },
         options: OptionsState {
             scaling: Some("Bicubic".to_owned()),
             fps_mode: Some("Reference rate on both".to_owned()),

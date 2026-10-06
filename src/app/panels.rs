@@ -320,6 +320,45 @@ impl crate::app::RFMetricsApp {
                 });
             });
                 });
+                // CVVDP options box, right of VMAF options. Own gating
+                // (CVVDP tick, not VMAF tick): nesting it in the VMAF box
+                // would AND the two ticks and dim a live CVVDP setting
+                // whenever VMAF is unticked.
+                ui.vertical(|ui| {
+                    ui.add(egui::Label::new("CVVDP options").selectable(false));
+                    // Dim when running or when the CVVDP header checkbox is
+                    // off (same pattern as the VMAF box above).
+                    let cvvdp_enabled = !run_locked && self.config.metrics.cvvdp;
+                    ui.add_enabled_ui(cvvdp_enabled, |ui| {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [70.0, 18.0],
+                                    egui::Label::new("Display").selectable(false),
+                                );
+                                let _ = egui::ComboBox::from_id_salt("cvvdp_display")
+                                    .width(220.0)
+                                    .selected_text(self.config.cvvdp.display.label())
+                                    .show_ui(ui, |ui| {
+                                        use crate::metrics::ffvship::CvvdpDisplay;
+                                        for d in CvvdpDisplay::ALL {
+                                            let _ = ui.selectable_value(
+                                                &mut self.config.cvvdp.display,
+                                                d,
+                                                d.label(),
+                                            );
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(
+                                        "Display CVVDP models (FFVship --displayModel; \
+                                         default standard_fhd). A change recomputes \
+                                         just the CVVDP column",
+                                    );
+                            });
+                        });
+                    });
+                });
                 // Global options box, right of VMAF options. Gated on
                 // `!run_locked` only (not on `m_vmaf`): the scaler feeds
                 // every ffmpeg-backed metric.
@@ -712,6 +751,7 @@ impl crate::app::RFMetricsApp {
                             self.config.view.scale_method,
                             self.config.view.fps_mode,
                             self.config.reference.pixfmt,
+                            self.config.cvvdp.display,
                         )),
                         _ => None,
                     };
@@ -1015,9 +1055,12 @@ impl crate::app::RFMetricsApp {
                                         // keep their value and rank fill —
                                         // only struck-through (issue #92).
                                         let stale = match &stale_cur {
-                                            Some((s, c, vmaf, scaler, fps, pf)) => done_is_stale(
-                                                kind, cell, *s, *c, vmaf, *scaler, *fps, *pf,
-                                            ),
+                                            Some((s, c, vmaf, scaler, fps, pf, cd)) => {
+                                                done_is_stale(
+                                                    kind, cell, *s, *c, vmaf, *scaler, *fps,
+                                                    *pf, *cd,
+                                                )
+                                            }
                                             None => false,
                                         };
                                         // Idle borrows a static, Avg-selected Done

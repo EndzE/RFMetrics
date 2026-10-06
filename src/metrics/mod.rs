@@ -42,6 +42,10 @@ pub enum MetricCell {
         /// (FFVship has no `format=` stage and ignores it; selections
         /// the metric doesn't support fall back to legacy legs).
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt,
+        /// CVVDP display model the run used (`Some` for CVVDP jobs
+        /// only); a rerun under a different display recomputes just the
+        /// CVVDP column (other metrics have no display stage).
+        cvvdp_display: Option<crate::metrics::ffvship::CvvdpDisplay>,
     },
     Error {
         msg: String,

@@ -203,6 +203,10 @@ pub(crate) enum MetricMsg {
         /// column (FFVship has no `format=` stage and ignores it at
         /// compare time).
         ref_pixfmt: crate::metrics::ffmpeg::RefPixFmt,
+        /// CVVDP display model the run used (`Some` for CVVDP jobs
+        /// only); stamped onto the `Done` cell so a display change
+        /// recomputes just the CVVDP column.
+        cvvdp_display: Option<crate::metrics::ffvship::CvvdpDisplay>,
     },
     /// End of the worker loop; `aborted` settles still-Running cells to
     /// Idle while keeping finished (`Done`) results on screen.
@@ -717,6 +721,7 @@ impl crate::app::RFMetricsApp {
                     scaler,
                     fps_mode,
                     ref_pixfmt,
+                    cvvdp_display,
                 } => {
                     if generation != self.run.generation {
                         log::debug!(target: "rfmetrics::app", "discarded stale {} result", kind.name());
@@ -772,6 +777,7 @@ impl crate::app::RFMetricsApp {
                                 scaler,
                                 fps_mode,
                                 ref_pixfmt,
+                                cvvdp_display,
                             },
                         };
                         // Cache the stats once (clone+sort lives here, not
@@ -956,7 +962,10 @@ impl crate::app::RFMetricsApp {
         };
         // Validated VMAF snapshot: snapshotted before the partition so
         // VMAF `Done` stamps compare against the settings this run uses.
+        // CVVDP display likewise (frozen: a mid-run combo change must not
+        // half-apply).
         let vmaf_cfg = self.config.vmaf.current_vmaf_cfg();
+        let cvvdp_display = self.config.cvvdp.display;
         // Per metric: rows already holding a valid value sit the rerun out —
         // but only when the trim settings still match: a value computed
         // under a different skip/clip is stale and must recompute. VMAF
@@ -983,6 +992,7 @@ impl crate::app::RFMetricsApp {
                     scaler,
                     fps_mode,
                     ref_pixfmt,
+                    cvvdp_display,
                 ) && matches!(
                     self.queue.rows[i].cell(kind),
                     crate::metrics::MetricCell::Done { .. }
@@ -1193,7 +1203,13 @@ impl crate::app::RFMetricsApp {
                 let out = if kind == MetricKind::Vmaf {
                     crate::metrics::vmaf::run_vmaf(&job, &vmaf_cfg, &progress)
                 } else if let Some(fkind) = kind.ffvship_kind() {
-                    crate::metrics::ffvship::run_ffvship(&job, fkind, &progress, &series)
+                    crate::metrics::ffvship::run_ffvship(
+                        &job,
+                        fkind,
+                        cvvdp_display,
+                        &progress,
+                        &series,
+                    )
                 } else {
                     crate::metrics::ffmpeg::run_metric(&job, &progress, &series)
                 };
@@ -1226,6 +1242,11 @@ impl crate::app::RFMetricsApp {
                     ref_pixfmt,
                     vmaf_cfg: if kind == MetricKind::Vmaf {
                         Some(vmaf_cfg.clone())
+                    } else {
+                        None
+                    },
+                    cvvdp_display: if kind == MetricKind::Cvvdp {
+                        Some(cvvdp_display)
                     } else {
                         None
                     },

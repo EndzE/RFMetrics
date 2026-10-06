@@ -44,6 +44,14 @@ pub(crate) struct VmafOpts {
     pub(crate) models: Vec<String>,
 }
 
+/// CVVDP options (Options panel, own box after VMAF options).
+pub(crate) struct CvvdpOpts {
+    /// Display model CVVDP scores for (`--displayModel`, default the
+    /// binary's own `standard_fhd`). Run input: locked mid-run,
+    /// stamped onto CVVDP `Done` cells like `vmaf_cfg` is for VMAF.
+    pub(crate) display: crate::metrics::ffvship::CvvdpDisplay,
+}
+
 /// Display/run-shape options (Options panel).
 pub(crate) struct ViewOpts {
     /// Global scaling method for every `scale=` the app emits.
@@ -85,6 +93,7 @@ pub(crate) struct Config {
     pub(crate) reference: ReferenceInputs,
     pub(crate) metrics: MetricToggles,
     pub(crate) vmaf: VmafOpts,
+    pub(crate) cvvdp: CvvdpOpts,
     pub(crate) view: ViewOpts,
     pub(crate) export: ExportOpts,
 }

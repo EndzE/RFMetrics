@@ -147,6 +147,9 @@ impl Default for RFMetricsApp {
                         &crate::metrics::vmaf::vmaf_home().join("vmaf-models"),
                     ),
                 },
+                cvvdp: config::CvvdpOpts {
+                    display: crate::metrics::ffvship::CvvdpDisplay::default(),
+                },
                 view: config::ViewOpts {
                     scale_method: ScaleMethod::default(),
                     fps_mode: crate::metrics::ffmpeg::InputFpsMode::default(),
