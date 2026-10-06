@@ -6,10 +6,11 @@
 
 use crate::metrics::ffvship::CustomDisplay;
 
-/// Editor window size: snug around the 10-row form + buttons (a taller
-/// window leaves a black void; content wider clips, so this errs exact
-/// — the window stays user-resizable either way).
-const EDITOR_SIZE: [f32; 2] = [370.0, 315.0];
+/// Editor window size: wide enough for the four-button bar (~470px of
+/// buttons), which is wider than the form; the bar sets the width.
+/// Height stays snug (a taller window leaves a black void) — the window
+/// is user-resizable either way.
+const EDITOR_SIZE: [f32; 2] = [480.0, 315.0];
 
 /// Draft display values as edited (floats throughout, like the boxes;
 /// resolution rounds to ints and reflectivity edits as percent at save).
