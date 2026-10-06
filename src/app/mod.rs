@@ -154,6 +154,7 @@ impl Default for RFMetricsApp {
                     display: crate::metrics::ffvship::DEFAULT_DISPLAY_KEY.to_owned(),
                     show_all: false,
                     custom: Vec::new(),
+                    temp: None,
                 },
                 view: config::ViewOpts {
                     scale_method: ScaleMethod::default(),

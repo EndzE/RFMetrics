@@ -339,8 +339,15 @@ impl crate::app::RFMetricsApp {
                                 // as the VMAF model list above).
                                 let customs = self.config.cvvdp.custom.clone();
                                 let current = self.config.cvvdp.display.clone();
-                                let (selected, detail) =
-                                    match crate::metrics::ffvship::lookup_display(
+                                // Temp display (Apply-without-saving) wins
+                                // over the named selection; picking any named
+                                // preset below clears it again.
+                                let (selected, detail) = match &self.config.cvvdp.temp {
+                                    Some(t) => (
+                                        "Custom (not saved as a preset)".to_owned(),
+                                        crate::metrics::ffvship::describe_display("custom", t),
+                                    ),
+                                    None => match crate::metrics::ffvship::lookup_display(
                                         &current, &customs,
                                     ) {
                                         Some((name, display)) => (
@@ -350,7 +357,8 @@ impl crate::app::RFMetricsApp {
                                             ),
                                         ),
                                         None => (current.clone(), current.clone()),
-                                    };
+                                    },
+                                };
                             ui.horizontal(|ui| {
                                 ui.add_sized(
                                     [70.0, 18.0],
@@ -363,20 +371,30 @@ impl crate::app::RFMetricsApp {
                                         for m in
                                             registry.iter().filter(|m| show_all || m.vmlab)
                                         {
-                                            let _ = ui.selectable_value(
-                                                &mut self.config.cvvdp.display,
-                                                m.key.clone(),
-                                                m.name.as_str(),
-                                            );
+                                            if ui
+                                                .selectable_value(
+                                                    &mut self.config.cvvdp.display,
+                                                    m.key.clone(),
+                                                    m.name.as_str(),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.config.cvvdp.temp = None;
+                                            }
                                         }
                                         // Customs always list (they are the
                                         // user's own, like VideoMetricsLab).
                                         for c in &customs {
-                                            let _ = ui.selectable_value(
-                                                &mut self.config.cvvdp.display,
-                                                c.name.clone(),
-                                                c.name.as_str(),
-                                            );
+                                            if ui
+                                                .selectable_value(
+                                                    &mut self.config.cvvdp.display,
+                                                    c.name.clone(),
+                                                    c.name.as_str(),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.config.cvvdp.temp = None;
+                                            }
                                         }
                                     })
                                     .response
@@ -797,7 +815,9 @@ impl crate::app::RFMetricsApp {
                             self.config.view.scale_method,
                             self.config.view.fps_mode,
                             self.config.reference.pixfmt,
-                            self.config.cvvdp.display.clone(),
+                            crate::metrics::ffvship::display_stamp(
+                                &self.config.cvvdp.display_sel(),
+                            ),
                         )),
                         _ => None,
                     };

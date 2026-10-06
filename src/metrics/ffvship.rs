@@ -151,6 +151,47 @@ pub fn display_named(key: &str) -> Option<&'static DisplayModel> {
     display_registry().iter().find(|m| m.key == key)
 }
 
+/// Normalized display object (registry entries, customs, temp): the
+/// `--displayConfig` file content per model key.
+pub type DisplayMap = serde_json::Map<String, serde_json::Value>;
+
+/// `--displayModel` key for ad-hoc (Apply-without-saving) displays: the
+/// temp file carries the values, so the key is only a label.
+pub const CUSTOM_KEY: &str = "custom";
+
+/// Resolved display selection for one run (owned: crosses into the
+/// worker thread). Named selections carry no map (registry lookup at
+/// run time); temp selections carry their values.
+#[derive(Debug, Clone)]
+pub struct DisplaySel {
+    pub key: String,
+    pub map: Option<DisplayMap>,
+}
+
+/// Provenance stamp: the key for named displays, the canonical JSON for
+/// temp ones. Exact values must participate in equality — two different
+/// temps must never compare equal (stale detection) nor merge in the
+/// results file.
+pub fn display_stamp(sel: &DisplaySel) -> String {
+    match &sel.map {
+        Some(m) => serde_json::to_string(m).unwrap_or_default(),
+        None => sel.key.clone(),
+    }
+}
+
+/// Key of the entry (customs first) whose display object equals the
+/// given one, if any (Apply-without-saving prefers selecting it over
+/// minting temp state).
+pub fn match_display(display: &DisplayMap, customs: &[CustomDisplay]) -> Option<String> {
+    if let Some(c) = customs.iter().find(|c| c.display == *display) {
+        return Some(c.name.clone());
+    }
+    display_registry()
+        .iter()
+        .find(|m| m.display == *display)
+        .map(|m| m.key.clone())
+}
+
 /// User-saved display preset (state file): a name plus a normalized
 /// display object in registry shape. Saved through the display editor,
 /// which validates values before they can land here.
@@ -200,7 +241,6 @@ pub fn validate_custom_display(
     replacing: Option<&str>,
     customs: &[CustomDisplay],
 ) -> Result<(), String> {
-    let num = |f: &str| display.get(f).and_then(|v| v.as_f64());
     let name = name.trim();
     if name.is_empty() {
         return Err("Type a name for the preset.".to_owned());
@@ -211,6 +251,15 @@ pub fn validate_custom_display(
             "There is already a preset called \"{name}\". Choose another name."
         ));
     }
+    validate_display_values(display)
+}
+
+/// Validate display values alone (no name involved): shared by saving
+/// (via `validate_custom_display`) and Apply-without-saving.
+pub fn validate_display_values(
+    display: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let num = |f: &str| display.get(f).and_then(|v| v.as_f64());
     let float_in =
         |f: &str, lo: f64, hi: f64| num(f).is_some_and(|v| v.is_finite() && (lo..=hi).contains(&v));
     let res_ok = display
@@ -350,6 +399,15 @@ impl DisplayConfig {
             key: key.to_owned(),
             path,
         }))
+    }
+
+    /// Temp display: values writer-provided, key is only a label
+    /// (`CUSTOM_KEY`). Never fails closed (a temp always has values).
+    pub fn with_map(key: &str, display: &DisplayMap) -> std::io::Result<Self> {
+        Ok(Self {
+            key: key.to_owned(),
+            path: write_display_config(key, display)?,
+        })
     }
 
     /// `(key, path)` argv pair.
@@ -514,7 +572,7 @@ pub fn build_args(
 pub fn run_ffvship(
     job: &RunInputs,
     kind: FfvshipKind,
-    display_key: &str,
+    sel: &DisplaySel,
     customs: &[CustomDisplay],
     on_progress: &(dyn Fn(u64) + Sync),
     on_series: &(dyn Fn(&[f64]) + Sync),
@@ -542,9 +600,14 @@ pub fn run_ffvship(
         }
     };
     // Per-run display file (guard deletes it on every exit path,
-    // including abort). Temp-dir write failure fails the run loudly
-    // instead of silently scoring the wrong display.
-    let display_cfg = match DisplayConfig::new(display_key, customs) {
+    // including abort). Temp selections write their own values; named
+    // keys resolve the registry. Temp-dir write failure fails the run
+    // loudly instead of silently scoring the wrong display.
+    let display_cfg = match &sel.map {
+        Some(m) => DisplayConfig::with_map(&sel.key, m).map(Some),
+        None => DisplayConfig::new(&sel.key, customs),
+    };
+    let display_cfg = match display_cfg {
         Ok(cfg) => cfg,
         Err(e) => {
             log::warn!(target: "rfmetrics::metric", "{name} display file: {e}");

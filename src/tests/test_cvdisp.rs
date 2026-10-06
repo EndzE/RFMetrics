@@ -109,3 +109,39 @@ fn delete_flows() {
     assert!(delete_custom(&mut list, "Mine"));
     assert!(list.is_empty());
 }
+
+/// Selecting a named preset clears any temp display; snapshots carry
+/// keys for named selections and values for temp ones.
+#[test]
+fn select_clears_temp_and_sel_snapshots() {
+    use crate::app::RFMetricsApp;
+    use crate::metrics::ffvship::{CUSTOM_KEY, display_stamp};
+    let mut app = RFMetricsApp::default();
+    let sel = app.config.cvvdp.display_sel();
+    assert_eq!(sel.key, "standard_fhd");
+    assert!(sel.map.is_none());
+    assert_eq!(display_stamp(&sel), "standard_fhd");
+    // Temp overrides with values.
+    let map: crate::metrics::ffvship::DisplayMap =
+        serde_json::from_str(r#"{"max_luminance":200}"#).unwrap();
+    app.config.cvvdp.temp = Some(map);
+    let sel = app.config.cvvdp.display_sel();
+    assert_eq!(sel.key, CUSTOM_KEY);
+    let stamp = display_stamp(&sel);
+    assert!(stamp.contains("\"max_luminance\":200"), "{stamp}");
+    // Selecting clears temp; state apply never touches it.
+    app.config.cvvdp.select("standard_4k".to_owned());
+    assert_eq!(app.config.cvvdp.display, "standard_4k");
+    assert!(app.config.cvvdp.temp.is_none());
+    app.config.cvvdp.temp = Some(serde_json::from_str(r#"{"max_luminance":200}"#).unwrap());
+    app.apply_state(Some(crate::state::AppState {
+        cvvdp: crate::state::CvvdpState {
+            display: Some("standard_hdr_pq".to_owned()),
+            show_all: None,
+            custom: None,
+        },
+        ..Default::default()
+    }));
+    assert_eq!(app.config.cvvdp.display, "standard_hdr_pq");
+    assert!(app.config.cvvdp.temp.is_some());
+}

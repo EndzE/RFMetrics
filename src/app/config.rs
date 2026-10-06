@@ -58,6 +58,32 @@ pub(crate) struct CvvdpOpts {
     /// registry at lookup, so they shadow nothing (built-in keys are
     /// refused at save time).
     pub(crate) custom: Vec<crate::metrics::ffvship::CustomDisplay>,
+    /// Ad-hoc display from Apply-without-saving (session-only, never
+    /// persisted): overrides the named selection while set.
+    pub(crate) temp: Option<crate::metrics::ffvship::DisplayMap>,
+}
+
+impl CvvdpOpts {
+    /// Select a named preset (clears any temp display).
+    pub(crate) fn select(&mut self, key: String) {
+        self.display = key;
+        self.temp = None;
+    }
+
+    /// Owned selection snapshot for a run / stale check: temp values
+    /// travel with the `custom` key, named selections by key alone.
+    pub(crate) fn display_sel(&self) -> crate::metrics::ffvship::DisplaySel {
+        match &self.temp {
+            Some(m) => crate::metrics::ffvship::DisplaySel {
+                key: crate::metrics::ffvship::CUSTOM_KEY.to_owned(),
+                map: Some(m.clone()),
+            },
+            None => crate::metrics::ffvship::DisplaySel {
+                key: self.display.clone(),
+                map: None,
+            },
+        }
+    }
 }
 
 /// Display/run-shape options (Options panel).

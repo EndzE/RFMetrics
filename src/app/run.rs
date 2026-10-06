@@ -965,7 +965,8 @@ impl crate::app::RFMetricsApp {
         // CVVDP display likewise (frozen: a mid-run combo change must not
         // half-apply).
         let vmaf_cfg = self.config.vmaf.current_vmaf_cfg();
-        let cvvdp_display = self.config.cvvdp.display.clone();
+        let cvvdp_sel = self.config.cvvdp.display_sel();
+        let cvvdp_stamp = crate::metrics::ffvship::display_stamp(&cvvdp_sel);
         let cvvdp_custom = self.config.cvvdp.custom.clone();
         // Per metric: rows already holding a valid value sit the rerun out —
         // but only when the trim settings still match: a value computed
@@ -993,7 +994,7 @@ impl crate::app::RFMetricsApp {
                     scaler,
                     fps_mode,
                     ref_pixfmt,
-                    &cvvdp_display,
+                    &cvvdp_stamp,
                 ) && matches!(
                     self.queue.rows[i].cell(kind),
                     crate::metrics::MetricCell::Done { .. }
@@ -1211,7 +1212,7 @@ impl crate::app::RFMetricsApp {
                     crate::metrics::ffvship::run_ffvship(
                         &job,
                         fkind,
-                        &cvvdp_display,
+                        &cvvdp_sel,
                         &cvvdp_custom,
                         &progress,
                         &series,
@@ -1252,7 +1253,7 @@ impl crate::app::RFMetricsApp {
                         None
                     },
                     cvvdp_display: if kind == MetricKind::Cvvdp {
-                        Some(cvvdp_display.clone())
+                        Some(crate::metrics::ffvship::display_stamp(&cvvdp_sel))
                     } else {
                         None
                     },

@@ -316,6 +316,69 @@ fn heights_ratio_matches_reference() {
 }
 
 #[test]
+fn display_stamp_keys_and_values() {
+    let named = DisplaySel {
+        key: "standard_4k".to_owned(),
+        map: None,
+    };
+    assert_eq!(display_stamp(&named), "standard_4k");
+    // Temp stamps carry the values (two different temps never compare
+    // equal) and are deterministic.
+    let temp = DisplaySel {
+        key: CUSTOM_KEY.to_owned(),
+        map: Some(valid_display()),
+    };
+    let s1 = display_stamp(&temp);
+    assert!(s1.contains("\"max_luminance\":200"), "{s1}");
+    assert_eq!(s1, display_stamp(&temp));
+    let mut other = valid_display();
+    other.insert("max_luminance".to_owned(), serde_json::Value::from(201));
+    let temp2 = DisplaySel {
+        key: CUSTOM_KEY.to_owned(),
+        map: Some(other),
+    };
+    assert_ne!(s1, display_stamp(&temp2));
+}
+
+#[test]
+fn match_display_prefers_customs() {
+    let map = valid_display();
+    let customs = vec![CustomDisplay {
+        name: "Mine".to_owned(),
+        display: map.clone(),
+    }];
+    assert_eq!(match_display(&map, &customs), Some("Mine".to_owned()));
+    // Registry hit without customs.
+    let reg = display_named("standard_fhd").unwrap();
+    assert_eq!(
+        match_display(&reg.display, &[]),
+        Some("standard_fhd".to_owned())
+    );
+    // No match anywhere.
+    let mut other = map.clone();
+    other.insert("max_luminance".to_owned(), serde_json::Value::from(201));
+    assert_eq!(match_display(&other, &[]), None);
+}
+
+#[test]
+fn with_map_writes_keyed_object() {
+    let map = valid_display();
+    let path = {
+        let cfg = DisplayConfig::with_map("custom", &map).unwrap();
+        let (key, path) = cfg.argv();
+        assert_eq!(key, "custom");
+        let text = std::fs::read_to_string(path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            v.get("custom").and_then(|m| m.get("max_luminance")),
+            Some(&serde_json::Value::from(200))
+        );
+        path.to_path_buf()
+    };
+    assert!(!path.exists());
+}
+
+#[test]
 fn display_config_guard_writes_and_cleans() {
     let customs = vec![CustomDisplay {
         name: "Mine".to_owned(),

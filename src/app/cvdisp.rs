@@ -303,9 +303,13 @@ impl crate::app::RFMetricsApp {
         });
     }
 
-    /// Current display object (validated selection ⇒ lookup hits; the
-    /// binary default map is the unreachable fallback).
+    /// Current effective display object: temp values while an
+    /// Apply-without-saving is active (validated selection ⇒ lookup hits
+    /// otherwise; the binary default map is the unreachable fallback).
     fn current_display_map(&self) -> DisplayMap {
+        if let Some(t) = &self.config.cvvdp.temp {
+            return t.clone();
+        }
         crate::metrics::ffvship::lookup_display(
             &self.config.cvvdp.display,
             &self.config.cvvdp.custom,
@@ -395,6 +399,9 @@ impl crate::app::RFMetricsApp {
                     }
                     if ui.button("Save as new preset").clicked() {
                         self.cvdisp_save(now, true, &mut close);
+                    }
+                    if !self.cvdisp.adding && ui.button("Apply without saving").clicked() {
+                        self.cvdisp_apply(&mut close);
                     }
                     let can_save = self.cvdisp.own.is_some() && !self.cvdisp.adding;
                     if can_save && ui.button("Save preset").clicked() {
@@ -577,9 +584,9 @@ impl crate::app::RFMetricsApp {
         }
     }
 
-    /// Run one save flow: build + preserve + validate, then store, select
-    /// (except Add, which never touches the selection), toast, and close.
-    /// `as_new`: Save-as-new button (else the Save-preset button).
+    /// Run one save flow: build + preserve + validate, then store,
+    /// always select the saved preset, toast, and close. `as_new`:
+    /// Save-as-new button (else the Save-preset button).
     fn cvdisp_save(&mut self, now: f64, as_new: bool, close: &mut bool) {
         let replacing = if as_new {
             None
@@ -596,9 +603,7 @@ impl crate::app::RFMetricsApp {
         ) {
             Ok(saved) => {
                 let renamed = replacing.as_deref().is_some_and(|o| o != saved);
-                if !self.cvdisp.adding {
-                    self.config.cvvdp.display = saved.clone();
-                }
+                self.config.cvvdp.select(saved.clone());
                 self.ui.toast(
                     now,
                     if renamed {
@@ -617,6 +622,24 @@ impl crate::app::RFMetricsApp {
             }
             Err(e) => self.cvdisp.warning = e,
         }
+    }
+
+    /// Apply-without-saving (Edit mode only): validated draft values take
+    /// effect at once without creating a preset. Values matching a known
+    /// preset select it instead of minting temp state; anything else lands
+    /// in the session-only temp slot (never persisted).
+    fn cvdisp_apply(&mut self, close: &mut bool) {
+        let map = self.cvdisp.built_map();
+        if let Err(e) = crate::metrics::ffvship::validate_display_values(&map) {
+            self.cvdisp.warning = e;
+            return;
+        }
+        if let Some(key) = crate::metrics::ffvship::match_display(&map, &self.config.cvvdp.custom) {
+            self.config.cvvdp.select(key);
+        } else {
+            self.config.cvvdp.temp = Some(map);
+        }
+        *close = true;
     }
 }
 
