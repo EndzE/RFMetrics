@@ -54,3 +54,5 @@
 ## Original Inspiration
 
 [**fifonik/FFMetrics**](https://github.com/fifonik/FFMetrics)
+
+[**4KVCD/VideoMetricsLab**](https://github.com/4KVCD/VideoMetricsLab)
