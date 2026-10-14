@@ -338,38 +338,38 @@ impl crate::app::RFMetricsApp {
                                     [70.0, 18.0],
                                     egui::Label::new("CSV folder").selectable(false),
                                 );
-                                // Bounded display (full path stays in the hover);
-                                // the worker snapshots the real string at Start.
-                                let full = self.config.export.csv_dir.clone();
-                                let shown = if full.trim().is_empty() {
-                                    "Beside distorted files".to_owned()
-                                } else if full.chars().count() > 40 {
-                                    format!(
-                                        "…{}",
-                                        full.chars().skip(full.chars().count() - 39).collect::<String>()
-                                    )
-                                } else {
-                                    full.clone()
-                                };
-                                ui.label(shown).on_hover_text(if full.trim().is_empty() {
-                                    "Empty: each CSV lands next to its distorted file".to_owned()
-                                } else {
-                                    full
-                                });
-                                if ui.button("Browse…").clicked()
-                                    && let Some(dir) = rfd::FileDialog::new()
-                                        .set_title("CSV output folder")
-                                        .pick_folder()
-                                {
-                                    self.config.export.csv_dir = dir.to_string_lossy().into_owned();
-                                }
-                                if ui
-                                    .button("Clear")
-                                    .on_hover_text("Back to beside-the-distorted-file")
-                                    .clicked()
-                                {
-                                    self.config.export.csv_dir.clear();
-                                }
+                                // Right-to-left so the buttons claim their
+                                // width first and the field fills the rest
+                                // (Path-to-file parity); empty shows the
+                                // default as a hint. The worker snapshots
+                                // the real string at Start.
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .button("Clear")
+                                            .on_hover_text("Back to beside-the-distorted-file")
+                                            .clicked()
+                                        {
+                                            self.config.export.csv_dir.clear();
+                                        }
+                                        if ui.button("Browse…").clicked()
+                                            && let Some(dir) = rfd::FileDialog::new()
+                                                .set_title("CSV output folder")
+                                                .pick_folder()
+                                        {
+                                            self.config.export.csv_dir =
+                                                dir.to_string_lossy().into_owned();
+                                        }
+                                        let _ = ui.add(
+                                            egui::TextEdit::singleline(
+                                                &mut self.config.export.csv_dir,
+                                            )
+                                            .hint_text("Beside distorted files")
+                                            .desired_width(f32::INFINITY),
+                                        );
+                                    },
+                                );
                             });
                             let _ = ui
                                 .add(egui::Checkbox::new(
@@ -385,51 +385,58 @@ impl crate::app::RFMetricsApp {
                                     [70.0, 18.0],
                                     egui::Label::new("Results file").selectable(false),
                                 );
-                                // Bounded display (full path stays in the hover);
-                                // resolved (custom or exe-dir default) at save time.
-                                let full = self.config.export.results_path.clone();
-                                let empty = full.trim().is_empty();
-                                let shown = if empty {
-                                    "RFMetrics.Results.csv next to exe".to_owned()
-                                } else if full.chars().count() > 40 {
-                                    format!(
-                                        "…{}",
-                                        full.chars().skip(full.chars().count() - 39).collect::<String>()
-                                    )
-                                } else {
-                                    full.clone()
-                                };
-                                ui.label(shown).on_hover_text(if empty {
-                                    crate::metrics::results::default_results_path()
-                                        .to_string_lossy()
-                                        .into_owned()
-                                } else {
-                                    full.clone()
-                                });
-                                if ui.button("Browse…").clicked() {
-                                    let mut dialog = rfd::FileDialog::new()
-                                        .set_title("Results file")
-                                        .add_filter("CSV file", &["csv"]);
-                                    if empty {
-                                        dialog = dialog.set_file_name(
-                                            crate::metrics::results::RESULTS_FILE_NAME,
+                                // Right-to-left so the buttons claim their
+                                // width first and the field fills the rest
+                                // (Path-to-file parity); empty shows the
+                                // default as a hint. Resolved (custom or
+                                // exe-dir default) at save time.
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .button("Clear")
+                                            .on_hover_text("Back to next-to-the-exe default")
+                                            .clicked()
+                                        {
+                                            self.config.export.results_path.clear();
+                                        }
+                                        if ui.button("Browse…").clicked() {
+                                            let empty = self
+                                                .config
+                                                .export
+                                                .results_path
+                                                .trim()
+                                                .is_empty();
+                                            let mut dialog = rfd::FileDialog::new()
+                                                .set_title("Results file")
+                                                .add_filter("CSV file", &["csv"]);
+                                            if empty {
+                                                dialog = dialog.set_file_name(
+                                                    crate::metrics::results::RESULTS_FILE_NAME,
+                                                );
+                                            } else {
+                                                dialog = dialog.set_file_name(
+                                                    &self.config.export.results_path,
+                                                );
+                                            }
+                                            if let Some(mut path) = dialog.save_file() {
+                                                path.set_extension("csv");
+                                                self.config.export.results_path =
+                                                    path.to_string_lossy().into_owned();
+                                            }
+                                        }
+                                        let _ = ui.add(
+                                            egui::TextEdit::singleline(
+                                                &mut self.config.export.results_path,
+                                            )
+                                            .hint_text(format!(
+                                                "{} next to exe",
+                                                crate::metrics::results::RESULTS_FILE_NAME,
+                                            ))
+                                            .desired_width(f32::INFINITY),
                                         );
-                                    } else {
-                                        dialog = dialog.set_file_name(&full);
-                                    }
-                                    if let Some(mut path) = dialog.save_file() {
-                                        path.set_extension("csv");
-                                        self.config.export.results_path =
-                                            path.to_string_lossy().into_owned();
-                                    }
-                                }
-                                if ui
-                                    .button("Clear")
-                                    .on_hover_text("Back to next-to-the-exe default")
-                                    .clicked()
-                                {
-                                    self.config.export.results_path.clear();
-                                }
+                                    },
+                                );
                             });
                         });
                     });
