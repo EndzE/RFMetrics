@@ -319,6 +319,120 @@ impl crate::app::RFMetricsApp {
                     });
                 });
             });
+                    // Unnamed export box under VMAF options (keeps the
+                    // Options box narrow enough to fit at 1300px).
+                    ui.add_enabled_ui(!run_locked, |ui| {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            let _ = ui
+                                .add(egui::Checkbox::new(
+                                    &mut self.config.export.csv_export,
+                                    "Save frames metrics to CSV files",
+                                ))
+                                .on_hover_text(
+                                    "Write one <name>.<METRIC>.csv per finished run \
+                                     (TAB-separated per-frame values), to the chosen CSV folder \
+                                     or beside each distorted file when empty",
+                                );
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [70.0, 18.0],
+                                    egui::Label::new("CSV folder").selectable(false),
+                                );
+                                // Bounded display (full path stays in the hover);
+                                // the worker snapshots the real string at Start.
+                                let full = self.config.export.csv_dir.clone();
+                                let shown = if full.trim().is_empty() {
+                                    "Beside distorted files".to_owned()
+                                } else if full.chars().count() > 40 {
+                                    format!(
+                                        "…{}",
+                                        full.chars().skip(full.chars().count() - 39).collect::<String>()
+                                    )
+                                } else {
+                                    full.clone()
+                                };
+                                ui.label(shown).on_hover_text(if full.trim().is_empty() {
+                                    "Empty: each CSV lands next to its distorted file".to_owned()
+                                } else {
+                                    full
+                                });
+                                if ui.button("Browse…").clicked()
+                                    && let Some(dir) = rfd::FileDialog::new()
+                                        .set_title("CSV output folder")
+                                        .pick_folder()
+                                {
+                                    self.config.export.csv_dir = dir.to_string_lossy().into_owned();
+                                }
+                                if ui
+                                    .button("Clear")
+                                    .on_hover_text("Back to beside-the-distorted-file")
+                                    .clicked()
+                                {
+                                    self.config.export.csv_dir.clear();
+                                }
+                            });
+                            let _ = ui
+                                .add(egui::Checkbox::new(
+                                    &mut self.config.export.results_autosave,
+                                    "Auto-save results",
+                                ))
+                                .on_hover_text(
+                                    "Append one row per queued file to the results file \
+                                     when each run ends, stopped runs included",
+                                );
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [70.0, 18.0],
+                                    egui::Label::new("Results file").selectable(false),
+                                );
+                                // Bounded display (full path stays in the hover);
+                                // resolved (custom or exe-dir default) at save time.
+                                let full = self.config.export.results_path.clone();
+                                let empty = full.trim().is_empty();
+                                let shown = if empty {
+                                    "RFMetrics.Results.csv next to exe".to_owned()
+                                } else if full.chars().count() > 40 {
+                                    format!(
+                                        "…{}",
+                                        full.chars().skip(full.chars().count() - 39).collect::<String>()
+                                    )
+                                } else {
+                                    full.clone()
+                                };
+                                ui.label(shown).on_hover_text(if empty {
+                                    crate::metrics::results::default_results_path()
+                                        .to_string_lossy()
+                                        .into_owned()
+                                } else {
+                                    full.clone()
+                                });
+                                if ui.button("Browse…").clicked() {
+                                    let mut dialog = rfd::FileDialog::new()
+                                        .set_title("Results file")
+                                        .add_filter("CSV file", &["csv"]);
+                                    if empty {
+                                        dialog = dialog.set_file_name(
+                                            crate::metrics::results::RESULTS_FILE_NAME,
+                                        );
+                                    } else {
+                                        dialog = dialog.set_file_name(&full);
+                                    }
+                                    if let Some(mut path) = dialog.save_file() {
+                                        path.set_extension("csv");
+                                        self.config.export.results_path =
+                                            path.to_string_lossy().into_owned();
+                                    }
+                                }
+                                if ui
+                                    .button("Clear")
+                                    .on_hover_text("Back to next-to-the-exe default")
+                                    .clicked()
+                                {
+                                    self.config.export.results_path.clear();
+                                }
+                            });
+                        });
+                    });
                 });
                 // CVVDP options box, right of VMAF options. Own gating
                 // (CVVDP tick, not VMAF tick): nesting it in the VMAF box
@@ -427,7 +541,6 @@ impl crate::app::RFMetricsApp {
                     ui.add(egui::Label::new("Options").selectable(false));
                     ui.add_enabled_ui(!run_locked, |ui| {
                         egui::Frame::group(ui.style()).show(ui, |ui| {
-                            ui.horizontal_top(|ui| {
                                 ui.vertical(|ui| {
                             ui.horizontal(|ui| {
                                 ui.add_sized(
@@ -571,117 +684,6 @@ impl crate::app::RFMetricsApp {
                                 self.refresh_media_info();
                             }
                                 });
-                                ui.vertical(|ui| {
-                            let _ = ui
-                                .add(egui::Checkbox::new(
-                                    &mut self.config.export.csv_export,
-                                    "Save frames metrics to CSV files",
-                                ))
-                                .on_hover_text(
-                                    "Write one <name>.<METRIC>.csv per finished run \
-                                     (TAB-separated per-frame values), to the chosen CSV folder \
-                                     or beside each distorted file when empty",
-                                );
-                            ui.horizontal(|ui| {
-                                ui.add_sized(
-                                    [70.0, 18.0],
-                                    egui::Label::new("CSV folder").selectable(false),
-                                );
-                                // Bounded display (full path stays in the hover);
-                                // the worker snapshots the real string at Start.
-                                let full = self.config.export.csv_dir.clone();
-                                let shown = if full.trim().is_empty() {
-                                    "Beside distorted files".to_owned()
-                                } else if full.chars().count() > 40 {
-                                    format!(
-                                        "…{}",
-                                        full.chars().skip(full.chars().count() - 39).collect::<String>()
-                                    )
-                                } else {
-                                    full.clone()
-                                };
-                                ui.label(shown).on_hover_text(if full.trim().is_empty() {
-                                    "Empty: each CSV lands next to its distorted file".to_owned()
-                                } else {
-                                    full
-                                });
-                                if ui.button("Browse…").clicked()
-                                    && let Some(dir) = rfd::FileDialog::new()
-                                        .set_title("CSV output folder")
-                                        .pick_folder()
-                                {
-                                    self.config.export.csv_dir = dir.to_string_lossy().into_owned();
-                                }
-                                if ui
-                                    .button("Clear")
-                                    .on_hover_text("Back to beside-the-distorted-file")
-                                    .clicked()
-                                {
-                                    self.config.export.csv_dir.clear();
-                                }
-                            });
-                            let _ = ui
-                                .add(egui::Checkbox::new(
-                                    &mut self.config.export.results_autosave,
-                                    "Auto-save results",
-                                ))
-                                .on_hover_text(
-                                    "Append one row per queued file to the results file \
-                                     when each run ends, stopped runs included",
-                                );
-                            ui.horizontal(|ui| {
-                                ui.add_sized(
-                                    [70.0, 18.0],
-                                    egui::Label::new("Results file").selectable(false),
-                                );
-                                // Bounded display (full path stays in the hover);
-                                // resolved (custom or exe-dir default) at save time.
-                                let full = self.config.export.results_path.clone();
-                                let empty = full.trim().is_empty();
-                                let shown = if empty {
-                                    "RFMetrics.Results.csv next to exe".to_owned()
-                                } else if full.chars().count() > 40 {
-                                    format!(
-                                        "…{}",
-                                        full.chars().skip(full.chars().count() - 39).collect::<String>()
-                                    )
-                                } else {
-                                    full.clone()
-                                };
-                                ui.label(shown).on_hover_text(if empty {
-                                    crate::metrics::results::default_results_path()
-                                        .to_string_lossy()
-                                        .into_owned()
-                                } else {
-                                    full.clone()
-                                });
-                                if ui.button("Browse…").clicked() {
-                                    let mut dialog = rfd::FileDialog::new()
-                                        .set_title("Results file")
-                                        .add_filter("CSV file", &["csv"]);
-                                    if empty {
-                                        dialog = dialog.set_file_name(
-                                            crate::metrics::results::RESULTS_FILE_NAME,
-                                        );
-                                    } else {
-                                        dialog = dialog.set_file_name(&full);
-                                    }
-                                    if let Some(mut path) = dialog.save_file() {
-                                        path.set_extension("csv");
-                                        self.config.export.results_path =
-                                            path.to_string_lossy().into_owned();
-                                    }
-                                }
-                                if ui
-                                    .button("Clear")
-                                    .on_hover_text("Back to next-to-the-exe default")
-                                    .clicked()
-                                {
-                                    self.config.export.results_path.clear();
-                                }
-                            });
-                                });
-                            });
                         });
                     });
                 });
