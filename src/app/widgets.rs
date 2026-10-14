@@ -190,11 +190,17 @@ pub(crate) fn fmt_spin(v: f64, decimals: usize) -> String {
     }
 }
 
+/// Hold-to-repeat cadence for spinbox chevrons (Plot goto parity:
+/// first repeat after a short delay, then a steady cadence).
+const SPIN_FIRST_DELAY_S: f64 = 0.4;
+const SPIN_REPEAT_S: f64 = 0.05;
+
 /// Go-to-frame-style spinbox (Plot parity): frameless typed field plus
-/// bare ^/v chevrons in one text-edit-styled frame. No dragging —
-/// chevrons click-step by `step`, clamped to `range`; typed text parses
-/// live (unparseable keeps the old value). Returns the outer frame
-/// response for hover tips.
+/// bare ^/v chevrons in one text-edit-styled frame. No dragging — a
+/// press steps at once and holding repeats on the cadence above;
+/// typed text parses live (unparseable keeps the old value). The hold
+/// latch lives in egui temp data per field, so callers keep no state.
+/// Returns the outer frame response for hover tips.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spinbox(
     ui: &mut egui::Ui,
@@ -239,13 +245,52 @@ pub(crate) fn spinbox(
                 {
                     *value = v.clamp(*range.start(), *range.end());
                 }
-                if step_button(ui, true, false).clicked() {
-                    *value = spin_step(*value, true, step, range.clone());
+                // Hold-to-repeat (goto parity): a fresh press steps at
+                // once and latches; the latch fires on cadence off the
+                // physical button state and drops on release, so the next
+                // press steps at once. `clicked` covers keyboard
+                // activation; the latch guard keeps a mouse release from
+                // double-stepping. Repaints run continuously while held
+                // so the cadence fires on an idle tick.
+                let now = ui.input(|i| i.time);
+                let down = ui.input(|i| i.pointer.primary_down());
+                let mut latch: Option<(i8, f64)> = ui.data(|data| data.get_temp(tid));
+                let mut held = latch.map(|(dir, _)| dir);
+                let up = step_button(ui, true, held == Some(1));
+                let dn = step_button(ui, false, held == Some(-1));
+                let mut step_dir = 0i8;
+                for (resp, dir) in [(&up, 1i8), (&dn, -1i8)] {
+                    if resp.is_pointer_button_down_on() && held != Some(dir) {
+                        step_dir = dir;
+                        held = Some(dir);
+                        latch = Some((dir, now + SPIN_FIRST_DELAY_S));
+                    } else if resp.clicked() && held != Some(dir) {
+                        step_dir = dir;
+                    }
+                }
+                match (down, held) {
+                    (true, Some(_)) => {
+                        if latch.is_some_and(|(_, next)| now >= next) {
+                            step_dir = held.unwrap_or(0);
+                            latch = held.map(|dir| (dir, now + SPIN_REPEAT_S));
+                        }
+                        ui.ctx().request_repaint();
+                    }
+                    _ => {
+                        latch = None;
+                    }
+                }
+                if step_dir != 0 {
+                    *value = spin_step(*value, step_dir > 0, step, range.clone());
                     *text = fmt_spin(*value, decimals);
                 }
-                if step_button(ui, false, false).clicked() {
-                    *value = spin_step(*value, false, step, range.clone());
-                    *text = fmt_spin(*value, decimals);
+                match latch {
+                    Some(held) => {
+                        ui.data_mut(|data| data.insert_temp(tid, held));
+                    }
+                    None => {
+                        ui.data_mut(|data| data.remove_temp::<(i8, f64)>(tid));
+                    }
                 }
             });
         })
