@@ -169,6 +169,89 @@ pub(crate) fn step_button(ui: &mut egui::Ui, up: bool, held: bool) -> egui::Resp
     resp
 }
 
+/// Chevron click step with range clamp (spinbox behavior, pure for tests).
+pub(crate) fn spin_step(
+    value: f64,
+    up: bool,
+    step: f64,
+    range: std::ops::RangeInclusive<f64>,
+) -> f64 {
+    (if up { value + step } else { value - step }).clamp(*range.start(), *range.end())
+}
+
+/// Display formatting for spinbox buffers: fixed decimals with the
+/// DragValue look (no trailing zeros: "24", not "24.0").
+pub(crate) fn fmt_spin(v: f64, decimals: usize) -> String {
+    let s = format!("{v:.decimals$}");
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_owned()
+    } else {
+        s
+    }
+}
+
+/// Go-to-frame-style spinbox (Plot parity): frameless typed field plus
+/// bare ^/v chevrons in one text-edit-styled frame. No dragging —
+/// chevrons click-step by `step`, clamped to `range`; typed text parses
+/// live (unparseable keeps the old value). Returns the outer frame
+/// response for hover tips.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spinbox(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    text: &mut String,
+    value: &mut f64,
+    step: f64,
+    range: std::ops::RangeInclusive<f64>,
+    decimals: usize,
+    field_w: f32,
+) -> egui::Response {
+    let tid = egui::Id::new(("spinbox", id));
+    // Previous-frame focus (same one-frame lag as the goto field: the
+    // frame must draw before this frame's field response exists).
+    let focused = ui.memory(|mem| mem.has_focus(tid));
+    let frame = egui::Frame::new()
+        .fill(ui.visuals().text_edit_bg_color())
+        .corner_radius(ui.visuals().widgets.inactive.corner_radius)
+        .stroke(if focused {
+            ui.visuals().selection.stroke
+        } else {
+            egui::Stroke::new(1.0, egui::Color32::TRANSPARENT)
+        })
+        .inner_margin(egui::Margin {
+            left: 6,
+            right: 3,
+            top: 2,
+            bottom: 2,
+        });
+    frame
+        .show(ui, |ui| {
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let field = ui.add(
+                    egui::TextEdit::singleline(text)
+                        .id(tid)
+                        .frame(egui::Frame::NONE)
+                        .desired_width(field_w),
+                );
+                if field.changed()
+                    && let Ok(v) = text.trim().parse::<f64>()
+                {
+                    *value = v.clamp(*range.start(), *range.end());
+                }
+                if step_button(ui, true, false).clicked() {
+                    *value = spin_step(*value, true, step, range.clone());
+                    *text = fmt_spin(*value, decimals);
+                }
+                if step_button(ui, false, false).clicked() {
+                    *value = spin_step(*value, false, step, range.clone());
+                    *text = fmt_spin(*value, decimals);
+                }
+            });
+        })
+        .response
+}
+
 /// Hover tooltip that wraps instead of clipping: viewport-bound popups
 /// cut long single-line texts (e.g. in the narrow preset editor), so
 /// informational hovers go through this. Fixed max width, full text kept.

@@ -155,6 +155,39 @@ pub(crate) fn delete_custom(list: &mut Vec<CustomDisplay>, name: &str) -> bool {
     list.len() != n
 }
 
+/// Typed-text buffers for the spinbox fields (Go-to-frame parity: the
+/// box edits text, the draft holds the parsed f64). Seeded on open so
+/// untouched boxes show the stored precision, not a reformat.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DraftText {
+    pub width: String,
+    pub height: String,
+    pub diagonal: String,
+    pub distance: String,
+    pub peak: String,
+    pub contrast: String,
+    pub ambient: String,
+    pub reflect_pct: String,
+    pub exposure: String,
+}
+
+impl DraftText {
+    fn from_draft(d: &DisplayDraft) -> Self {
+        use crate::app::widgets::fmt_spin;
+        Self {
+            width: fmt_spin(d.width, 0),
+            height: fmt_spin(d.height, 0),
+            diagonal: fmt_spin(d.diagonal, 1),
+            distance: fmt_spin(d.distance, 4),
+            peak: fmt_spin(d.peak, 0),
+            contrast: fmt_spin(d.contrast, 0),
+            ambient: fmt_spin(d.ambient, 1),
+            reflect_pct: fmt_spin(d.reflect_pct, 2),
+            exposure: fmt_spin(d.exposure, 2),
+        }
+    }
+}
+
 /// Editor dialog session state (like the plot runtime: session-only,
 // never persisted — the presets themselves persist via the state file).
 #[derive(Debug, Default)]
@@ -167,6 +200,7 @@ pub(crate) struct CvdispEditor {
     center_once: bool,
     own: Option<String>,
     draft: DisplayDraft,
+    text: DraftText,
     original: DisplayMap,
     warning: String,
 }
@@ -186,6 +220,7 @@ impl CvdispEditor {
 
     fn open_editor(&mut self, display: &DisplayMap, name: &str, own: Option<String>, adding: bool) {
         self.draft = DisplayDraft::from_map(name, display);
+        self.text = DraftText::from_draft(&self.draft);
         self.original = display.clone();
         self.own = own;
         self.adding = adding;
@@ -441,46 +476,66 @@ impl crate::app::RFMetricsApp {
                 ui.label("Resolution:");
                 ui.horizontal(|ui| {
                     crate::app::widgets::hover_wrap(
-                        ui.add(
-                            egui::DragValue::new(&mut self.cvdisp.draft.width)
-                                .range(16.0..=8192.0)
-                                .speed(1.0)
-                                .max_decimals(0),
+                        crate::app::widgets::spinbox(
+                            ui,
+                            "res_w",
+                            &mut self.cvdisp.text.width,
+                            &mut self.cvdisp.draft.width,
+                            1.0,
+                            16.0..=8192.0,
+                            0,
+                            60.0,
                         ),
                         "The display's own resolution in pixels (not the video's).",
                     );
                     ui.label("x");
-                    ui.add(
-                        egui::DragValue::new(&mut self.cvdisp.draft.height)
-                            .range(16.0..=8192.0)
-                            .speed(1.0)
-                            .max_decimals(0),
+                    crate::app::widgets::spinbox(
+                        ui,
+                        "res_h",
+                        &mut self.cvdisp.text.height,
+                        &mut self.cvdisp.draft.height,
+                        1.0,
+                        16.0..=8192.0,
+                        0,
+                        60.0,
                     );
                 });
                 ui.end_row();
                 ui.label("Screen size:");
-                ui.add(
-                    egui::DragValue::new(&mut self.cvdisp.draft.diagonal)
-                        .range(1.0..=1000.0)
-                        .speed(0.1)
-                        .max_decimals(1)
-                        .suffix(" in"),
-                )
-                .on_hover_text("The screen's diagonal size.");
+                ui.horizontal(|ui| {
+                    crate::app::widgets::hover_wrap(
+                        crate::app::widgets::spinbox(
+                            ui,
+                            "diagonal",
+                            &mut self.cvdisp.text.diagonal,
+                            &mut self.cvdisp.draft.diagonal,
+                            0.1,
+                            1.0..=1000.0,
+                            1,
+                            56.0,
+                        ),
+                        "The screen's diagonal size.",
+                    );
+                    ui.label("in");
+                });
                 ui.end_row();
                 ui.label("Viewing distance:");
                 ui.horizontal(|ui| {
                     crate::app::widgets::hover_wrap(
-                        ui.add(
-                            egui::DragValue::new(&mut self.cvdisp.draft.distance)
-                                .range(0.05..=50.0)
-                                .speed(0.05)
-                                .max_decimals(4)
-                                .suffix(" m"),
+                        crate::app::widgets::spinbox(
+                            ui,
+                            "distance",
+                            &mut self.cvdisp.text.distance,
+                            &mut self.cvdisp.draft.distance,
+                            0.05,
+                            0.05..=50.0,
+                            4,
+                            64.0,
                         ),
                         "How far the viewer's eyes are from the screen. Closer makes \
                      small artifacts easier to see.",
                     );
+                    ui.label("m");
                     let r = crate::metrics::ffvship::heights_ratio(
                         self.cvdisp.draft.width,
                         self.cvdisp.draft.height,
@@ -495,64 +550,92 @@ impl crate::app::RFMetricsApp {
                 });
                 ui.end_row();
                 ui.label("Peak brightness:");
-                crate::app::widgets::hover_wrap(
-                    ui.add(
-                        egui::DragValue::new(&mut self.cvdisp.draft.peak)
-                            .range(1.0..=10000.0)
-                            .speed(10.0)
-                            .max_decimals(0)
-                            .suffix(" nits"),
-                    ),
-                    "The display's peak brightness: about 200 for an office monitor, \
-                 600-1500 for an HDR monitor, 1000-4000 for an HDR TV.",
-                );
+                ui.horizontal(|ui| {
+                    crate::app::widgets::hover_wrap(
+                        crate::app::widgets::spinbox(
+                            ui,
+                            "peak",
+                            &mut self.cvdisp.text.peak,
+                            &mut self.cvdisp.draft.peak,
+                            10.0,
+                            1.0..=10000.0,
+                            0,
+                            56.0,
+                        ),
+                        "The display's peak brightness: about 200 for an office monitor, \
+                     600-1500 for an HDR monitor, 1000-4000 for an HDR TV.",
+                    );
+                    ui.label("nits");
+                });
                 ui.end_row();
                 ui.label("Contrast:");
-                crate::app::widgets::hover_wrap(
-                    ui.add(
-                        egui::DragValue::new(&mut self.cvdisp.draft.contrast)
-                            .range(1.0..=10_000_000.0)
-                            .speed(100.0)
-                            .max_decimals(0)
-                            .suffix(" : 1"),
-                    ),
-                    "Peak to black: about 1000:1 for a typical LCD, 1,000,000:1 \
-                 for OLED or the official HDR displays.",
-                );
+                ui.horizontal(|ui| {
+                    crate::app::widgets::hover_wrap(
+                        crate::app::widgets::spinbox(
+                            ui,
+                            "contrast",
+                            &mut self.cvdisp.text.contrast,
+                            &mut self.cvdisp.draft.contrast,
+                            100.0,
+                            1.0..=10_000_000.0,
+                            0,
+                            84.0,
+                        ),
+                        "Peak to black: about 1000:1 for a typical LCD, 1,000,000:1 \
+                     for OLED or the official HDR displays.",
+                    );
+                    ui.label(": 1");
+                });
                 ui.end_row();
                 ui.label("Room light:");
-                crate::app::widgets::hover_wrap(
-                    ui.add(
-                        egui::DragValue::new(&mut self.cvdisp.draft.ambient)
-                            .range(0.0..=100_000.0)
-                            .speed(10.0)
-                            .max_decimals(1)
-                            .suffix(" lux"),
-                    ),
-                    "Light falling on the screen: about 250 lux in an office, 5-10 \
-                 watching a film with the lights low, 0 in the dark.",
-                );
+                ui.horizontal(|ui| {
+                    crate::app::widgets::hover_wrap(
+                        crate::app::widgets::spinbox(
+                            ui,
+                            "ambient",
+                            &mut self.cvdisp.text.ambient,
+                            &mut self.cvdisp.draft.ambient,
+                            10.0,
+                            0.0..=100_000.0,
+                            1,
+                            64.0,
+                        ),
+                        "Light falling on the screen: about 250 lux in an office, 5-10 \
+                     watching a film with the lights low, 0 in the dark.",
+                    );
+                    ui.label("lux");
+                });
                 ui.end_row();
                 ui.label("Screen reflectivity:");
-                crate::app::widgets::hover_wrap(
-                    ui.add(
-                        egui::DragValue::new(&mut self.cvdisp.draft.reflect_pct)
-                            .range(0.0..=99.9)
-                            .speed(0.1)
-                            .max_decimals(2)
-                            .suffix(" %"),
-                    ),
-                    "How much of the room light the screen reflects back at the \
-                 viewer; 0.5% is the official models' value.",
-                );
+                ui.horizontal(|ui| {
+                    crate::app::widgets::hover_wrap(
+                        crate::app::widgets::spinbox(
+                            ui,
+                            "reflect",
+                            &mut self.cvdisp.text.reflect_pct,
+                            &mut self.cvdisp.draft.reflect_pct,
+                            0.1,
+                            0.0..=99.9,
+                            2,
+                            56.0,
+                        ),
+                        "How much of the room light the screen reflects back at the \
+                     viewer; 0.5% is the official models' value.",
+                    );
+                    ui.label("%");
+                });
                 ui.end_row();
                 ui.label("Exposure:");
                 crate::app::widgets::hover_wrap(
-                    ui.add(
-                        egui::DragValue::new(&mut self.cvdisp.draft.exposure)
-                            .range(0.01..=100.0)
-                            .speed(0.1)
-                            .max_decimals(2),
+                    crate::app::widgets::spinbox(
+                        ui,
+                        "exposure",
+                        &mut self.cvdisp.text.exposure,
+                        &mut self.cvdisp.draft.exposure,
+                        0.1,
+                        0.01..=100.0,
+                        2,
+                        56.0,
                     ),
                     "Brightness multiplier for the pictures; 1 shows them as encoded.",
                 );

@@ -98,6 +98,23 @@ fn save_flows() {
     );
 }
 
+/// Spinbox pure bits: chevron steps clamp at the range ends; display
+/// formatting trims DragValue-style (no trailing zeros, ints intact).
+#[test]
+fn spin_step_and_fmt() {
+    use crate::app::widgets::{fmt_spin, spin_step};
+    assert!((spin_step(24.0, true, 0.1, 1.0..=1000.0) - 24.1).abs() < 1e-9);
+    assert!((spin_step(24.0, false, 0.1, 1.0..=1000.0) - 23.9).abs() < 1e-9);
+    assert_eq!(spin_step(1000.0, true, 0.1, 1.0..=1000.0), 1000.0);
+    assert_eq!(spin_step(1.0, false, 0.1, 1.0..=1000.0), 1.0);
+    assert_eq!(fmt_spin(24.0, 1), "24");
+    assert_eq!(fmt_spin(0.7472, 4), "0.7472");
+    assert_eq!(fmt_spin(0.6, 4), "0.6");
+    assert_eq!(fmt_spin(100.0, 0), "100");
+    assert_eq!(fmt_spin(10_000_000.0, 0), "10000000");
+    assert_eq!(fmt_spin(99.9, 2), "99.9");
+}
+
 /// Delete removes by name and reports; unknown names are no-ops.
 #[test]
 fn delete_flows() {
