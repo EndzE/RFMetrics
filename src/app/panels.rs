@@ -323,6 +323,11 @@ impl crate::app::RFMetricsApp {
                     // Options box narrow enough to fit at 1300px).
                     ui.add_enabled_ui(!run_locked, |ui| {
                         egui::Frame::group(ui.style()).show(ui, |ui| {
+                            // Bound the fill-width fields below: in an
+                            // auto-sized column INFINITY claims the whole
+                            // window (Path-to-file's column is width-capped
+                            // by its panel; this one is not).
+                            ui.set_width(430.0);
                             let _ = ui
                                 .add(egui::Checkbox::new(
                                     &mut self.config.export.csv_export,
